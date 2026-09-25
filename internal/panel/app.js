@@ -451,7 +451,6 @@ function openAdd() {
   loginID = '';
   $('addLoad').hidden = false;
   $('addReady').hidden = true;
-  $('addDone').hidden = true;
   $('addErr').hidden = true;
   $('btnCopyUrl').hidden = true;
   $('btnOpenUrl').hidden = true;
@@ -480,9 +479,9 @@ async function finishAdd() {
       method: 'POST',
       body: JSON.stringify({ id: loginID, callback: $('callback').value }),
     });
-    $('addDone').hidden = false;
-    $('addDone').textContent = '已加入：' + (d.nickname || d.uid);
-    toast('账号已加入池', 'ok');
+    // 加完立刻关弹窗：成功提示交给 toast（弹窗关了也看得见），省一次「关闭」点击。
+    toast('已加入：' + (d.nickname || d.uid), 'ok');
+    $('addVeil').classList.remove('on');
     loadOverview(true);
   } catch (e) {
     $('addErr').hidden = false;
