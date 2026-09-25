@@ -28,6 +28,27 @@ func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
 	}
 }
 
+// 客户端自己设的思考强度等 OpenAI 字段，PrepareBody 只认 stream/function/model/tools，
+// 其余键原样转发给上游 —— 也就是说「客户端设了 reasoning_effort」这件事不会被我们吞掉，
+// 认不认是上游的事。这里把这个转发行为钉住，别哪天加个白名单把它删了。
+func TestPrepareBodyForwardsUnknownClientFields(t *testing.T) {
+	out := PrepareBody([]byte(`{"model":"kimi-k3","reasoning_effort":"high","thinking":{"type":"enabled"},` +
+		`"temperature":0.3,"messages":[{"role":"user","content":"hi"}]}`))
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["reasoning_effort"] != "high" {
+		t.Errorf("reasoning_effort 丢了: %v", m["reasoning_effort"])
+	}
+	if th, ok := m["thinking"].(map[string]any); !ok || th["type"] != "enabled" {
+		t.Errorf("thinking 丢了: %v", m["thinking"])
+	}
+	if m["temperature"] != 0.3 {
+		t.Errorf("temperature 丢了: %v", m["temperature"])
+	}
+}
+
 func TestPrepareBodyKeepsArrayContent(t *testing.T) {
 	out := PrepareBody([]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
 	var m map[string]any
