@@ -305,6 +305,13 @@ func TestProbeLiveEffortAB(t *testing.T) {
 			rounds = n
 		}
 	}
+	// max_tokens 太小会把高档位的思考截断，各档就都顶在上限上、差异被抹平 —— 那样测出来的是上限不是档位。
+	maxTok := 600
+	if v := os.Getenv("TW2A_PROBE_MAXTOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxTok = n
+		}
+	}
 	// 档位清单：默认按 OpenAI 系常见的五档全测（"" = 不发，始终作基线）。
 	efforts := []string{""}
 	list := os.Getenv("TW2A_PROBE_EFFORTS")
@@ -323,8 +330,8 @@ func TestProbeLiveEffortAB(t *testing.T) {
 	for r := 1; r <= rounds; r++ {
 		// 轮次在外、档位在内：把时间漂移摊平到各档位上（不然同时段整体抖动会被算成档位差异）。
 		for _, effort := range efforts {
-			body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}],"max_tokens":600,"stream":true`,
-				model, prompt)
+			body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}],"max_tokens":%d,"stream":true`,
+				model, prompt, maxTok)
 			if effort != "" {
 				body += fmt.Sprintf(`,"reasoning_effort":%q`, effort)
 			}
@@ -347,8 +354,8 @@ func TestProbeLiveEffortAB(t *testing.T) {
 			usage, _ := out["usage"].(map[string]any)
 			n, _ := usage["reasoning_tokens"].(float64)
 			got[effort] = append(got[effort], int(n))
-			fmt.Printf("  r%d %-6s reasoning_tokens=%-4d completion=%-4v total=%-4v | 答: %s\n",
-				r, label(effort), int(n), usage["completion_tokens"], usage["total_tokens"], answerOf(out))
+			fmt.Printf("  r%d %-8s reasoning=%-5d completion=%-5v total=%-5v finish=%-7s | 答: %s\n",
+				r, label(effort), int(n), usage["completion_tokens"], usage["total_tokens"], finishOf(out), answerOf(out))
 		}
 	}
 
@@ -377,6 +384,17 @@ func median(v []int) int {
 	s := append([]int(nil), v...)
 	sort.Ints(s)
 	return s[len(s)/2]
+}
+
+// finishOf 取 finish_reason：length = 被 max_tokens 截断，这轮的 reasoning_tokens 不可比。
+func finishOf(out map[string]any) string {
+	ch, _ := out["choices"].([]any)
+	if len(ch) == 0 {
+		return ""
+	}
+	c0, _ := ch[0].(map[string]any)
+	f, _ := c0["finish_reason"].(string)
+	return f
 }
 
 // answerOf 取聚合结果的回答正文，压成一行（探针只关心「答对没」和思考长度）。
