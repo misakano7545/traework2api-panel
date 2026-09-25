@@ -128,7 +128,6 @@ func main() {
 	sch := scheduler.New(scheduler.Config{
 		Pool:                   p,
 		Upstream:               up,
-		RefreshSkew:            24 * time.Hour,
 		CheckinHours:           cfg.Schedule.CheckinHours,
 		KeepaliveHours:         cfg.Schedule.KeepaliveHours,
 		CheckinEnabled:         cfg.Schedule.CheckinEnabled,

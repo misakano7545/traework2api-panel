@@ -82,9 +82,11 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("POST /panel/api/login/finish", p.withAuth(p.loginFinish))
 	p.mux.HandleFunc("POST /panel/api/checkin", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/balance", p.withAuth(p.balanceAll))
+	p.mux.HandleFunc("POST /panel/api/keepalive", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/enable", p.withAuth(p.accountEnable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/clear-cooldown", p.withAuth(p.accountClear))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	return p
@@ -304,6 +306,16 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 	p.overview(w, r)
 }
 
+// keepaliveAll 立即对全账号刷一遍 token（保活）。不花积分：只刷新凭证，不调对话。
+func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
+		return
+	}
+	p.cfg.Scheduler.RunRefreshNow()
+	p.overview(w, r)
+}
+
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	failed := 0
 	for _, st := range p.cfg.Pool.List() {
@@ -369,6 +381,30 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Pool.Disable(uid, "disabled from panel")
 	log.Printf("panel: disabled uid=%s", uid)
+	st, _ := p.cfg.Pool.Status(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
+}
+
+// accountEnable 重新启用被禁用的账号（启用后立刻参与选号）。
+func (p *Panel) accountEnable(w http.ResponseWriter, r *http.Request) {
+	uid, ok := p.uidFrom(w, r)
+	if !ok {
+		return
+	}
+	old, exists := p.cfg.Pool.Status(uid)
+	if !exists {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if !old.Disabled {
+		writeErr(w, http.StatusConflict, "account not disabled")
+		return
+	}
+	if !p.cfg.Pool.Enable(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: enabled uid=%s", uid)
 	st, _ := p.cfg.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
 }

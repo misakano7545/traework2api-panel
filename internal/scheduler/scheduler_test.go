@@ -96,7 +96,6 @@ func newTestScheduler(f *fakeUpstream, p *pool.Pool, srv *httptest.Server) *Sche
 		Upstream:       up,
 		CheckinHours:   []int{9},
 		KeepaliveHours: []int{3},
-		RefreshSkew:    time.Hour,
 	})
 }
 
@@ -191,22 +190,28 @@ func TestRunRefreshRefreshesTokens(t *testing.T) {
 	}
 }
 
-func TestRunRefreshSkipsFreshToken(t *testing.T) {
+func TestRunRefreshRefreshesFreshTokenToo(t *testing.T) {
+	// 保活不看剩余有效期：access token 活 14 天，只在过期前 24h 刷等于 refresh 链
+	// 十天半个月没人碰，上游一过期就只能重登（掉线）。每天刷一遍才活得久。
 	f := &fakeUpstream{}
 	srv := f.server()
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "fresh", RefreshToken: "rt", ExpiresAt: 9999999999, ApiHost: srv.URL})
+	a := &auth.Auth{UID: "u1", AccessToken: "fresh", RefreshToken: "rt", ExpiresAt: 9999999999, ApiHost: srv.URL}
+	p.Add(a)
 
 	s := newTestScheduler(f, p, srv)
 	s.RunRefreshNow()
-	if f.refreshCalls.Load() != 0 {
-		t.Errorf("fresh token should not refresh, calls=%d", f.refreshCalls.Load())
+	if f.refreshCalls.Load() != 1 {
+		t.Errorf("保活应无条件刷一遍, calls=%d", f.refreshCalls.Load())
+	}
+	if a.AccessToken != "newat" {
+		t.Errorf("token 未更新: %s", a.AccessToken)
 	}
 }
 
-func TestRunRefreshSessionDeadDisables(t *testing.T) {
+func TestRunRefreshSessionDeadNeedsThreeStrikes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":20101,"msg":"login required"}`))
@@ -218,10 +223,16 @@ func TestRunRefreshSessionDeadDisables(t *testing.T) {
 
 	up := &upstream.Client{HTTP: srv.Client(), AgentHost: srv.URL, UgHost: srv.URL, OAuthHost: srv.URL, ClientID: upstream.ClientID}
 	s := New(Config{Pool: p, Upstream: up})
+	for i := 1; i <= 2; i++ {
+		s.RunRefreshNow()
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次 session 失效就禁用了（一次 401 不该杀号）: %+v", i, st)
+		}
+	}
 	s.RunRefreshNow()
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("should disable session-dead account: %+v", st)
+		t.Errorf("连续 3 次 session 失效仍不禁用: %+v", st)
 	}
 }
 

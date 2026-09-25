@@ -107,6 +107,58 @@ func TestDisablePersists(t *testing.T) {
 	}
 }
 
+func TestSessionDeadNeedsThreeStrikesAndPersists(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+
+	if p.NoteSessionDead("u1") {
+		t.Fatal("第 1 次 session 失效不该禁用")
+	}
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Fatalf("第 1 次就禁用了: %+v", st)
+	}
+	if p.NoteSessionDead("u1") {
+		t.Fatal("第 2 次不该禁用")
+	}
+	if !p.NoteSessionDead("u1") {
+		t.Fatal("第 3 次应触发禁用")
+	}
+	if st, _ := p.Status("u1"); !st.Disabled || st.Reason != "session dead" {
+		t.Fatalf("status=%+v", st)
+	}
+
+	// 计数与禁用状态落盘：重启不该给故障号免费重试。
+	p2 := New(fp)
+	if st, _ := p2.Status("u1"); !st.Disabled {
+		t.Fatalf("禁用未持久化: %+v", st)
+	}
+
+	// 刷新成功清零后，再失败一次不该禁用（误判有复活路径）。
+	p2.ClearSessionDead("u1")
+	if p2.NoteSessionDead("u1") {
+		t.Fatal("计数清零后第 1 次就禁用了")
+	}
+}
+
+func TestEnableRevivesDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	if p.Pick() != nil {
+		t.Fatal("禁用号不该被选中")
+	}
+	if !p.Enable("u1") {
+		t.Fatal("Enable 应返回 true")
+	}
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Fatalf("启用后应能被选中, pick=%+v", got)
+	}
+	if st, _ := p.Status("u1"); st.Disabled || st.Reason != "" {
+		t.Fatalf("启用后状态应干净: %+v", st)
+	}
+}
+
 func TestReenableIfCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})

@@ -10,10 +10,10 @@ TRAE Work (SOLO CN) 的 OpenAI 兼容反向代理。把 TRAE SOLO 免费对话�
 
 - **OpenAI 兼容 API**：`POST /v1/chat/completions`（流式/非流式）、`GET /v1/models`
 - **多账号池**：积分加权挑选（闲置补偿 + 快过期优先），在途限额，熔断/降权/计划冷却，
-  401 禁用，请求级轮转
+  401 连续 3 次才禁用（一次抖动不杀号），请求级轮转
 - **自动签到**：多时点定时签到 + 周期余额刷新 + 手动批量签到（`signin.sh`）
 - **积分查询**：全账号/指定账号日报（`credit.sh`）
-- **Token 保活**：多时点预刷新（默认过期前 24h 内），refreshToken 轮换落盘
+- **Token 保活**：多时点**无条件**全账号刷新 token（不看剩余有效期），refreshToken 轮换落盘
 - **会话粘性**：同一会话的多轮请求粘同一账号（命中上游 prompt 缓存）
 - **调用用量台账**：按「时间片 × 账号 × 模型」记请求数/失败数/token/延迟，面板可查
 - **系统提示词改写**：passthrough / custom / append 三态，出站前替换或追加
@@ -111,6 +111,18 @@ go build -o tw2api ./cmd/server
 ./credit.sh <uid>       # 指定账号
 ```
 
+## 保活（防掉线）
+
+`schedule.keepalive_hours`（默认 `[3]`）到点对**全账号无条件**刷一遍 token，不看剩余有效期：
+access token 活 14 天，只在「过期前 24h」刷等于 refresh token 链十天半个月没人碰，上游一旦让它过期
+就只能重新登录（掉线）。每天摸一次，链不会冷。刷新 token 不吃积分，只换凭证并原子落盘 `auths/`。
+面板「全部保活」= 同一件事的手动入口（`POST /panel/api/keepalive`）。
+
+session 失效（上游 `1001` / `20101`，refresh token 也救不回来）**连续 3 次**才永久禁用：一次 401 多是
+上游抖动，见到就杀号会让可用账号凭空下线。期间任何一次刷新成功都清零（`ClearSessionDead`），
+误判的号自己回来；真被判死的号用面板「启用」（`POST /panel/api/accounts/{uid}/enable`）清掉禁用标记、
+计数与冷却直接复池，不必再「移除 + 重登」。计数与禁用状态都落 `state_file`。
+
 ## 管理面板
 
 浏览器打开 `http://127.0.0.1:7864/panel/`。页面和 `app.js` 不用密钥；`/panel/api/*` 与 `/v1`
@@ -120,15 +132,44 @@ go build -o tw2api ./cmd/server
 相关字段（`model_extra_config` 里的 `Thinking.Type`、`reasoning_effort_config` 原文），不做解释和换算。
 
 客户端自己带的 `reasoning_effort` 之类字段是**原样透传**上游的，不认的也一个不吞（`PrepareBody` 只改
-`stream`/`function`/`config_name`/`model`/`tools`）。全档实测（不发 / `none` / `minimal` / `lowest` /
-`low` / `medium` / `high` / `max` / `xhigh` / `ultra` / `highest`，各 3 次取 `reasoning_tokens` 中位数）：
-`glm-5.2` 落在 313–345、`kimi-k2.6`（唯一 `Thinking.Type=enabled` 的模型）落在 146–202 —— 全都在档内单次
-波动（±20~40%）里，没有 `low<medium<high` 的单调关系，连 `none`/`minimal` 也没关掉思考，也就是
-**上游不按这个字段调档，静默忽略**。非法值、错类型、未知键都不会让请求失败。复跑：
-`TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v`（吃额度；档位清单
-`TW2A_PROBE_EFFORTS=`、模型 `TW2A_PROBE_MODEL=`、样本 `TW2A_PROBE_ROUNDS=`、上限 `TW2A_PROBE_MAXTOKENS=`）。
+`stream`/`function`/`config_name`/`model`/`tools`）。
 
-可签到、刷新剩余积分、禁用、解除冷却、移除，以及粘贴登录回调后立刻写入 `auths/trae-{uid}.json` 并进池，不用重启。
+**全模型全档实测**（不发 + 10 档 × 3 轮，取 `reasoning_tokens` 中位数，`max_tokens=2000`）：
+
+| 模型 | 不发 | none | minimal | lowest | low | medium | high | max | xhigh | ultra | highest | 档间极差 | 档内波动 | ρ(档位序) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `Doubao-Seed-Evolving` | 71 | 139 | 148 | 76 | 68 | 109 | 75 | 177 | 95 | 79 | 101 | 109 | ±67 | +0.12 |
+| `Doubao-Seed-2.1-Pro` | 120 | 80 | 119 | 102 | 126 | 127 | 116 | 151 | 124 | 146 | 109 | 71 | ±99 | +0.37 |
+| `Doubao-Seed-2.1-Turbo` | 119 | 118 | 175 | 109 | 98 | 162 | 104 | 183 | 175 | 143 | 159 | 85 | ±83 | +0.29 |
+| `glm-5.2` | 338 | 336 | 321 | 310 | 325 | 360 | 351 | 304 | 318 | 327 | 384 | 80 | ±67 | +0.09 |
+| `glm-5` | 363 | 362 | 377 | 352 | 397 | 341 | 371 | 374 | 351 | 367 | 349 | 56 | ±42 | -0.24 |
+| `DeepSeek-V4-Flash-Official` | 81 | 83 | 85 | 82 | 79 | 79 | 66 | 85 | 62 | 85 | 86 | 24 | ±24 | +0.13 |
+| `DeepSeek-V4-Flash` | 146 | 143 | 161 | 140 | 141 | 169 | 144 | 164 | 168 | 136 | 105 | 64 | ±53 | -0.20 |
+| `DeepSeek-V4-Pro-Official` | 99 | 115 | 121 | 129 | 115 | 97 | 95 | 102 | 115 | 111 | 109 | 34 | ±23 | -0.30 |
+| `DeepSeek-V4-Pro` | 150 | 148 | 76 | 134 | 157 | 143 | 144 | 118 | 102 | 131 | 164 | 88 | ±79 | -0.09 |
+| `kimi-k2.7-code` | 97 | 87 | 95 | 103 | 99 | 84 | 100 | 100 | 94 | 104 | 91 | 20 | ±43 | +0.14 |
+| `kimi-k2.6` | 158 | 203 | 174 | 138 | 166 | 156 | 156 | 171 | 134 | 199 | 193 | 69 | ±54 | +0.05 |
+| `minimax-m3` | 98 | 92 | 102 | 104 | 98 | 91 | 95 | 146 | 108 | 56 | 120 | 90 | ±64 | +0.20 |
+| `qwen3.8-max` | 118 | 109 | 100 | 108 | 97 | 100 | 100 | 108 | 107 | 105 | 93 | 25 | ±20 | -0.49 |
+| `qwen-3.7-plus` | 147 | 146 | 158 | 187 | 143 | 147 | 144 | 176 | 143 | 143 | 147 | 44 | ±51 | -0.17 |
+| `kimi-k3` | — | — | — | — | — | — | — | — | — | — | — | 整档不可用 | — | 上游 1005 |
+
+`档间极差` = 各档**中位数**的极差；`档内波动` = 同一档 3 轮的平均极差；`ρ(档位序)` = 中位数与档位序号的
+Spearman 相关系数（真按档位调档应该接近 `+1`）。15 个模型**没有一个**呈单调关系：ρ 落在 −0.49~+0.37，
+档间极差基本没超过档内波动，连 `none`/`minimal` 也关不掉思考（`Thinking.Type=enabled` 的 `kimi-k2.6`
+亦然）——**上游不按这个字段调档，静默忽略**；非法值、错类型、未知键都不会让请求失败。
+唯一整档不可用的是 `kimi-k3`，原因不在请求而在账号：`get_detail_param` 里 k3 的
+`display_contact_config.access.identity_list` 是 `[2,3,100]`，其余 14 个模型是 `[0,5,1,2,3,100]`，
+且 k3 的 `consumption_rate` 全场最高（1.83）。实测两个账号（免费档 `3753047934371050`、重登后的
+`253358232317424`）请求 k3 都是 `code 1005`，`ent_usage` 里两号的包都只有免费/用户福利/每月登录积分 ——
+**上游按账号档位放量，代码侧没有可改的点**。
+
+复跑：`TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v`（吃额度；档位清单
+`TW2A_PROBE_EFFORTS=`、模型 `TW2A_PROBE_MODEL=`、样本 `TW2A_PROBE_ROUNDS=`、上限 `TW2A_PROBE_MAXTOKENS=`）。
+换模型即换 `TW2A_PROBE_MODEL=`；矩阵是一条 shell 循环每个模型跑一次，逐模型累积日志。
+
+可签到、刷新剩余积分、**全部保活**（立刻全账号刷 token，不吃积分）、禁用/启用、解除冷却、移除，
+以及粘贴登录回调后立刻写入 `auths/trae-{uid}.json` 并进池，不用重启。
 
 「登录账号」拿到的授权链接里，`auth_callback_url` 恒为 `http://127.0.0.1:18080/authorize`，**写死不做配置项**：
 实测 TRAE 只认它自己 IDE 的这一条，换任何别的地址（面板自己的路径、别的端口、公网隧道域名）授权页
@@ -153,7 +194,7 @@ cmd/credit/       积分查询工具
 internal/auth/    auth 文件解析/原子写回
 internal/upstream/ SOLO 上游客户端 + SSE 转换
 internal/pool/    账号池（冷却/禁用/积分）
-internal/scheduler/ 定时签到 + token 预刷新
+internal/scheduler/ 定时签到 + token 保活
 internal/server/  OpenAI 兼容路由
 internal/panel/   /panel/ 管理页（go:embed）
 internal/session/ 会话粘性（会话 → 账号 绑定表）

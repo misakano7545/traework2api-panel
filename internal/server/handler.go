@@ -431,7 +431,8 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 	if err != nil {
 		var ue *upstream.Error
 		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-			h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+			// 一次 401 不杀号：连续 NoteSessionDead 达阈值才禁用（阈值见 pool）。
+			h.cfg.Pool.NoteSessionDead(acct.UID)
 		} else {
 			// token 刷新失败不是一次对话调用，不计用量；但账号本身有问题，按罚号记一次。
 			h.cfg.Pool.NoteError(acct.UID)
@@ -440,6 +441,9 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 	}
 	if refreshed {
 		_ = acct.SaveAtomic()
+		// 刷新成功 = 号还活着，清连续失效计数（没有真刷新就不清，否则每请求清零，
+		// 连续计数永远到不了禁用阈值）。
+		h.cfg.Pool.ClearSessionDead(acct.UID)
 	}
 
 	attemptStart := time.Now()
@@ -513,7 +517,7 @@ func (h *Handler) noteFailure(uid string, kind upstream.ErrKind) {
 	case upstream.ErrSoftRate:
 		h.cfg.Pool.CooldownSoft(uid, "429 rate limit")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "session dead")
+		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrServer:
 		h.cfg.Pool.NoteError(uid)
 	default:

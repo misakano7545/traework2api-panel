@@ -169,6 +169,7 @@ function renderAccounts(list) {
     const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '">签到</button>',
       '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>'];
     if (a.cooling) acts.push('<button class="xs" data-a="clear-cooldown" data-u="' + esc(a.uid) + '">解除冷却</button>');
+    if (a.disabled) acts.push('<button class="xs" data-a="enable" data-u="' + esc(a.uid) + '">启用</button>');
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
     acts.push('<button class="xs danger" data-a="remove" data-u="' + esc(a.uid) + '">移除</button>');
     return '<tr class="' + cls + '"><td class="mark" aria-hidden="true"><i></i></td>' +
@@ -566,12 +567,20 @@ function boot() {
     } catch (e) { toast(e.message, 'err'); }
     loadOverview(true);
   };
+  $('btnKeepalive').onclick = async () => {
+    try {
+      await api('keepalive', { method: 'POST', body: '{}' });
+      toast('token 已刷新（保活）', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+    loadOverview(true);
+  };
   $('accBody').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-a]');
     if (!b) return;
     const u = b.dataset.u, a = b.dataset.a;
     if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
     if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+    if (a === 'enable' && !confirm('重新启用该账号，让它立刻参与选号？')) return;
     b.disabled = true;
     try {
       const r = await api('accounts/' + encodeURIComponent(u) + '/' + a, { method: 'POST', body: '{}' });
@@ -579,6 +588,7 @@ function boot() {
         toast((a === 'checkin' ? '签到完成' : '积分已刷新') + (r.account ? '，积分 ' + r.account.credits : ''), 'ok');
       } else if (a === 'clear-cooldown') toast('已解除冷却', 'ok');
       else if (a === 'disable') toast('已禁用', 'ok');
+      else if (a === 'enable') toast('已启用', 'ok');
       else toast('已移除', 'ok');
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; loadOverview(true); }

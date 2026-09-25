@@ -259,21 +259,26 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
-func TestChatSessionDeadDisables(t *testing.T) {
+func TestChatSessionDeadNeedsThreeStrikes(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":1001,"msg":"login required"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
-		t.Errorf("code=%d", rec.Code)
-	}
-	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+	for i := 1; i <= 3; i++ {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 503 {
+			t.Errorf("第 %d 次 code=%d", i, rec.Code)
+		}
+		st, _ := p.Status("u1")
+		if i < 3 && st.Disabled {
+			t.Fatalf("第 %d 次 401 就禁用（一次抖动不该杀号）: %+v", i, st)
+		}
+		if i == 3 && !st.Disabled {
+			t.Errorf("连续 3 次 session 失效仍不禁用: %+v", st)
+		}
 	}
 }
 

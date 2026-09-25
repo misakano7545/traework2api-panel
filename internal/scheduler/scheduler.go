@@ -24,9 +24,8 @@ import (
 // 时点集合与开关在 New 时定下（面板改排程要重启，见 RestartFields）：
 // 排程是低频且"改错代价大"的配置，做成热生效反而容易让人误判当前生效值。
 type Config struct {
-	Pool        *pool.Pool
-	Upstream    *upstream.Client
-	RefreshSkew time.Duration // token 预刷新窗口，默认 24h
+	Pool     *pool.Pool
+	Upstream *upstream.Client
 
 	CheckinHours   []int // 每日签到时点，默认 [9]
 	KeepaliveHours []int // token 保活时点，默认 [3]
@@ -57,9 +56,6 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{3}
-	}
-	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 24 * time.Hour
 	}
 	return &Scheduler{cfg: cfg}
 }
@@ -350,7 +346,11 @@ func (s *Scheduler) CatchUp() {
 	}
 }
 
-// RunRefreshNow 立即对所有账号刷新 token；session 失效的自动禁用。
+// RunRefreshNow 立即对所有账号刷新 token（保活：不看剩余有效期，每天无条件刷一遍）。
+//
+// 为什么不按 RefreshSkew 只刷快过期的：access token 活 14 天，按「过期前 24h」刷等于
+// refresh token 链十天半个月没人碰；上游一旦让它过期就只能重登（掉线）。
+// session 失效不立刻杀号：连续 SessionDeadThreshold 次才禁用，成功即清零。
 func (s *Scheduler) RunRefreshNow() {
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -360,17 +360,17 @@ func (s *Scheduler) RunRefreshNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if !a.NeedsRefresh(s.cfg.RefreshSkew) {
-			continue
-		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("refresh %s: %v", st.UID, err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-				s.cfg.Pool.Disable(st.UID, "session dead")
+				if s.cfg.Pool.NoteSessionDead(st.UID) {
+					log.Printf("refresh %s: 连续 %d 次 session 失效 — 禁用", st.UID, pool.SessionDeadThreshold())
+				}
 			}
 			continue
 		}
+		s.cfg.Pool.ClearSessionDead(st.UID)
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("refresh %s save: %v", st.UID, err)
 		}

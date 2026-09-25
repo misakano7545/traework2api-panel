@@ -87,6 +87,9 @@ type entry struct {
 	degradeCount  int
 	breakerStreak int
 	softStreak    int // 软限流退避档位（429/404）
+	// sessionDeadFails 连续 session 失效计数（持久化：重启不该给故障号免费重试）。
+	// 上游偶发 401 不代表号真死，连续 sessionDeadThreshold 次才禁用，见 NoteSessionDead。
+	sessionDeadFails int
 	// 在途请求数（不持久化：重启即在途归零，没有需要恢复的在途请求）。
 	inFlight int
 	// lastUsed 上次被选中时间，用于闲置补偿（不持久化：重启后视为全部闲置）。
@@ -151,9 +154,10 @@ type stateFile struct {
 		CoolUntil    time.Time `json:"checkin_until,omitempty"`
 		CoolReason   string    `json:"checkin_reason,omitempty"`
 		// 连败/退避档位要持久化：重启丢掉退避档位等于每次重启都给故障号一次免费重试。
-		Breaker int `json:"breaker_streak,omitempty"`
-		Soft    int `json:"soft_streak,omitempty"`
-		Degrade int `json:"degrade_count,omitempty"`
+		Breaker  int `json:"breaker_streak,omitempty"`
+		Soft     int `json:"soft_streak,omitempty"`
+		Degrade  int `json:"degrade_count,omitempty"`
+		SessDead int `json:"session_dead_fails,omitempty"`
 	} `json:"accounts"`
 }
 
@@ -448,6 +452,69 @@ func (p *Pool) Disable(uid, reason string) {
 	p.saveLocked()
 }
 
+// sessionDeadThreshold 连续 session 失效（ErrSessionDead）达到该次数才永久禁用。
+// 一次 401 多是上游抖动或瞬时鉴权失败，见到就杀号会让可用账号凭空下线（WorkBuddy
+// 那边一次性禁用号里全是这类误判）。连续失败才判定号真死；期间任何一次刷新/调用成功
+// 都会 ClearSessionDead 清零，误判的号自己回来。
+const sessionDeadThreshold = 3
+
+// SessionDeadThreshold 暴露连续失效的禁用阈值（日志与文档引用）。
+func SessionDeadThreshold() int { return sessionDeadThreshold }
+
+// NoteSessionDead 记一次 session 失效；连续达阈值才禁用。
+// 返回 true 表示本次触发禁用（调用方据此打日志）。
+func (p *Pool) NoteSessionDead(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.sessionDeadFails++
+	if e.sessionDeadFails < sessionDeadThreshold {
+		p.saveLocked()
+		return false
+	}
+	e.disabled = true
+	e.reason = "session dead"
+	p.saveLocked()
+	return true
+}
+
+// ClearSessionDead 清零连续失效计数（刷新/调用成功即调用）。
+// 计数本来为 0 时不写状态文件，避免热路径每请求落盘。
+func (p *Pool) ClearSessionDead(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.sessionDeadFails == 0 {
+		return
+	}
+	e.sessionDeadFails = 0
+	p.saveLocked()
+}
+
+// Enable 重新启用被禁用的账号：清禁用标记、连续失效计数与冷却，让它下一轮就能被选中。
+// 没有它，被误判禁用的号只能「移除 + 重登」（Add 对已知 uid 保留旧状态，不会自己解禁）。
+func (p *Pool) Enable(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.disabled = false
+	e.reason = ""
+	e.until = time.Time{}
+	e.errCount = 0
+	e.degradeCount = 0
+	e.breakerStreak = 0
+	e.softStreak = 0
+	e.sessionDeadFails = 0
+	p.saveLocked()
+	return true
+}
+
 // ClearCooldown 解除冷却。禁用账号保持原状。
 func (p *Pool) ClearCooldown(uid string) bool {
 	p.mu.Lock()
@@ -694,18 +761,19 @@ func (p *Pool) load() {
 	}
 	for uid, s := range sf.Accounts {
 		p.byUID[uid] = &entry{
-			a:             &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:       s.Credits,
-			creditsTotal:  s.CreditsTotal,
-			expire:        s.Expire,
-			disabled:      s.Disabled,
-			reason:        s.Reason,
-			until:         s.Until,
-			coolUntil:     s.CoolUntil,
-			coolReason:    s.CoolReason,
-			breakerStreak: s.Breaker,
-			softStreak:    s.Soft,
-			degradeCount:  s.Degrade,
+			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:          s.Credits,
+			creditsTotal:     s.CreditsTotal,
+			expire:           s.Expire,
+			disabled:         s.Disabled,
+			reason:           s.Reason,
+			until:            s.Until,
+			coolUntil:        s.CoolUntil,
+			coolReason:       s.CoolReason,
+			breakerStreak:    s.Breaker,
+			softStreak:       s.Soft,
+			degradeCount:     s.Degrade,
+			sessionDeadFails: s.SessDead,
 		}
 	}
 }
@@ -726,6 +794,7 @@ func (p *Pool) saveLocked() {
 		Breaker      int       `json:"breaker_streak,omitempty"`
 		Soft         int       `json:"soft_streak,omitempty"`
 		Degrade      int       `json:"degrade_count,omitempty"`
+		SessDead     int       `json:"session_dead_fails,omitempty"`
 	}{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = struct {
@@ -740,6 +809,7 @@ func (p *Pool) saveLocked() {
 			Breaker      int       `json:"breaker_streak,omitempty"`
 			Soft         int       `json:"soft_streak,omitempty"`
 			Degrade      int       `json:"degrade_count,omitempty"`
+			SessDead     int       `json:"session_dead_fails,omitempty"`
 		}{
 			Credits:      e.credits,
 			CreditsTotal: e.creditsTotal,
@@ -752,6 +822,7 @@ func (p *Pool) saveLocked() {
 			Breaker:      e.breakerStreak,
 			Soft:         e.softStreak,
 			Degrade:      e.degradeCount,
+			SessDead:     e.sessionDeadFails,
 		}
 	}
 	raw, err := json.MarshalIndent(sf, "", "  ")

@@ -44,7 +44,7 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule struct {
-		// CheckinHours 每日签到时点；KeepaliveHours token 预刷新时点（均在 0-23）。
+		// CheckinHours 每日签到时点；KeepaliveHours token 保活时点（每日无条件全账号刷一遍，均在 0-23）。
 		CheckinHours   []int `json:"checkin_hours"`   // [9]
 		KeepaliveHours []int `json:"keepalive_hours"` // [3]
 		// 开关缺省 true：键缺席保留默认，空数组仍回落默认时点——「禁用」只走开关，语义不混。
