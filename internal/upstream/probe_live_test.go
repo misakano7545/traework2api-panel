@@ -305,13 +305,24 @@ func TestProbeLiveEffortAB(t *testing.T) {
 			rounds = n
 		}
 	}
+	// 档位清单：默认按 OpenAI 系常见的五档全测（"" = 不发，始终作基线）。
+	efforts := []string{""}
+	list := os.Getenv("TW2A_PROBE_EFFORTS")
+	if strings.TrimSpace(list) == "" {
+		list = "none,minimal,low,medium,high"
+	}
+	for _, e := range strings.Split(list, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			efforts = append(efforts, e)
+		}
+	}
 	c, a := probeChat(t, fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":8}`, model))
-	fmt.Printf("\n===== 行为对比 %s：同一 prompt × %d 轮，只改 reasoning_effort\n题: %s\n", model, rounds, prompt)
+	fmt.Printf("\n===== 行为对比 %s：同一 prompt × %d 轮 × %d 档\n题: %s\n", model, rounds, len(efforts), prompt)
 
 	got := map[string][]int{}
 	for r := 1; r <= rounds; r++ {
-		// 轮次在外、档位在内：把时间漂移摊平到三个档位上（不然同时段整体抖动会被算成档位差异）。
-		for _, effort := range []string{"", "low", "high"} {
+		// 轮次在外、档位在内：把时间漂移摊平到各档位上（不然同时段整体抖动会被算成档位差异）。
+		for _, effort := range efforts {
 			body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}],"max_tokens":600,"stream":true`,
 				model, prompt)
 			if effort != "" {
@@ -342,14 +353,30 @@ func TestProbeLiveEffortAB(t *testing.T) {
 	}
 
 	fmt.Println("----- 汇总（中位数才作数，单轮不看）")
-	for _, e := range []string{"", "low", "high"} {
-		v := got[e]
+	base := median(got[""])
+	for _, e := range efforts {
+		v := append([]int(nil), got[e]...)
 		if len(v) == 0 {
 			continue
 		}
 		sort.Ints(v)
-		fmt.Printf("  %-6s 各轮 %v → 中位数 %d\n", label(e), v, v[len(v)/2])
+		m := median(v)
+		diff := ""
+		if base > 0 {
+			diff = fmt.Sprintf("（%+d%% vs 不发）", (m-base)*100/base)
+		}
+		fmt.Printf("  %-8s 各轮 %v → 中位数 %d %s\n", label(e), v, m, diff)
 	}
+}
+
+// median 中位数（偶数个取中间偏上那个：样本就这么几个，不值得插值）。
+func median(v []int) int {
+	if len(v) == 0 {
+		return 0
+	}
+	s := append([]int(nil), v...)
+	sort.Ints(s)
+	return s[len(s)/2]
 }
 
 // answerOf 取聚合结果的回答正文，压成一行（探针只关心「答对没」和思考长度）。

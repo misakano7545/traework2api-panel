@@ -120,10 +120,12 @@ go build -o tw2api ./cmd/server
 相关字段（`model_extra_config` 里的 `Thinking.Type`、`reasoning_effort_config` 原文），不做解释和换算。
 
 客户端自己带的 `reasoning_effort` 之类字段是**原样透传**上游的，不认的也一个不吞（`PrepareBody` 只改
-`stream`/`function`/`config_name`/`model`/`tools`）。实测 `glm-5.2` 各 4 次：带 `low` 时
-`reasoning_tokens` 中位数 280，不发 / `high` 分别是 329 / 329 —— 上游很可能真读这个字段，而 `high`
-与默认一致；非法值、错类型、未知键都不会让请求失败。复跑：
-`TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v`（吃额度，13 次约 2 积分）。
+`stream`/`function`/`config_name`/`model`/`tools`）。实测 `glm-5.2` 全档各 3 次，`reasoning_tokens`
+中位数：不发 331 / `none` 345 / `minimal` 337 / `low` 314 / `medium` 313 / `high` 330 —— 全在 ±5%
+抖动带里，连 `none`、`minimal` 都没把思考关掉，也就是**上游不按这个字段调档，静默忽略**（各档内单次
+波动 ±20%，大于档位间差异）。非法值、错类型、未知键都不会让请求失败。复跑：
+`TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v`（吃额度，19 次约 5 积分；
+`TW2A_PROBE_ROUNDS=8` 加样本，`TW2A_PROBE_MODEL=` 换模型）。
 
 可签到、刷新剩余积分、禁用、解除冷却、移除，以及粘贴登录回调后立刻写入 `auths/trae-{uid}.json` 并进池，不用重启。
 
