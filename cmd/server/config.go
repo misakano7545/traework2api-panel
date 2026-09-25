@@ -16,7 +16,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -35,12 +34,6 @@ type Config struct {
 	StateFile string `json:"state_file"` // "./data/state.json"
 	// DefaultModel trae 扩展：wb 无此键（它按 /v1/models 列表路由）。请求缺 model 时用它。
 	DefaultModel string `json:"default_model"` // "glm-5.2"
-
-	// Login trae 扩展：登录回跳。空 callback_url = 用 listen 拼本机地址（面板和浏览器同机时够用），
-	// 异机/隧道部署就填面板自己那个对外地址（浏览器能打开的那个）。
-	Login struct {
-		CallbackURL string `json:"callback_url"` // "" = http://<listen>/panel/oauth/callback/<id>
-	} `json:"login"`
 
 	Cooldown struct {
 		// PlanCredit trae 扩展：1005 权益不足的硬冷却时长（wb 固定成"到次日 04:00"，没有键）。
@@ -335,16 +328,6 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
-	}
-	// 登录回跳前缀：空 = 用 listen 拼本机地址；填了就必须真能拼出 http(s) 地址，
-	// 否则登录链接会静默坏掉（浏览器点过去一片白），比启动即报错难查得多。
-	c.Login.CallbackURL = strings.TrimSpace(c.Login.CallbackURL)
-	if c.Login.CallbackURL != "" {
-		u, err := url.Parse(c.Login.CallbackURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("login.callback_url: 需要 http(s)://host[:port] 形式的地址（例 https://panel.example.com）")
-		}
-		c.Login.CallbackURL = strings.TrimRight(c.Login.CallbackURL, "/")
 	}
 	if c.Pool.ExpiringSoon != "" {
 		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {

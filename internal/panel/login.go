@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,13 +18,20 @@ import (
 	"traework2api/internal/upstream"
 )
 
-const (
-	loginTTL = 15 * time.Minute
-	// CallbackPath 登录回跳路径，后面接一次性登录会话 id（32 位 hex）。
-	CallbackPath = "/panel/oauth/callback/"
-)
+const loginTTL = 15 * time.Minute
 
-// errLoginSession 登录会话不存在或过期。文案直接给浏览器看，不夹内部细节。
+// traeCallback TRAE 授权页只认它自己 IDE 的这条回调地址，写死，不做成配置项。
+//
+// 实测（换任何别的地址都被拒，页面直接「登录失败 / 网络错误，请刷新页面重试」）：
+//   - https://<面板隧道域名>/panel/oauth/callback/<id>  ✗
+//   - http://127.0.0.1:7864/panel/oauth/callback/test   ✗
+//   - http://127.0.0.1:18080/panel/oauth/callback/test  ✗（端口对、路径不对也不行）
+//   - http://127.0.0.1:18080/authorize                  ✓ 只有这条进得来登录页
+//
+// 所以面板拿不到回跳，只能把浏览器地址栏粘回面板换票；做成可配置项只会再走进一次这个死胡同。
+// 想免粘贴，得在**浏览器那台机器**上跑个监听 18080 的本机中继（面板在服务器上时它够不着）。
+const traeCallback = "http://127.0.0.1:18080/authorize"
+
 var errLoginSession = errors.New("登录链接已失效，请回面板重新点「登录账号」")
 
 type loginSession struct {
@@ -52,7 +57,7 @@ func randHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func loginURL(machine, device, callback string) (string, error) {
+func loginURL(machine, device string) (string, error) {
 	trace, err := randHex(8)
 	if err != nil {
 		return "", err
@@ -66,7 +71,7 @@ func loginURL(machine, device, callback string) (string, error) {
 	q.Set("client_id", upstream.ClientID)
 	q.Set("redirect", "0")
 	q.Set("login_trace_id", trace)
-	q.Set("auth_callback_url", callback)
+	q.Set("auth_callback_url", traeCallback)
 	q.Set("machine_id", machine)
 	q.Set("device_id", device)
 	q.Set("x_device_id", device)
@@ -77,36 +82,6 @@ func loginURL(machine, device, callback string) (string, error) {
 	q.Set("x_app_version", upstream.IdeVersion)
 	q.Set("x_app_type", "stable")
 	return "https://www.trae.cn/authorization?" + q.Encode(), nil
-}
-
-// callbackURL 登录回跳地址：配了 login.callback_url（面板对外地址）就用它——异机/隧道场景
-// 必须填浏览器够得着的那一个；没配就按 listen 拼本机地址（面板和浏览器同机时直接可用）。
-// 地址末尾的一次性 id 是这条路免鉴权的兜底：只有刚点过登录的那次会话认得它，15 分钟过期、成功即删。
-func (p *Panel) callbackURL(id string) string {
-	base := p.loginBase()
-	if base == "" {
-		base = "http://" + loopbackAddr(p.cfg.Listen)
-	}
-	return strings.TrimRight(base, "/") + CallbackPath + id
-}
-
-func (p *Panel) loginBase() string {
-	if p.cfg.LoginCallback == nil {
-		return ""
-	}
-	return strings.TrimSpace(p.cfg.LoginCallback())
-}
-
-// loopbackAddr listen → 浏览器同机时够得着的地址：":7864"/"0.0.0.0:7864" 都落到 127.0.0.1。
-func loopbackAddr(listen string) string {
-	host, port, err := net.SplitHostPort(listen)
-	if err != nil {
-		return "127.0.0.1:7864"
-	}
-	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
-		host = "127.0.0.1"
-	}
-	return net.JoinHostPort(host, port)
 }
 
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +100,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "random failed")
 		return
 	}
-	link, err := loginURL(machine, device, p.callbackURL(id))
+	link, err := loginURL(machine, device)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "login url failed")
 		return
@@ -176,43 +151,7 @@ func (p *Panel) loginFinish(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "nickname": nick})
 }
 
-// oauthCallback 登录回跳：浏览器从 trae.cn 302 过来带不了 Authorization 头，所以这条路免鉴权
-// （不套 withAuth）。兜底就是地址里的一次性 id + loginTTL + 成功即删——和粘贴那条路共用同一个会话表，
-// 不新增状态机。只回文案，绝不再吐出任何 token。
-func (p *Panel) oauthCallback(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	cb, err := parseCallback(r.URL.String())
-	if err != nil {
-		p.callbackPage(w, http.StatusBadRequest, "没拿到登录凭据", "请回面板重新点「登录账号」。")
-		return
-	}
-	uid, nick, code, err := p.completeLogin(id, cb)
-	if err != nil {
-		log.Printf("panel: oauth callback failed id=%s", id) // id 不是凭据；URL 本身（带 token）不进日志
-		p.callbackPage(w, code, "登录未完成", err.Error())
-		return
-	}
-	name := nick
-	if name == "" {
-		name = uid
-	}
-	p.callbackPage(w, http.StatusOK, "登录完成", "已加入："+name+"。可以关闭本页回面板了。")
-}
-
-// callbackPage 回调结果页。纯文案，不回显任何凭据。
-func (p *Panel) callbackPage(w http.ResponseWriter, code int, title, detail string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(code)
-	_, _ = fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>%s</title>`+
-		`<body style="font:15px/1.7 system-ui;margin:0;height:100vh;display:grid;place-items:center;background:#0f1115;color:#e8e8e8">`+
-		`<div style="text-align:center;max-width:34em;padding:0 20px"><h1 style="font-size:19px;margin:0 0 8px">%s</h1>`+
-		`<p style="margin:0;opacity:.72">%s</p></div>`,
-		html.EscapeString(title), html.EscapeString(title), html.EscapeString(detail))
-}
-
-// completeLogin 换票 → GetUserInfo → 落盘 → 进池 → 删会话。粘贴回调和自动回调共用这一份内核，
-// 所以两条路的行为（文件权限、去重、池热加载）永远一致。code 给调用方决定 HTTP 状态。
+// completeLogin 换票 → GetUserInfo → 落盘 → 进池 → 删会话。手动粘贴回调就走这一条路。
 func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, code int, err error) {
 	p.loginMu.Lock()
 	sess, ok := p.logins[id]

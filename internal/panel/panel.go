@@ -38,12 +38,6 @@ type Config struct {
 	ConfigPath string
 	LoadConfig func() (any, error)
 	SaveConfig func(raw []byte) ([]string, error)
-
-	// Listen 进程的监听地址（":7864"）。登录回跳没配 login.callback_url 时按它拼本机地址。
-	Listen string
-	// LoginCallback 可选：面板对外地址（配置里的 login.callback_url），登录回跳前缀。
-	// 用 getter 而不是值——面板保存配置后要立刻生效，不重启。
-	LoginCallback func() string
 }
 
 // Panel 挂在 /panel/ 下，pattern 使用完整路径。
@@ -86,9 +80,6 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("POST /panel/api/login/finish", p.withAuth(p.loginFinish))
-	// 登录回跳：浏览器 302 过来，带不了 Authorization 头，所以这条**故意**不套 withAuth。
-	// 安全边界是一次性 id（只有刚点过登录的会话认得）+ 15 分钟 TTL + 成功即删。
-	p.mux.HandleFunc("GET /panel/oauth/callback/{id}", p.oauthCallback)
 	p.mux.HandleFunc("POST /panel/api/checkin", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/balance", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))

@@ -131,32 +131,6 @@ func TestBadDuration(t *testing.T) {
 	}
 }
 
-// login.callback_url 会拼进登录链接，填了就必须真能拼出 http(s) 地址。
-func TestLoginCallbackURLNormalize(t *testing.T) {
-	base := Default()
-	next, err := ParseBody(base, []byte(`{"login":{"callback_url":"https://panel.example.com/"}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 末尾斜杠去掉：拼回跳地址时不该出现双斜杠。
-	if next.Login.CallbackURL != "https://panel.example.com" {
-		t.Fatalf("got %q", next.Login.CallbackURL)
-	}
-	for _, bad := range []string{"panel.example.com", "ftp://panel.example.com", "http://", "/panel/"} {
-		if _, err := ParseBody(base, []byte(`{"login":{"callback_url":"`+bad+`"}}`)); err == nil {
-			t.Fatalf("%q 应该被拒", bad)
-		}
-	}
-	// 空 = 用 listen 拼本机地址，合法；也不是重启项（面板保存后立即生效）。
-	empty, err := ParseBody(base, []byte(`{"login":{"callback_url":""}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := RestartFields(base, empty); len(got) != 0 {
-		t.Fatalf("不该报重启: %v", got)
-	}
-}
-
 // 排程时点没有运行时 setter，改了必须报重启——否则面板谎称已生效。
 func TestRestartFieldsReportKeepaliveHours(t *testing.T) {
 	base := Default()

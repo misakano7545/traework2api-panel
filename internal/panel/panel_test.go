@@ -453,91 +453,22 @@ func TestRingScrubsSecrets(t *testing.T) {
 	}
 }
 
-// 自动回调：点登录 → trae.cn 把浏览器跳回面板自己的回调地址 → 面板换票落盘，全程不粘贴。
-func TestOAuthCallbackAutoLogin(t *testing.T) {
-	const access = "auto-secret-access"
-	const refresh = "auto-secret-refresh"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/ExchangeToken"):
-			w.Write([]byte(`{"Result":{"Token":"` + access + `","RefreshToken":"` + refresh + `-new","TokenExpireAt":1786805537000}}`))
-		case strings.HasSuffix(r.URL.Path, "/GetUserInfo"):
-			w.Write([]byte(`{"Result":{"UserID":"user_auto","ScreenName":"nick","EnterpriseID":"ent"}}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-	up := upstream.New()
-	up.HTTP = srv.Client()
-	up.OAuthHost = srv.URL
-	const pub = "https://panel.example.com"
-	pl := pool.New("")
-	p := New(Config{Pool: pl, Upstream: up, AuthDir: t.TempDir(), APIKey: "k", Logs: NewRing(20),
-		Listen: "127.0.0.1:7864", LoginCallback: func() string { return pub }})
-
+// 自动回调：TRAE 只认它自己的本机回调地址，所以登录链接里必须就是那一条（换任何别的地址
+// 授权页直接「登录失败 / 网络错误」），面板拿不到回跳，只能靠粘贴。
+func TestLoginLinkUsesTraeCallback(t *testing.T) {
+	p := New(Config{Pool: pool.New(""), APIKey: "k"})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/panel/api/login/start", strings.NewReader("{}"))
 	req.Header.Set("Authorization", "Bearer k")
 	p.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Fatal(rec.Body)
-	}
 	var start struct {
-		ID  string `json:"id"`
 		URL string `json:"url"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &start); err != nil {
 		t.Fatal(err)
 	}
-	// 登录链接必须带面板自己的回调地址（含本次一次性 id），不是写死的 18080。
-	if want := url.QueryEscape(pub + "/panel/oauth/callback/" + start.ID); !strings.Contains(start.URL, want) {
-		t.Fatalf("登录链接没带面板回调地址: %s", start.URL)
-	}
-	if strings.Contains(start.URL, "18080") {
-		t.Fatal("还在用写死的 18080")
-	}
-
-	// 浏览器 302 过来：没有 Authorization 头也必须能过（这条路故意不鉴权）。
-	rec = httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/oauth/callback/"+start.ID+"?refreshToken="+refresh, nil))
-	if rec.Code != 200 {
-		t.Fatalf("callback %d %s", rec.Code, rec.Body)
-	}
-	if strings.Contains(rec.Body.String(), refresh) || strings.Contains(rec.Body.String(), access) {
-		t.Fatal("回调页回显了 token")
-	}
-	if pl.AuthByUID("user_auto") == nil {
-		t.Fatal("账号没热加载进池")
-	}
-	// 一次性 id：同一个会话不能重放。
-	rec = httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/oauth/callback/"+start.ID+"?refreshToken="+refresh, nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("重放应被拒: %d", rec.Code)
-	}
-}
-
-// 没配 login.callback_url 时落回本机地址，":7864" 这种省略 host 的 listen 也要拼得出来。
-func TestOAuthCallbackDefaultBaseAndMissingCreds(t *testing.T) {
-	p := New(Config{Pool: pool.New(""), APIKey: "k", Listen: ":7864"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/panel/api/login/start", strings.NewReader("{}"))
-	req.Header.Set("Authorization", "Bearer k")
-	p.ServeHTTP(rec, req)
-	var start struct {
-		ID  string `json:"id"`
-		URL string `json:"url"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &start)
-	if want := url.QueryEscape("http://127.0.0.1:7864/panel/oauth/callback/" + start.ID); !strings.Contains(start.URL, want) {
-		t.Fatalf("默认回跳地址不对: %s", start.URL)
-	}
-	// 回跳里没有凭据：给报错页，不写任何凭据文件。
-	rec = httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/oauth/callback/"+start.ID, nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("无凭据 code=%d", rec.Code)
+	if !strings.Contains(start.URL, url.QueryEscape(traeCallback)) {
+		t.Fatalf("登录链接没带 TRAE 认的那条回调: %s", start.URL)
 	}
 }
 

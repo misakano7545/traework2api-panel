@@ -158,12 +158,6 @@ func main() {
 		Models:     h.Models,
 		Usage:      rec,
 		ConfigPath: *cfgPath,
-		Listen:     cfg.Listen,
-		LoginCallback: func() string {
-			cfgMu.Lock()
-			defer cfgMu.Unlock()
-			return cfg.Login.CallbackURL
-		},
 		LoadConfig: func() (any, error) {
 			cfgMu.Lock()
 			defer cfgMu.Unlock()
