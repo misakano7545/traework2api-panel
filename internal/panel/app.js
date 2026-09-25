@@ -454,6 +454,7 @@ function openAdd() {
   $('addDone').hidden = true;
   $('addErr').hidden = true;
   $('btnCopyUrl').hidden = true;
+  $('btnOpenUrl').hidden = true;
   $('btnAddFinish').hidden = true;
   $('callback').value = '';
   $('addVeil').classList.add('on');
@@ -463,6 +464,7 @@ function openAdd() {
     $('addLoad').hidden = true;
     $('addReady').hidden = false;
     $('btnCopyUrl').hidden = false;
+    $('btnOpenUrl').hidden = false;
     $('btnAddFinish').hidden = false;
   }).catch(e => {
     $('addLoad').hidden = true;
@@ -522,6 +524,8 @@ function boot() {
   $('btnCopyUrl').onclick = () => {
     if (navigator.clipboard) navigator.clipboard.writeText($('addUrl').textContent).catch(() => {});
   };
+  // 新标签页打开：点击是用户手势，弹窗拦截不挡；noopener 不给新页面 window.opener 句柄。
+  $('btnOpenUrl').onclick = () => window.open($('addUrl').textContent, '_blank', 'noopener');
   $('btnAddFinish').onclick = finishAdd;
   $('callback').addEventListener('keydown', e => { if (e.key === 'Enter') finishAdd(); });
   $('btnKey').onclick = submitKey;

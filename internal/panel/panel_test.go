@@ -430,6 +430,9 @@ func TestPanelServesUsageColumn(t *testing.T) {
 		{"/panel/", "<th>思考</th>"},
 		{"/panel/app.js", "function thinkCell("},
 		{"/panel/app.js", "reasoning_effort_config"},
+		// 添加账号弹窗：复制链接旁的「在浏览器中打开」
+		{"/panel/", `id="btnOpenUrl"`},
+		{"/panel/app.js", "$('btnOpenUrl').onclick"},
 	} {
 		w := httptest.NewRecorder()
 		p.ServeHTTP(w, httptest.NewRequest("GET", c.path, nil))
