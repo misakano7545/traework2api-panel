@@ -13,11 +13,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"traework2api/internal/auth"
 )
@@ -167,5 +169,98 @@ func TestProbeLive(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestProbeLiveReasoningEffort 花额度的一次性探测：上游 llm_utils_chat 到底认不认客户端传来的
+// reasoning_effort？原理是发个非法值——上游要是解析这个字段就会 400，静默忽略就是 200。
+// 加一个控制组（随机未知键）才能定责：万一 400 是因为「拒绝一切未知字段」，那就不是认得 effort，
+// 而是我们透传客户端设置会让请求直接失败（更糟，得改）。
+//
+// 三次极短请求（prompt "hi"、max_tokens 8）：
+//
+//	A 基线，无额外字段           200 → 链路本身通
+//	B reasoning_effort=__bogus__ 400 → 上游解析该字段 / 200 → 静默忽略
+//	C 未知键 __x_unknown_key__   400 → 上游拒绝一切未知字段（那 B 的 400 不算数）
+//
+// 手动跑：TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveReasoningEffort -v
+// 换模型：TW2A_PROBE_MODEL=doubao-seed-evolving（默认 kimi-k3，它的 Thinking.Type=enabled）
+func TestProbeLiveReasoningEffort(t *testing.T) {
+	if os.Getenv("TW2A_PROBE_CHAT") == "" {
+		t.Skip("置 TW2A_PROBE_CHAT=1 才跑（真实发聊天请求，吃额度）")
+	}
+	dir := os.Getenv("TW2A_AUTH_DIR")
+	if dir == "" {
+		dir = "../../auths"
+	}
+	as, err := auth.LoadDir(dir)
+	if err != nil || len(as) == 0 {
+		t.Fatalf("加载账号失败: %v (dir=%s)", err, dir)
+	}
+	a := as[0]
+	c := New()
+	// 探测用的短请求不该挂死：给个总超时（生产流式客户端故意不设）。
+	c.StreamHTTP = &http.Client{Timeout: 60 * time.Second, Transport: c.StreamHTTP.Transport}
+
+	model := os.Getenv("TW2A_PROBE_MODEL")
+	if model == "" {
+		model = "kimi-k3"
+	}
+	base := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"max_tokens":8`
+	short := func(b []byte) string {
+		if len(b) > 240 {
+			b = b[:240]
+		}
+		return string(b)
+	}
+	// send 只发不回放：SSE 读 240 字节就掐（够看开头，不整条烧完输出）。
+	send := func(body string) (status int, head, rejected []byte) {
+		rc, st, respBody, err := c.ChatStream(a, []byte(body))
+		if err != nil {
+			return 0, nil, []byte(err.Error())
+		}
+		if rc != nil {
+			b, _ := io.ReadAll(io.LimitReader(rc, 240))
+			rc.Close()
+			return st, b, nil
+		}
+		return st, nil, respBody
+	}
+
+	// A 基线兼「账号还活着吗」探针：session 死的账号上游 401，不花额度，直接换下一个。
+	fmt.Printf("\n===== 探测 %s：上游认不认 reasoning_effort（每请求 prompt=hi, max_tokens=8）\n", model)
+	live := false
+	for _, cand := range as {
+		a = cand
+		status, _, rejected := send(base + "}")
+		fmt.Printf("----- A 基线（账号 %s，无额外字段）→ %d %s\n", a.UID, status, short(rejected))
+		if status < 400 {
+			live = true
+			break
+		}
+		fmt.Println("      这个账号不可用，换下一个")
+	}
+	if !live {
+		t.Fatal("没有可用账号，探测无意义（先跑 cmd/signin 刷新 token）")
+	}
+
+	for _, tc := range []struct{ label, extra string }{
+		{"B reasoning_effort=__bogus__（非法枚举值）", `,"reasoning_effort":"__bogus__"`},
+		{"C 控制组：未知键 __x_unknown_key__", `,"__x_unknown_key__":"1"`},
+		// D/E 用「类型不对」比枚举值更硬：上游 struct 里真有 reasoning_effort 这个字段
+		// （哪怕类型是 string），塞个数字进去就会反序列化失败 → 400。
+		// E 是对照：拿一个上游肯定有的字段（max_tokens）塞字符串，验证这个端点的类型错误确实会 400，
+		// 否则 D 的 200 什么也证明不了。
+		{"D reasoning_effort=12345（类型不对）", `,"reasoning_effort":12345`},
+		{"E 对照：max_tokens=\"eight\"（已知字段，类型不对）", `,"max_tokens":"eight"`},
+	} {
+		body := base + tc.extra + "}"
+		status, head, rejected := send(body)
+		fmt.Printf("----- %s\n  发出: %s\n  → %d ", tc.label, body, status)
+		if rejected != nil {
+			fmt.Printf("拒绝，上游原话: %s\n", short(rejected))
+			continue
+		}
+		fmt.Printf("通了，SSE 前 240 字节: %s\n", short(head))
 	}
 }
