@@ -25,12 +25,14 @@ var (
 	tsPrefixRe = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} `)
 	secretRE   = regexp.MustCompile(`(?i)((?:bearer|cloud-ide-jwt)\s+|(?:refresh|access)_?token(?:=|"\s*:\s*"))[^&\s"]+`)
 	jsonSecret = regexp.MustCompile(`(?i)"(?:accessToken|refreshToken|token|RefreshToken)"\s*:\s*"[^"]*"`)
-	callbackRE = regexp.MustCompile(`https?://\S*authorize\?\S+`)
+	// 带凭据参数的 URL：路径不固定（面板自己的 /panel/oauth/callback/{id}、TRAE 的 /authorize、
+	// 自建隧道的任意路径），所以只认参数名，不认路径。
+	callbackRE = regexp.MustCompile(`https?://\S*\?\S*(?:refreshToken|accessToken|userJwt|userInfo)\S*`)
 	apiKeyRE   = regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}`)
 )
 
 func scrub(line string) string {
-	line = callbackRE.ReplaceAllString(line, "http://127.0.0.1/authorize?********")
+	line = callbackRE.ReplaceAllString(line, "https://panel/callback?********")
 	line = jsonSecret.ReplaceAllString(line, `"token":"********"`)
 	line = apiKeyRE.ReplaceAllString(line, "sk-********")
 	return secretRE.ReplaceAllString(line, "${1}********")

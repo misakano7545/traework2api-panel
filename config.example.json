@@ -4,6 +4,9 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "default_model": "glm-5.2",
+  "login": {
+    "callback_url": ""
+  },
   "cooldown": {
     "plan_credit": "12h",
     "soft_rate": "60s",

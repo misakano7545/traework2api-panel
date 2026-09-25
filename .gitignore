@@ -23,6 +23,7 @@ docs/
 
 # 构建产物
 *.tmp
+*.log
 __pycache__/
 
 # IDE

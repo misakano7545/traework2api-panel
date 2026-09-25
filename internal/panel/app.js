@@ -351,6 +351,7 @@ async function loadUsage(quiet) {
 const CFG_MAP = {
   // 服务
   listen: ['listen'], auth_dir: ['auth_dir'], state_file: ['state_file'],
+  login_callback_url: ['login', 'callback_url'],
   // 排程（整段改动需重启）
   checkin_hours: ['schedule', 'checkin_hours'], keepalive_hours: ['schedule', 'keepalive_hours'],
   checkin_enabled: ['schedule', 'checkin_enabled'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
@@ -432,8 +433,8 @@ function collectConfig() {
     const el = f.elements[name];
     if (!el) continue;
     const raw = el.value.trim();
-    // api_key 例外：空也要提交（清空 = 关鉴权）；其他字段留空表示"沿用现值"。
-    if (name === 'api_key') { put(cfgLoaded, path, raw); continue; }
+    // api_key / 登录回跳地址例外：空也要提交（清空 = 关鉴权 / 回落本机地址）。
+    if (name === 'api_key' || name === 'login_callback_url') { put(cfgLoaded, path, raw); continue; }
     if (raw === '') continue;                       // 空 = 沿用现值
     if (ARRAY_FIELDS.includes(name)) {
       put(cfgLoaded, path, raw.split(/[,，\s]+/).filter(Boolean).map(Number));
