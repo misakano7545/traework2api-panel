@@ -107,6 +107,39 @@ func TestProbeLive(t *testing.T) {
 		fmt.Println()
 	}
 
+	// ---------- 3. 思考强度档位：原样 dump（低/中/高这类到底有没有上游来源） ----------
+	var rawTop struct {
+		ConfigInfoList []map[string]any `json:"config_info_list"`
+	}
+	if err := json.Unmarshal(data, &rawTop); err == nil {
+		keys := map[string]any{}
+		for _, cfg := range rawTop.ConfigInfoList {
+			for k := range cfg {
+				keys[k] = true
+			}
+		}
+		fmt.Printf("\n===== 配置项顶层字段并集: %s\n", probeKeys(keys))
+		fmt.Println("----- 官方模型原样（找思考强度档位）")
+		for _, cfg := range rawTop.ConfigInfoList {
+			if cfg["usage"] != usageChat || cfg["is_invisible_to_user"] == true {
+				continue
+			}
+			fmt.Printf("  %-32s reasoning_effort_config=%v\n", cfg["config_name"], cfg["reasoning_effort_config"])
+			fmt.Printf("      display_config=%v\n      extra_config=%v\n      config_switch=%v\n",
+				cfg["display_config"], cfg["extra_config"], cfg["config_switch"])
+			if dl, ok := cfg["model_detail_list"].([]any); ok && len(dl) > 0 {
+				if dm, ok := dl[0].(map[string]any); ok {
+					extra, _ := dm["model_extra_config"].(string)
+					if len(extra) > 300 {
+						extra = extra[:300] + "…（截断）"
+					}
+					fmt.Printf("      detail keys: [%s]\n      model_extra_config=%.300s\n",
+						probeKeys(dm), extra)
+				}
+			}
+		}
+	}
+
 	// ---------- 2. ide_user_ent_usage：{} vs 真实客户端体 ----------
 	for _, b := range []string{`{}`, `{"require_usage":true,"full_data":true}`} {
 		req, rerr := http.NewRequest(http.MethodPost, c.UgHost+EpEntUsage, bytes.NewReader([]byte(b)))

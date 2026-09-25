@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -439,6 +440,17 @@ func TestPanelServesUsageColumn(t *testing.T) {
 		if w.Code != 200 || !strings.Contains(w.Body.String(), c.want) {
 			t.Fatalf("%s 缺少 %q (code=%d)", c.path, c.want, w.Code)
 		}
+	}
+}
+
+// 思考列渲染自检：真跑 node 里那份 thinkcell_check.mjs（它从 app.js 抠函数，不测副本）。
+// 没装 node 就跳过——显示层断言不该挡住 go test。
+func TestThinkCellRendering(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("没装 node，跳过思考列渲染自检")
+	}
+	if out, err := exec.Command("node", "thinkcell_check.mjs").CombinedOutput(); err != nil {
+		t.Fatalf("thinkcell_check.mjs 失败: %v\n%s", err, out)
 	}
 }
 

@@ -213,15 +213,30 @@ async function loadOverview(quiet) {
 }
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
-/* 思考档位：上游给什么显示什么，不解释不换算。
-   thinking = model_extra_config 里的 Thinking.Type（实测 kimi 三兄弟为 enabled，其余为空）；
-   reasoning_effort_config = 上游原值（实测 {"support_thinking":false}，没有该字段则为空）。 */
+/* 思考列：上游这条接口**没有** low/medium/high 档位列表（2026-09 实测 15 个官方模型：
+   kimi 三兄弟给 model_extra_config.Thinking.Type=enabled，Doubao 三条给 reasoning_effort_config={"support_thinking":false}，
+   其余 12 条两个字段都没有；顶层再无其它 effort/thinking 键）。
+   所以不编档位：有什么说什么，原值塞进 title，什么都没有就明说「上游未给」。 */
 function thinkCell(m) {
+  const raw = [];
+  if (m.thinking) raw.push('thinking=' + m.thinking);
+  if (m.reasoning_effort_config) raw.push(m.reasoning_effort_config);
+  if (!raw.length) {
+    return '<span class="tag mute" title="上游没给思考字段，也没有 low/medium/high 档位列表">上游未给</span>';
+  }
   const parts = [];
-  if (m.thinking) parts.push('thinking=' + m.thinking);
-  if (m.reasoning_effort_config) parts.push(m.reasoning_effort_config);
-  if (!parts.length) return '—';
-  return '<span class="tag mute" title="上游原值">' + esc(parts.join(' · ')) + '</span>';
+  if (m.thinking) parts.push('思考：' + (m.thinking === 'enabled' ? '开' : m.thinking));
+  if (m.reasoning_effort_config) parts.push('思考开关：' + switchLabel(m.reasoning_effort_config));
+  return '<span class="tag mute" title="上游原值：' + esc(raw.join(' · ')) + '">' + esc(parts.join(' · ')) + '</span>';
+}
+/* support_thinking:true/false → 支持/不支持；形状不认识就原样显示，不猜。
+   上游哪天在这段 JSON 里加了档位列表之类的其它键，就把它原样补在后面，别被这个标签吞掉。 */
+function switchLabel(cfg) {
+  const m = /"support_thinking"\s*:\s*(true|false)/.exec(cfg);
+  if (!m) return cfg;
+  const label = (m[1] === 'true' ? '支持' : '不支持') + '（support_thinking=' + m[1] + '）';
+  const rest = cfg.replace(/"support_thinking"\s*:\s*(?:true|false)\s*,?/, '').replace(/^\{\s*|\s*\}$/g, '').trim();
+  return rest ? label + ' ' + cfg : label;
 }
 async function loadModels() {
   const tb = $('mdBody');
