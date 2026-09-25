@@ -26,8 +26,15 @@ type row struct {
 
 func main() {
 	dir := "auths"
-	if len(os.Args) > 1 {
-		dir = os.Args[1]
+	force := false
+	for _, arg := range os.Args[1:] {
+		if arg == "-force" {
+			// 上游 401 code 1001（session 被吊销）时 token 往往还没到 expiresAt，
+			// 光看有效期不会刷新 —— 强制走一次 ExchangeToken 看能不能把会话救回来。
+			force = true
+			continue
+		}
+		dir = arg
 	}
 	files, err := filepath.Glob(filepath.Join(dir, "trae-*.json"))
 	if err != nil || len(files) == 0 {
@@ -59,7 +66,7 @@ func main() {
 		r.uid, r.nick = a.UID, a.Nickname
 
 		// refresh 过期 token
-		if a.NeedsRefresh(2 * time.Hour) {
+		if force || a.NeedsRefresh(2*time.Hour) {
 			if err := up.RefreshToken(a); err != nil {
 				if ue, ok := err.(*upstream.Error); ok && ue.Kind == upstream.ErrSessionDead {
 					r.status = "AUTH_INVALID"

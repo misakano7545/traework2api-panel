@@ -47,8 +47,6 @@ func TestProbeLive(t *testing.T) {
 		t.Fatalf("加载账号失败: %v (dir=%s)", err, dir)
 	}
 	a := as[0]
-	t.Logf("账号 uid=%s（不打印 token）", a.UID)
-
 	c := New()
 
 	// ---------- 1. get_detail_param 决策表 ----------
@@ -58,15 +56,26 @@ func TestProbeLive(t *testing.T) {
 		"mode_type": nil, "agent_type": nil,
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.AgentHost+EpModels, bytes.NewReader(raw))
-	if err != nil {
-		t.Fatal(err)
+	// 表是只读的，用哪条账号取都一样：拿它当「账号还活着吗」的探针，session 死的自动跳过。
+	var data []byte
+	for _, cand := range as {
+		req, rerr := http.NewRequest(http.MethodPost, c.AgentHost+EpModels, bytes.NewReader(raw))
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		SOLOHeaders(req, cand, false)
+		d, derr := c.doJSON(req)
+		if derr != nil {
+			fmt.Printf("----- 账号 %s get_detail_param 失败: %v，换下一个\n", cand.UID, derr)
+			continue
+		}
+		a, data = cand, d
+		break
 	}
-	SOLOHeaders(req, a, false)
-	data, err := c.doJSON(req)
-	if err != nil {
-		t.Fatalf("get_detail_param: %v", err)
+	if data == nil {
+		t.Fatal("没有账号能取到模型表（都过期了？先跑 cmd/signin）")
 	}
+	t.Logf("账号 uid=%s（不打印 token）", a.UID)
 	var top struct {
 		ConfigInfoList []paramConfig `json:"config_info_list"`
 	}
@@ -141,6 +150,25 @@ func TestProbeLive(t *testing.T) {
 				}
 			}
 		}
+	}
+
+	// ---------- 4. 指定配置的原样 JSON ----------
+	// 默认拿被套餐挡的 kimi-k3 和能用的 kimi-k2.6 对照：差在哪个字段，就是 gating 的线索。
+	want := os.Getenv("TW2A_PROBE_DUMP")
+	if strings.TrimSpace(want) == "" {
+		want = "kimi-k3,kimi-k2.6"
+	}
+	names := map[string]bool{}
+	for _, n := range strings.Split(want, ",") {
+		names[strings.TrimSpace(n)] = true
+	}
+	for _, cfg := range rawTop.ConfigInfoList {
+		name, _ := cfg["config_name"].(string)
+		if !names[name] {
+			continue
+		}
+		b, _ := json.MarshalIndent(cfg, "  ", "  ")
+		fmt.Printf("\n===== 原样 JSON: %s（%d 字节）\n  %s\n", name, len(b), b)
 	}
 
 	// ---------- 2. ide_user_ent_usage：{} vs 真实客户端体 ----------
