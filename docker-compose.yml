@@ -5,9 +5,11 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      - TW2A_API_KEY=${TW2A_API_KEY:?set TW2A_API_KEY in .env or shell}   # key 走 env，不落盘 git
     ports:
       - "7864:7864"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
+      # api_key（以及其它配置）只认 config.json，面板「配置」页改的就是这一份。
+      # 必须挂出来：不挂的话容器重建就把面板里改过的密钥丢了。宿主机先 cp config.example.json config.json。
+      - ./config.json:/app/config.json

@@ -58,6 +58,16 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
 }
 
+// BusinessError 是 HTTP 成功但上游业务拒绝。
+type BusinessError struct {
+	Code    int
+	Message string
+}
+
+func (e *BusinessError) Error() string {
+	return fmt.Sprintf("%s (code %d)", e.Message, e.Code)
+}
+
 var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §4.3）。
@@ -99,6 +109,9 @@ type Client struct {
 	// 通过 Transport.ResponseHeaderTimeout 兜底「上游一直不返回首字节」的悬挂。
 	// 与 HTTP 共享同一 Transport（连接池复用）。nil 时 ChatStream 回退 HTTP。
 	StreamHTTP *http.Client
+
+	// idleTimeout 聊天 SSE 流内空闲上限（0 = 不看门狗）。由 SetTimeouts 更新。
+	idleTimeout time.Duration
 
 	AgentHost string // https://trae-api-cn.mchost.guru
 	UgHost    string // https://api.trae.cn
@@ -194,11 +207,11 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 	}
 	var resp struct {
 		Result struct {
-			Token                string `json:"Token"`
-			TokenExpireAt        int64  `json:"TokenExpireAt"`
-			TokenExpireDuration  int64  `json:"TokenExpireDuration"`
-			RefreshToken         string `json:"RefreshToken"`
-			RefreshExpireAt      int64  `json:"RefreshExpireAt"`
+			Token               string `json:"Token"`
+			TokenExpireAt       int64  `json:"TokenExpireAt"`
+			TokenExpireDuration int64  `json:"TokenExpireDuration"`
+			RefreshToken        string `json:"RefreshToken"`
+			RefreshExpireAt     int64  `json:"RefreshExpireAt"`
 		} `json:"Result"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -257,6 +270,9 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
+	if c.idleTimeout > 0 {
+		return &idleTimeoutReader{rc: resp.Body, idle: c.idleTimeout}, resp.StatusCode, nil, nil
+	}
 	return resp.Body, resp.StatusCode, nil, nil
 }
 
@@ -266,9 +282,87 @@ type ModelInfo struct {
 	Name          string
 	ContextWindow int64 // = maxInputTokens
 	MaxTokens     int64 // = maxOutputTokens
+
+	// 思考相关三个字段按上游原样搬，不解释、不换算（面板「能力 / 思考」列如实显示）：
+	//   Capability = display_config.model_capability（实测 15 个官方模型全是 reasoning_model）
+	//   Thinking   = model_detail_list[0].model_extra_config 里 Thinking.Type（enabled / 空）
+	//   Effort     = reasoning_effort_config 原文（如 {"support_thinking":false}；上游没给则空）
+	Capability string
+	Thinking   string
+	Effort     string
 }
 
-// FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
+// paramConfig 是 get_detail_param 响应里的一条模型配置。
+type paramConfig struct {
+	ConfigName        string `json:"config_name"`
+	IsInvisibleToUser bool   `json:"is_invisible_to_user"`
+	Usage             string `json:"usage"`
+	DisplayConfig     struct {
+		DisplayName     string `json:"display_name"`
+		ModelCapability string `json:"model_capability"`
+	} `json:"display_config"`
+	ContextWindowTokens struct {
+		Dev int64 `json:"dev"`
+	} `json:"context_window_tokens"`
+	ModelDetailList []struct {
+		MaxTokens int64 `json:"max_tokens"`
+		// ModelExtraConfig 是 JSON 字符串（要二次解码），里面的 Thinking.Type 才是思考开关。
+		ModelExtraConfig string `json:"model_extra_config"`
+	} `json:"model_detail_list"`
+	// ReasoningEffortConfig 上游原样给的思考档位配置，面板不做解释。
+	ReasoningEffortConfig json.RawMessage `json:"reasoning_effort_config"`
+}
+
+// thinkingType 从 model_extra_config 这段 JSON 字符串里取 Thinking.Type（如 "enabled"）。
+// 上游把这层嵌成字符串，解析失败就当作"上游没给"，不猜。
+func thinkingType(extraConfig string) string {
+	if extraConfig == "" {
+		return ""
+	}
+	var m struct {
+		Thinking struct {
+			Type string `json:"Type"`
+		} `json:"Thinking"`
+	}
+	if json.Unmarshal([]byte(extraConfig), &m) != nil {
+		return ""
+	}
+	return m.Thinking.Type
+}
+
+// usageChat 用户可对话模型。上游还有 custom_model（自定义槽位）与 summary（内部摘要），
+// 以及 is_invisible_to_user 的内部子代理；这些都不是用户能选的官方模型。
+const usageChat = "chat_completion"
+
+// pickOfficialModels 从全量配置表里挑出用户可选的官方模型。
+// 实测上游返回 39 条内部配置，其中官方模型 15 条：
+// 排除 9 条 is_invisible_to_user（子代理等）+ 14 条 custom_model_* + 1 条 summary。
+func pickOfficialModels(list []paramConfig) []ModelInfo {
+	out := make([]ModelInfo, 0, len(list))
+	for _, cfg := range list {
+		if cfg.ConfigName == "" || cfg.IsInvisibleToUser || cfg.Usage != usageChat {
+			continue
+		}
+		mi := ModelInfo{
+			ID:            cfg.ConfigName,
+			Name:          cfg.DisplayConfig.DisplayName,
+			ContextWindow: cfg.ContextWindowTokens.Dev,
+		}
+		if len(cfg.ModelDetailList) > 0 {
+			mi.MaxTokens = cfg.ModelDetailList[0].MaxTokens
+			mi.Thinking = thinkingType(cfg.ModelDetailList[0].ModelExtraConfig)
+		}
+		mi.Capability = cfg.DisplayConfig.ModelCapability
+		if len(cfg.ReasoningEffortConfig) > 0 && string(cfg.ReasoningEffortConfig) != "null" {
+			mi.Effort = string(cfg.ReasoningEffortConfig)
+		}
+		out = append(out, mi)
+	}
+	return out
+}
+
+// FetchModels 拉账号当前可用的官方模型表（get_detail_param）。
+// 返回的是过滤后的官方模型，不是上游的内部全量表。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	body := map[string]any{
 		"function":            Function,
@@ -290,31 +384,14 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	var resp struct {
-		ConfigInfoList []struct {
-			ConfigName string `json:"config_name"`
-			DisplayConfig struct {
-				DisplayName string `json:"display_name"`
-			} `json:"display_config"`
-			ModelDetailList []struct {
-				ModelName string `json:"model_name"`
-			} `json:"model_detail_list"`
-		} `json:"config_info_list"`
+		ConfigInfoList []paramConfig `json:"config_info_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
-	out := make([]ModelInfo, 0, len(resp.ConfigInfoList))
-	for _, cfg := range resp.ConfigInfoList {
-		if cfg.ConfigName == "" {
-			continue
-		}
-		out = append(out, ModelInfo{
-			ID:   cfg.ConfigName,
-			Name: cfg.DisplayConfig.DisplayName,
-		})
-	}
+	out := pickOfficialModels(resp.ConfigInfoList)
 	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+		return nil, fmt.Errorf("models api returned no official model (got %d raw configs)", len(resp.ConfigInfoList))
 	}
 	return out, nil
 }
@@ -348,38 +425,115 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 		return err
 	}
 	UgHeaders(req, a)
-	_, err = c.doJSON(req)
-	return err
+	data, err := c.doJSON(req)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("checkin claim parse: %w", err)
+	}
+	if resp.Code != 0 {
+		return &BusinessError{Code: resp.Code, Message: "签到失败：" + resp.Message}
+	}
+	return nil
 }
 
-// UserEntUsage 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。
-func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
+// UserEntUsage 返回剩余积分、积分总额与最早的积分到期时间。
+// 每个 credits_limit>0 的包：remain += limit - used，
+// used 为 usage.credits_amount（与 cmd/credit 同一口径，截断为整数）。
+// expire 只在 expire_time > now 的包里取最小值（已过期的包不影响紧迫度排序），无则 0。
+func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
 	UgHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
 	var resp struct {
-		IsCreditsBilling bool `json:"is_credits_billing"`
+		IsCreditsBilling        bool `json:"is_credits_billing"`
 		UserEntitlementPackList []struct {
+			ExpireTime          int64 `json:"expire_time"`
 			EntitlementBaseInfo struct {
 				Quota struct {
 					CreditsLimit int64 `json:"credits_limit"`
 				} `json:"quota"`
 			} `json:"entitlement_base_info"`
+			Usage struct {
+				CreditsAmount float64 `json:"credits_amount"`
+			} `json:"usage"`
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("ent usage parse: %w", err)
+		return 0, 0, 0, fmt.Errorf("ent usage parse: %w", err)
 	}
+	now := time.Now().Unix()
 	for _, p := range resp.UserEntitlementPackList {
-		remain += p.EntitlementBaseInfo.Quota.CreditsLimit
+		limit := p.EntitlementBaseInfo.Quota.CreditsLimit
+		if limit <= 0 {
+			continue
+		}
+		remain += limit - int64(p.Usage.CreditsAmount)
+		total += limit // 面板「积分」列显示 剩余/总额
+		if p.ExpireTime > now && (expire == 0 || p.ExpireTime < expire) {
+			expire = p.ExpireTime
+		}
 	}
-	return remain, nil
+	return remain, total, expire, nil
+}
+
+// SetTimeouts 更新超时三元组：短 RPC 总时长 / 聊天首字节 / 聊天流内空闲。
+// 流式整流仍不设总超时（长推理不该被截断），"上游既不吐数据也不断连"交给空闲看门狗。
+// ponytail: 与在途 Do 并发写；管理页保存很稀，-race 报警再加锁。
+func (c *Client) SetTimeouts(short, header, idle time.Duration) {
+	if c == nil || c.HTTP == nil {
+		return
+	}
+	if short > 0 {
+		c.HTTP.Timeout = short
+	}
+	if header > 0 {
+		setHeaderTimeout(c.HTTP, header)
+		setHeaderTimeout(c.StreamHTTP, header)
+	}
+	if idle > 0 {
+		c.idleTimeout = idle
+	}
+}
+
+// SetTimeout 兼容旧调用：只改短 RPC 与首字节超时，流内空闲保持原值。
+func (c *Client) SetTimeout(d time.Duration) { c.SetTimeouts(d, d, 0) }
+
+// idleTimeoutReader 流式读的空闲看门狗：idle 内没有字节到达就关掉底层 body，
+// 让上层 Read 立刻报错，而不是永久挂着（上游既不吐数据也不断连的场景）。
+// ponytail: 每次 Read 起一个 timer；SSE 分块数不多，真到高频再换单 timer 复用。
+type idleTimeoutReader struct {
+	rc   io.ReadCloser
+	idle time.Duration
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	t := time.AfterFunc(r.idle, func() { _ = r.rc.Close() })
+	n, err := r.rc.Read(p)
+	t.Stop()
+	return n, err
+}
+
+func (r *idleTimeoutReader) Close() error { return r.rc.Close() }
+
+func setHeaderTimeout(hc *http.Client, d time.Duration) {
+	if hc == nil {
+		return
+	}
+	if tr, ok := hc.Transport.(*http.Transport); ok {
+		tr.ResponseHeaderTimeout = d
+	}
 }
 
 // GetUserInfo 查询账号信息（登录用）。

@@ -7,7 +7,7 @@ import (
 	"traework2api/internal/auth"
 )
 
-const clientUA = "Trae/" + IdeVersion
+// 出站身份走 identity.go 的运行期覆盖（默认仍是 Trae/<IdeVersion>）。
 
 // SOLOHeaders 设置 llm_utils_chat / get_detail_param 所需的 SOLO 专属头。
 // 规则来自 SPEC §1 SOLO headers（实测必须）。
@@ -18,7 +18,7 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", currentUA())
 	at := a.JWT() // 读锁快照，防与 RefreshToken 写并发竞态
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+at)
 	req.Header.Set("X-Cloudide-Token", at)
@@ -28,7 +28,7 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	}
 	req.Header.Set("X-App-Id", AppID)
 	req.Header.Set("X-App-Version", "default")
-	req.Header.Set("X-Ide-Version", IdeVersion)
+	req.Header.Set("X-Ide-Version", currentIdeVersion())
 	req.Header.Set("X-Ide-Version-Code", IdeVersionCode)
 	req.Header.Set("X-App-Version-Code", IdeVersionCode)
 	req.Header.Set("X-Ide-Version-Type", "stable")
@@ -48,7 +48,7 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 func UgHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", currentUA())
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
 	req.Header.Set("X-User-Region", "CN")
 	if a.DeviceID != "" {
@@ -60,5 +60,5 @@ func UgHeaders(req *http.Request, a *auth.Auth) {
 func OAuthHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", currentUA())
 }

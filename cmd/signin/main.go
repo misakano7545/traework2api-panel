@@ -106,7 +106,7 @@ func main() {
 			}
 		}
 		// 查积分
-		if remain, qerr := up.UserEntUsage(a); qerr == nil {
+		if remain, _, _, qerr := up.UserEntUsage(a); qerr == nil {
 			r.remain, r.hasRem = remain, true
 		}
 		rows = append(rows, r)

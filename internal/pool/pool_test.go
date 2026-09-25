@@ -142,12 +142,13 @@ func TestNoteErrorThreshold(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	for i := 0; i < 2; i++ {
-		p.NoteError("u1", 3, 10*time.Minute)
+		p.NoteError("u1")
 		if p.Pick() == nil {
 			t.Fatalf("cooling too early at %d", i+1)
 		}
+		p.Release("u1") // Pick 会占在途名额，测试里用完就放
 	}
-	p.NoteError("u1", 3, 10*time.Minute)
+	p.NoteError("u1")
 	if p.Pick() != nil {
 		t.Fatal("threshold 3 should cool the account")
 	}
@@ -156,11 +157,11 @@ func TestNoteErrorThreshold(t *testing.T) {
 func TestNoteSuccessResetsCounter(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.NoteError("u1", 3, time.Hour)
-	p.NoteError("u1", 3, time.Hour)
+	p.NoteError("u1")
+	p.NoteError("u1")
 	p.NoteSuccess("u1")
-	p.NoteError("u1", 3, time.Hour)
-	p.NoteError("u1", 3, time.Hour)
+	p.NoteError("u1")
+	p.NoteError("u1")
 	if p.Pick() == nil {
 		t.Fatal("success should reset error counter")
 	}
@@ -193,6 +194,32 @@ func TestList(t *testing.T) {
 	}
 }
 
+func TestClearCooldownAndRemove(t *testing.T) {
+	p := New(filepath.Join(t.TempDir(), "state.json"))
+	p.Add(&auth.Auth{UID: "u1", Nickname: "n"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429")
+	if !p.ClearCooldown("u1") {
+		t.Fatal("clear")
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling || st.Reason != "" {
+		t.Fatalf("%+v", st)
+	}
+	p.Disable("u1", "nope")
+	if p.ClearCooldown("u1") {
+		t.Fatal("disabled account must stay disabled")
+	}
+	if _, ok := p.Remove("u1"); !ok {
+		t.Fatal("remove")
+	}
+	if _, ok := p.Status("u1"); ok {
+		t.Fatal("u1 still present")
+	}
+	if _, ok := p.Remove("missing"); ok {
+		t.Fatal("missing uid removed")
+	}
+}
+
 func TestSyncToDirRemovesMissing(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -203,5 +230,89 @@ func TestSyncToDirRemovesMissing(t *testing.T) {
 	}
 	if _, ok := p.Status("u1"); ok {
 		t.Fatal("u1 should not exist")
+	}
+}
+
+func TestCooldownCheckin(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownCheckin("u1", 5*time.Minute, "congested")
+	st, _ := p.Status("u1")
+	if !st.CheckinCooling || st.CheckinReason != "congested" {
+		t.Fatalf("want checkin cooling, got %+v", st)
+	}
+	// 签到接口拥塞不代表对话额度不可用，绝不能把账号踢出代理选号。
+	if st.Cooling {
+		t.Fatalf("签到冷却不得影响网关选号: %+v", st)
+	}
+}
+
+// 签到冷却不得覆盖更长的网关冷却，也不得被更短的签到冷却缩短。
+func TestCooldownCheckinDoesNotTouchGatewayCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolPlan, 12*time.Hour, "plan limit")
+	p.CooldownCheckin("u1", time.Minute, "congested")
+
+	st, _ := p.Status("u1")
+	if st.Reason != "plan limit" || time.Until(st.Until) < 11*time.Hour {
+		t.Fatalf("网关冷却被改动: %+v", st)
+	}
+	if !st.CheckinCooling || st.CheckinReason != "congested" {
+		t.Fatalf("签到冷却未生效: %+v", st)
+	}
+}
+
+// 已在签到冷却中的账号，更短的签到冷却不得把它缩短。
+func TestCooldownCheckinDoesNotShorten(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownCheckin("u1", 10*time.Minute, "first")
+	p.CooldownCheckin("u1", time.Minute, "second")
+	st, _ := p.Status("u1")
+	if st.CheckinReason != "first" || time.Until(st.CheckinUntil) < 9*time.Minute {
+		t.Fatalf("签到冷却被缩短: %+v", st)
+	}
+}
+
+// 签到成功要清掉签到冷却。
+func TestClearCheckinCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownCheckin("u1", 5*time.Minute, "congested")
+	p.ClearCheckinCooldown("u1")
+	st, _ := p.Status("u1")
+	if st.CheckinCooling {
+		t.Fatalf("签到冷却未清除: %+v", st)
+	}
+}
+
+// 禁用账号不参与签到冷却。
+func TestCooldownCheckinSkipsDisabled(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "session dead")
+	p.CooldownCheckin("u1", time.Minute, "congested")
+	st, _ := p.Status("u1")
+	if st.CheckinCooling {
+		t.Fatalf("disabled account must not be cooled: %+v", st)
+	}
+}
+
+// 「积分」列的分母要能扛住重启，且不被只改剩余值的 SetCredits 冲掉。
+func TestCreditsTotalPersists(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsExpire("u1", 4940, 4941, 0)
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if st, _ := p2.Status("u1"); st.Credits != 4940 || st.CreditsTotal != 4941 {
+		t.Fatalf("重启读回 %d/%d，期望 4940/4941", st.Credits, st.CreditsTotal)
+	}
+	p2.SetCredits("u1", 4000) // 只改剩余
+	if st, _ := p2.Status("u1"); st.Credits != 4000 || st.CreditsTotal != 4941 {
+		t.Fatalf("SetCredits 后 %d/%d，分母不该变", st.Credits, st.CreditsTotal)
 	}
 }

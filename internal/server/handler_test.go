@@ -7,10 +7,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"traework2api/internal/auth"
 	"traework2api/internal/pool"
+	"traework2api/internal/session"
 	"traework2api/internal/upstream"
+	"traework2api/internal/usage"
 )
 
 // 模拟 SOLO SSE 响应（glm-5.2 回答"你好"）。
@@ -161,6 +164,80 @@ func TestChatStreamCooldownOnStreamError(t *testing.T) {
 	}
 }
 
+// 用量台账：成功的调用记 token，失败的尝试只记请求数+失败数（没有 usage 可记）。
+func TestUsageRecordsSuccessAndFailure(t *testing.T) {
+	rec := usage.New("") // 不落盘
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Cloud-IDE-JWT at-bad" {
+			return 429, `rate limited`, false
+		}
+		return 200, soloSSE, true
+	})
+	// 坏号积分更高，先被选中：第一次调用撞 429 → 冷却换号，好号成功。失败的那次只
+	// 记请求数与失败数（没有 usage 可记），成功的那次记 token。
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: rec})
+
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		return rec
+	}
+	if code := post(`{"model":"glm-5.2","messages":[]}`).Code; code != 200 {
+		t.Fatalf("非流式应换号后成功: code=%d", code)
+	}
+	if code := post(`{"model":"glm-5.2","stream":true,"messages":[]}`).Code; code != 200 {
+		t.Fatalf("流式 code=%d", code)
+	}
+
+	snap := rec.Snapshot(72, map[string]string{"good": "好的号"})
+	// 第一次调用记 2 次尝试（1 失败 + 1 成功），第二次记 1 次成功。
+	if snap.Totals.Requests != 3 || snap.Totals.Errors != 1 {
+		t.Fatalf("请求/失败 = %d/%d，期望 3/1: %+v", snap.Totals.Requests, snap.Totals.Errors, snap.Totals)
+	}
+	// soloSSE 每帧 usage: prompt 5 / completion 2 / total 7，两次成功共 10/4/14。
+	if snap.Totals.PromptTokens != 10 || snap.Totals.CompletionTok != 4 || snap.Totals.TotalTokens != 14 {
+		t.Fatalf("token 汇总 = %+v", snap.Totals)
+	}
+	if len(snap.ByModel) != 1 || snap.ByModel[0].Key != "glm-5.2" || snap.ByModel[0].Requests != 3 {
+		t.Fatalf("按模型 = %+v", snap.ByModel)
+	}
+	if len(snap.ByAccount) != 2 || snap.ByAccount[0].Key != "good" || snap.ByAccount[0].Extra != "好的号" ||
+		snap.ByAccount[0].Requests != 2 || snap.ByAccount[0].TotalTokens != 14 {
+		t.Fatalf("按账号 = %+v", snap.ByAccount)
+	}
+	if snap.ByAccount[1].Key != "bad" || snap.ByAccount[1].Errors != 1 || snap.ByAccount[1].TotalTokens != 0 {
+		t.Fatalf("失败账号行 = %+v", snap.ByAccount[1])
+	}
+	if snap.Totals.AvgLatencyMs <= 0 {
+		t.Fatalf("延迟应有样本: %+v", snap.Totals)
+	}
+}
+
+// 流内 1005：响应体正常写完、函数返回 nil，仍须记为失败而不是成功。
+func TestUsageMarksStreamPlanLimitAsFailure(t *testing.T) {
+	rec := usage.New("")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "event:error\ndata:{\"code\":1005,\"message\":\"plan limit\"}\n\n", true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Usage:    rec,
+	})
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`)))
+	snap := rec.Snapshot(72, nil)
+	if snap.Totals.Requests != 1 || snap.Totals.Errors != 1 {
+		t.Fatalf("流内 1005 应记 1 请求 1 失败: %+v", snap.Totals)
+	}
+}
+
 func TestChatAllUnavailableReturns503(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 429, `rate limited`, false
@@ -229,8 +306,8 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) != 32 {
-		t.Errorf("models count=%d want 32", len(data))
+	if len(data) != 15 {
+		t.Errorf("models count=%d want 15（官方模型，非上游全量表）", len(data))
 	}
 	found := false
 	for _, m := range data {
@@ -339,5 +416,67 @@ func TestHealthz(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("code=%d", rec.Code)
+	}
+}
+
+// 会话粘性：同一条会话的请求粘到已绑定的号，即使别的号积分更高。
+func TestSessionStickyPinsAccount(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 200, soloSSE, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a", AccessToken: "at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "b", AccessToken: "at-b", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a", 100)
+	p.SetCredits("b", 9000) // 正常挑号会选 b
+	sess := session.New(session.Config{Enabled: true, TTL: time.Minute, GCInterval: time.Minute})
+	defer sess.Stop()
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+
+	body := `{"model":"glm-5.2","conversation_id":"c-1","messages":[{"role":"user","content":"hi"}]}`
+	sess.Bind(session.ExtractKey([]byte(body)), "a") // 会话已绑定 a
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != 200 {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	}
+	if calls["Cloud-IDE-JWT at-a"] != 2 || calls["Cloud-IDE-JWT at-b"] != 0 {
+		t.Fatalf("会话应粘在 a: %v", calls)
+	}
+
+	// 无会话键的请求走正常挑号（积分最高的 b）。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if calls["Cloud-IDE-JWT at-b"] != 1 {
+		t.Fatalf("无会话键应选 b: %v", calls)
+	}
+}
+
+// 在途名额不泄漏：无论成败，尝试结束后账号都能继续被选中（MaxInFlight=1 时最容易暴露）。
+func TestAttemptReleasesInFlight(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Cloud-IDE-JWT at1" {
+			return 429, `rate limited`, false
+		}
+		return 200, soloSSE, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.ApplyLimits(pool.Limits{MaxInFlight: 1, SoftCooldown: time.Millisecond, SoftCooldownMax: time.Millisecond})
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: usage.New("")})
+
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		time.Sleep(2 * time.Millisecond) // 等软冷却过期
+	}
+	if st, _ := p.Status("u1"); st.InFlight != 0 {
+		t.Fatalf("在途名额泄漏: %+v", st)
 	}
 }

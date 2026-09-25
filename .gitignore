@@ -6,17 +6,19 @@ config.json
 *.key
 *.pem
 
-# 二进制
-login
-signin
-credit
-signin_bin
-tw2api
-server
+# 二进制（根目录下的构建产物；anchored，别把 internal/server/ 整个包吞掉）
+/login
+/signin
+/credit
+/signin_bin
+/tw2api
+/server
 
 # 文档(doc 排除上传): 本地 md 不入库,README 除外
 *.md
 !README.md
+# 内置提示词是 go:embed 的构建输入，必须入库，否则 clone 下来编译不了
+!internal/prompt/defaultprompt.md
 docs/
 
 # 构建产物

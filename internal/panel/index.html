@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TraeWork2API · 控制台</title>
+<script src="app.js"></script>
+<style>
+/* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
+   冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
+   语义色只给状态。等宽数字承载所有观测值，tabular-nums 对齐。 */
+:root {
+  --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
+  --line: #262c3a; --line-soft: #1e232e;
+  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
+  --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
+  --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
+  --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
+  --bad: #f0655f; --bad-soft: rgba(240,101,95,.12);
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.5);
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+[data-theme="light"] {
+  --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
+  --line: #e2e5ec; --line-soft: #eceef3;
+  --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
+  --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
+  --ok: #0f9d63; --ok-soft: rgba(15,157,99,.1);
+  --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
+  --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
+  --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--ink); font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent-soft); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ── 壳层：左侧导航 + 主区 ─────────────────────────────────────────── */
+.shell { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
+.nav {
+  background: var(--surface); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+}
+.brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft); }
+.brand .name { font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
+.brand .sub { color: var(--ink-3); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
+.nav ul { list-style: none; padding: 10px 8px; flex: 1; }
+.nav a {
+  display: flex; align-items: center; gap: 10px; padding: 8px 11px; margin-bottom: 2px;
+  color: var(--ink-2); text-decoration: none; border-radius: 7px; font-size: 13.5px;
+}
+.nav a:hover { background: var(--surface-2); color: var(--ink); }
+.nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
+.nav a svg { width: 15px; height: 15px; flex: none; opacity: .85; }
+.nav .sig { padding: 12px 16px; border-top: 1px solid var(--line-soft); font-size: 11.5px; color: var(--ink-3); }
+.nav .sig .row { display: flex; align-items: center; gap: 7px; }
+/* 日志频道筛选 chips */
+.chips { display: inline-flex; gap: 4px; align-items: center; }
+.chips .chip { padding: 2px 10px; border-radius: 999px; }
+.chips .chip.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 550; }
+.ln .lch { font-style: normal; display: inline-block; font-size: 10px; line-height: 1; padding: 2px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 1px; }
+.ln .lch.c-task { background: var(--accent-soft); color: var(--accent); }
+.ln .lch.c-chat { background: var(--ok-soft); color: var(--ok); }
+.ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
+.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+.pulse.bad { background: var(--bad); }
+.pulse.warn { background: var(--warn); }
+
+.main { min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  display: flex; align-items: center; gap: 14px; padding: 14px 24px;
+  border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 20;
+}
+.topbar h2 { font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
+.topbar .sep { color: var(--ink-3); }
+.topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
+.topbar .grow { flex: 1; }
+.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
+.view[hidden] { display: none; }
+
+/* ── 控件 ─────────────────────────────────────────────────────────── */
+button {
+  font: inherit; color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 7px; padding: 7px 13px; cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 550; }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+button.ghost { background: transparent; }
+button.danger { color: var(--bad); }
+button.danger:hover:not(:disabled) { border-color: var(--bad); }
+button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
+button.icon { padding: 7px 9px; }
+input, select {
+  font: inherit; color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
+}
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+input.invalid { border-color: var(--bad); background: var(--bad-soft); }
+input.invalid:focus { border-color: var(--bad); }
+input[type=checkbox] { width: auto; accent-color: var(--accent); }
+label.fld { display: block; margin-bottom: 14px; }
+label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
+label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+.inline { display: flex; align-items: center; gap: 9px; }
+
+/* ── 统计条（观测区）──────────────────────────────────────────────── */
+.stats {
+  display: grid; grid-template-columns: repeat(6, 1fr);
+  border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
+  overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
+}
+@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+.stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
+.stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
+.stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
+.stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+
+/* ── 面板块 ───────────────────────────────────────────────────────── */
+.box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
+.box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
+.box > header h3 { font-size: 13.5px; font-weight: 600; }
+.box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
+.box > header .grow { flex: 1; }
+.box > header .note { color: var(--ink-3); font-size: 12px; }
+.box .pad { padding: 17px; }
+
+/* ── 账号表（签名元素：健康色条）───────────────────────────────────── */
+.tbl-wrap { overflow-x: auto; }
+.acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
+.acc th {
+  text-align: left; font-weight: 500; font-size: 11.5px; color: var(--ink-3);
+  padding: 9px 11px; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.acc td { padding: 11px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+.acc tr:last-child td { border-bottom: none; }
+.acc tbody tr:hover { background: var(--surface-2); }
+/* 健康色条用真实单元格（td.mark）实现，而不是 tr::before 伪元素：
+   伪元素在表格行内会被浏览器当作匿名单元格插入行首，整行内容右移一列、
+   与表头错位——窗口越宽列越宽越明显。 */
+.acc .mark { width: 3px; min-width: 3px; padding: 0; }
+.acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--ok); }
+.acc tbody tr.cool .mark i { background: var(--warn); }
+.acc tbody tr.off .mark i { background: var(--bad); }
+/* 模型表无色条（健康指示只属于账号表）。 */
+.acc.md .mark { display: none; }
+/* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
+.acc .c-acts { width: 1px; white-space: nowrap; }
+.acc.md th, .acc.md td { padding: 10px 9px; }
+.who { min-width: 118px; max-width: 200px; }
+.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 账号池「用量」列：一行紧凑徽条（次 / tok / 延迟 / 速率），明细看 title。 */
+.usage-cell { min-width: 268px; }
+.usage-line {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  font: 600 11.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.usage-item {
+  display: inline-flex; align-items: baseline; padding: 3px 6px; border: 1px solid transparent;
+  border-radius: 5px; background: var(--surface-2);
+}
+.usage-item b { font-weight: 650; }
+.usage-item em { margin-left: 2px; font: 500 10px/1 var(--sans); font-style: normal; }
+.usage-count { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 18%, transparent); }
+.usage-total {
+  color: var(--accent); background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.usage-total b { font-size: 12px; letter-spacing: -.02em; }
+.usage-total em { color: var(--ink-2); }
+.usage-latency { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
+.usage-rate { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 18%, transparent); }
+.cred { min-width: 84px; }
+.cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
+.cred .n .tot { color: var(--ink-3); font-size: 11px; }
+.tag {
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
+  border-radius: 999px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
+}
+.tag.ok { background: var(--ok-soft); color: var(--ok); }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.bad { background: var(--bad-soft); color: var(--bad); }
+.tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+.acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
+.acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+
+.empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
+.empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
+
+/* ── 日志（终端质感）────────────────────────────────────────────── */
+#logBox {
+  max-height: 420px; overflow: auto; margin: 0; padding: 15px 17px;
+  font: 12px/1.75 var(--mono); white-space: pre-wrap; word-break: break-all; color: var(--ink-2);
+}
+#logBox .ln { display: block; }
+#logBox .ln.e { color: var(--bad); }
+#logBox .ln.w { color: var(--warn); }
+
+/* ── 配置表单 ─────────────────────────────────────────────────────── */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
+@media (max-width: 860px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+.hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
+.switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
+.switch .lb { font-size: 13.5px; }
+.savebar {
+  display: flex; align-items: center; gap: 12px; padding: 13px 17px;
+  border-top: 1px solid var(--line-soft); background: var(--surface-2);
+  position: sticky; bottom: 0;
+}
+.savebar .grow { flex: 1; }
+.restart-note { color: var(--warn); font-size: 12.5px; }
+
+/* ── 弹层 ─────────────────────────────────────────────────────────── */
+.veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
+.veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
+.dlg {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 13px;
+  width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
+  box-shadow: 0 24px 64px -24px rgba(0,0,0,.6);
+}
+.dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); }
+.dlg header h3 { font-size: 15px; font-weight: 620; }
+.dlg header .hint { color: var(--ink-3); font-size: 12.5px; margin-top: 5px; }
+.dlg .body { padding: 18px 20px; overflow: auto; }
+.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; }
+.dlg footer .grow { flex: 1; }
+.url {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 11px 13px; font: 12px var(--mono); word-break: break-all; color: var(--accent);
+  margin: 8px 0 12px; user-select: all;
+}
+.state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.state.ok { color: var(--ok); } .state.err { color: var(--bad); }
+.dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
+@keyframes blink { 0% { opacity: 1; } 50% { opacity: .3; } 100% { opacity: 1; } }
+
+/* ── Toast ───────────────────────────────────────────────────────── */
+#toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+.tst {
+  background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
+  border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow); max-width: 380px;
+}
+.tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
+
+@media (max-width: 760px) {
+  .shell { grid-template-columns: 1fr; }
+  .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
+  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
+  .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="nav">
+    <div class="brand">
+      <div class="name">TraeWork2API</div>
+      <div class="sub" id="navSub">控制台</div>
+    </div>
+    <ul>
+      <li><a href="#accounts" data-view="accounts" class="on">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
+        账号池</a></li>
+      <li><a href="#models" data-view="models">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
+        模型</a></li>
+      <li><a href="#usage" data-view="usage">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 13.5v-11M2.5 13.5h11"/><path d="M5.5 11V7.2M8.5 11V4.6M11.5 11V8.8"/></svg>
+        用量</a></li>
+      <li><a href="#config" data-view="config">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
+        配置</a></li>
+      <li><a href="#logs" data-view="logs">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
+        运行日志</a></li>
+    </ul>
+    <div class="sig">
+      <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
+      <div class="row" style="margin-top:5px"><span id="navVer">v-</span></div>
+    </div>
+  </nav>
+
+  <div class="main">
+    <div class="topbar">
+      <h2 id="ttl">账号池</h2>
+      <span class="sep">/</span>
+      <span class="meta" id="subMeta">-</span>
+      <div class="grow"></div>
+      <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
+        <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
+      </button>
+      <button id="btnRefresh">刷新</button>
+      <button class="primary" id="btnAdd">添加账号</button>
+    </div>
+
+    <!-- 账号池 -->
+    <section class="view" id="view-accounts">
+      <div class="stats">
+        <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
+        <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
+        <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
+        <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分合计</div></div>
+        <div class="stat warn"><div class="v" id="sCheckin">-</div><div class="k">签到冷却</div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>账号池</h3>
+          <span class="grow"></span>
+          <span class="note" id="accNote"></span>
+          <button class="xs" id="btnCheckinAll">全部签到</button>
+          <button class="xs" id="btnBalanceAll">全部刷新积分</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>账号</th><th>状态</th><th>积分</th><th>到期</th><th>错误</th><th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+          </tr></thead>
+          <tbody id="accBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 模型 -->
+    <section class="view" id="view-models" hidden>
+      <div class="box">
+        <header>
+          <h3>模型能力</h3>
+          <span class="grow"></span>
+          <span class="note" id="mdNote">实时查询上游</span>
+          <button class="xs" id="btnModels">重新获取</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc md">
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>能力</th><th>思考</th><th>归属</th><th>上下文长度</th></tr></thead>
+          <tbody id="mdBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 配置 -->
+    <section class="view" id="view-config" hidden>
+      <form id="cfgForm">
+        <div class="box">
+          <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">监听地址</span>
+                <input name="listen" placeholder=":7864">
+                <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">凭证目录</span>
+                <input name="auth_dir" placeholder="./auths">
+                <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">状态文件</span>
+                <input name="state_file" placeholder="./data/state.json">
+                <span class="hint">改动需重启进程</span></label>
+            </div>
+            <label class="fld"><span class="lb">API 密钥（config.json 的 api_key）</span>
+              <input name="api_key" placeholder="留空 = 不鉴权（仅本机可访问）" autocomplete="off">
+              <span class="hint">显示的就是文件里的原值；保存后立即生效，本页随即用新密钥继续请求</span></label>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>排程</h3><span class="grow"></span><span class="note">整段改动需重启进程</span></header>
+          <div class="pad">
+            <div class="grid2">
+              <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
+                <input name="checkin_hours" placeholder="9">
+                <span class="hint">0-23；留空想关掉签到请用下面的开关，别填 0</span></label>
+              <label class="fld"><span class="lb">token 保活时点（小时，逗号分隔）</span>
+                <input name="keepalive_hours" placeholder="3">
+                <span class="hint">临近过期的 token 在这些时点预刷新</span></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">启用签到</span>
+                <select name="checkin_enabled"><option value="true">开</option><option value="false">关</option></select></label>
+              <label class="fld"><span class="lb">启用 token 保活</span>
+                <select name="keepalive_enabled"><option value="true">开</option><option value="false">关</option></select></label>
+              <label class="fld"><span class="lb">周期刷新积分</span>
+                <select name="balance_refresh_enabled"><option value="true">开</option><option value="false">关</option></select></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">刷新间隔（分钟）</span>
+                <input name="balance_refresh_minutes" type="number" min="1" placeholder="5">
+                <span class="hint">两次签到之间也保持余额新鲜</span></label>
+            </div>
+            <div class="hint">签到错过时点会在进程启动时补跑一轮；周期刷新只更新余额，<b>不解除</b>熔断/降权/权益冷却。</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>冷却与熔断</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">权益不足冷却</span>
+                <input name="plan_credit" placeholder="12h">
+                <span class="hint">立即生效；1005 的硬冷却时长</span></label>
+              <label class="fld"><span class="lb">限流冷却</span>
+                <input name="soft_rate" placeholder="60s">
+                <span class="hint">立即生效</span></label>
+              <label class="fld"><span class="lb">限流冷却封顶</span>
+                <input name="soft_rate_max" placeholder="2h">
+                <span class="hint">反复限流时按 2 倍退避到此值</span></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">熔断阈值（连败次数）</span>
+                <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
+              <label class="fld"><span class="lb">熔断冷却</span>
+                <input name="breaker_cooldown" placeholder="10m"></label>
+              <label class="fld"><span class="lb">熔断冷却封顶</span>
+                <input name="breaker_cooldown_max" placeholder="2h"></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">降权阈值（连败次数）</span>
+                <input name="degrade_threshold" type="number" min="1" placeholder="5">
+                <span class="hint">4xx 参数类失败不罚号，只临时出池</span></label>
+              <label class="fld"><span class="lb">降权冷却</span>
+                <input name="degrade_cooldown" placeholder="10m"></label>
+              <label class="fld"><span class="lb">降权冷却钳制上限</span>
+                <input name="degrade_cooldown_max" placeholder="2h"></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>选号</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">单号在途上限</span>
+                <input name="max_in_flight" type="number" min="0" placeholder="3">
+                <span class="hint">0 = 不限</span></label>
+              <label class="fld"><span class="lb">闲置加成（% / 小时）</span>
+                <input name="idle_weight_per_hour" type="number" step="0.1" min="0" placeholder="0.5">
+                <span class="hint">按积分比例加成，冷号也有机会被用到</span></label>
+              <label class="fld"><span class="lb">闲置加成封顶（%）</span>
+                <input name="idle_weight_max" type="number" step="0.1" min="0" placeholder="5"></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">快过期优先窗口</span>
+                <input name="expiring_soon" placeholder="168h">
+                <span class="hint">窗口内到期的积分优先消耗；留空 = 禁用</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>会话粘性</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">启用</span>
+                <select name="session_sticky_enabled"><option value="true">开</option><option value="false">关</option></select>
+                <span class="hint">同一会话粘同一账号，命中上游 prompt 缓存</span></label>
+              <label class="fld"><span class="lb">绑定有效期</span>
+                <input name="session_sticky_ttl" placeholder="30m"></label>
+              <label class="fld"><span class="lb">GC 周期</span>
+                <input name="session_sticky_gc_interval" placeholder="5m">
+                <span class="hint">改动需重启进程</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>系统提示词</h3></header>
+          <div class="pad">
+            <div class="grid2">
+              <label class="fld"><span class="lb">模式</span>
+                <select name="prompt_mode">
+                  <option value="passthrough">passthrough（透传客户端）</option>
+                  <option value="custom">custom（替换客户端 system）</option>
+                  <option value="append">append（在开头 system 块后追加）</option>
+                </select>
+                <span class="hint">立即生效</span></label>
+              <label class="fld"><span class="lb">提示词文件</span>
+                <input name="prompt_file" placeholder="（留空用内置默认）">
+                <span class="hint">custom/append 下路径不可读会直接报错</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>上游</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">默认模型</span>
+                <input name="default_model" placeholder="glm-5.2">
+                <span class="hint">立即生效</span></label>
+              <label class="fld"><span class="lb">短请求超时（秒）</span>
+                <input name="timeout_seconds" type="number" min="1" placeholder="120"></label>
+              <label class="fld"><span class="lb">首字节超时（秒）</span>
+                <input name="header_timeout_seconds" type="number" min="1" placeholder="120">
+                <span class="hint">首字节前换号；不限制整流时长</span></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">流内空闲超时（秒）</span>
+                <input name="idle_timeout_seconds" type="number" min="1" placeholder="300">
+                <span class="hint">上游既不吐数据也不断连时掐掉</span></label>
+              <label class="fld"><span class="lb">User-Agent 覆盖</span>
+                <input name="user_agent" placeholder="（留空用内置 Trae/&lt;版本&gt;）"></label>
+              <label class="fld"><span class="lb">客户端版本覆盖</span>
+                <input name="client_version" placeholder="（留空用内置）">
+                <span class="hint">出站 UA 与 X-Ide-Version</span></label>
+            </div>
+            <div class="hint">以下 workbuddy2api 的配置段在 trae 上游没有对应能力，故未提供：活动任务（travel/activity/blackcat）、global 域路由、upstash、黑名单指纹脱敏、成本分层探索。</div>
+          </div>
+        </div>
+
+        <div class="savebar">
+          <span class="grow"></span>
+          <span class="restart-note" id="cfgNote"></span>
+          <button type="button" id="btnCfgReload">放弃修改</button>
+          <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- 用量 -->
+    <section class="view" id="view-usage" hidden>
+      <div class="stats">
+        <div class="stat"><div class="v" id="usReq">-</div><div class="k">请求次数</div></div>
+        <div class="stat bad"><div class="v" id="usErr">-</div><div class="k">失败次数</div></div>
+        <div class="stat"><div class="v" id="usPt">-</div><div class="k">输入 tokens</div></div>
+        <div class="stat"><div class="v" id="usCt">-</div><div class="k">输出 tokens</div></div>
+        <div class="stat good"><div class="v" id="usTt">-</div><div class="k">合计 tokens</div></div>
+        <div class="stat"><div class="v" id="usLat">-</div><div class="k">平均延迟</div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>按模型</h3>
+          <span class="grow"></span>
+          <span class="chips" id="usChips">
+            <button class="xs chip" data-h="24">24 小时</button>
+            <button class="xs chip on" data-h="72">72 小时</button>
+            <button class="xs chip" data-h="168">7 天</button>
+            <button class="xs chip" data-h="720">30 天</button>
+            <button class="xs chip" data-h="0">全部历史</button>
+          </span>
+          <span class="note" id="usNote"></span>
+          <button class="xs" id="btnUsageReload">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc us">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>模型</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>合计</th><th>平均延迟</th><th>速率</th>
+          </tr></thead>
+          <tbody id="usModelBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>按账号</h3><span class="grow"></span><span class="note" id="usAcctNote"></span></header>
+        <div class="tbl-wrap">
+        <table class="acc us">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>账号</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>合计</th><th>平均延迟</th>
+          </tr></thead>
+          <tbody id="usAcctBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>时序</h3><span class="grow"></span><span class="note" id="usSeriesNote"></span></header>
+        <div class="tbl-wrap">
+        <table class="acc us">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>时间片</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>合计</th>
+          </tr></thead>
+          <tbody id="usSeriesBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="view" id="view-logs" hidden>
+      <div class="box">
+        <header>
+          <h3>运行日志</h3>
+          <span class="grow"></span>
+          <span class="chips" id="logChips">
+            <button class="xs chip on" data-ch="all">全部</button>
+            <button class="xs chip" data-ch="task">任务</button>
+            <button class="xs chip" data-ch="chat">对话</button>
+            <button class="xs chip" data-ch="sys">系统</button>
+          </span>
+          <span class="note" id="logNote">最近 500 行</span>
+          <button class="xs" id="btnLogPin">自动滚动：开</button>
+        </header>
+        <pre id="logBox"></pre>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- 添加账号 -->
+<div class="veil" id="addVeil">
+  <div class="dlg">
+    <header>
+      <h3>添加账号</h3>
+      <div class="hint">在浏览器打开链接登录。跳到打不开的 127.0.0.1 后，把地址栏整段贴回来。不轮询，贴上就换票落盘。</div>
+    </header>
+    <div class="body">
+      <div id="addLoad" class="state"><span class="dots">正在获取授权链接</span></div>
+      <div id="addReady" hidden>
+        <div class="state">在浏览器打开以下链接并登录：</div>
+        <div class="url" id="addUrl"></div>
+        <label class="fld"><span class="lb">回调链接</span>
+          <input id="callback" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:18080/authorize?refreshToken=...">
+        </label>
+      </div>
+      <div id="addDone" class="state ok" hidden></div>
+      <div id="addErr" class="state err" hidden></div>
+    </div>
+    <footer>
+      <button id="btnCopyUrl" hidden>复制链接</button>
+      <span class="grow"></span>
+      <button id="btnAddClose">关闭</button>
+      <button id="btnAddFinish" class="primary" hidden>换票并加入</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 密钥 -->
+<div class="veil" id="keyVeil" data-lock="1">
+  <div class="dlg" style="width:420px">
+    <header>
+      <h3>需要访问密钥</h3>
+      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 里 api_key 的值（面板「配置」页可看可改）。</div>
+    </header>
+    <div class="body">
+      <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password">
+      <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="primary" id="btnKey">进入</button>
+    </footer>
+  </div>
+</div>
+
+<div id="toasts"></div>
+</body>
+</html>
