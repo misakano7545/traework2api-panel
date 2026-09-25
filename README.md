@@ -119,6 +119,12 @@ go build -o tw2api ./cmd/server
 「模型」页按上游 `get_detail_param` 原值列出模型的 `capability`（`model_capability`）与思考
 相关字段（`model_extra_config` 里的 `Thinking.Type`、`reasoning_effort_config` 原文），不做解释和换算。
 
+客户端自己带的 `reasoning_effort` 之类字段是**原样透传**上游的，不认的也一个不吞（`PrepareBody` 只改
+`stream`/`function`/`config_name`/`model`/`tools`）。实测 `glm-5.2` 各 4 次：带 `low` 时
+`reasoning_tokens` 中位数 280，不发 / `high` 分别是 329 / 329 —— 上游很可能真读这个字段，而 `high`
+与默认一致；非法值、错类型、未知键都不会让请求失败。复跑：
+`TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v`（吃额度，13 次约 2 积分）。
+
 可签到、刷新剩余积分、禁用、解除冷却、移除，以及粘贴登录回调后立刻写入 `auths/trae-{uid}.json` 并进池，不用重启。
 
 「登录账号」拿到的授权链接里，`auth_callback_url` 恒为 `http://127.0.0.1:18080/authorize`，**写死不做配置项**：

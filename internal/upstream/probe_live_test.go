@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -189,19 +190,6 @@ func TestProbeLiveReasoningEffort(t *testing.T) {
 	if os.Getenv("TW2A_PROBE_CHAT") == "" {
 		t.Skip("置 TW2A_PROBE_CHAT=1 才跑（真实发聊天请求，吃额度）")
 	}
-	dir := os.Getenv("TW2A_AUTH_DIR")
-	if dir == "" {
-		dir = "../../auths"
-	}
-	as, err := auth.LoadDir(dir)
-	if err != nil || len(as) == 0 {
-		t.Fatalf("加载账号失败: %v (dir=%s)", err, dir)
-	}
-	a := as[0]
-	c := New()
-	// 探测用的短请求不该挂死：给个总超时（生产流式客户端故意不设）。
-	c.StreamHTTP = &http.Client{Timeout: 60 * time.Second, Transport: c.StreamHTTP.Transport}
-
 	model := os.Getenv("TW2A_PROBE_MODEL")
 	if model == "" {
 		model = "kimi-k3"
@@ -213,6 +201,9 @@ func TestProbeLiveReasoningEffort(t *testing.T) {
 		}
 		return string(b)
 	}
+	// 基线请求顺便当「账号还活着吗」探针：session 死的账号上游 401，不花额度。
+	c, a := probeChat(t, base+"}")
+	fmt.Printf("\n===== 探测 %s：上游认不认 reasoning_effort（每请求 prompt=hi, max_tokens=8）\n", model)
 	// send 只发不回放：SSE 读 240 字节就掐（够看开头，不整条烧完输出）。
 	send := func(body string) (status int, head, rejected []byte) {
 		rc, st, respBody, err := c.ChatStream(a, []byte(body))
@@ -225,23 +216,6 @@ func TestProbeLiveReasoningEffort(t *testing.T) {
 			return st, b, nil
 		}
 		return st, nil, respBody
-	}
-
-	// A 基线兼「账号还活着吗」探针：session 死的账号上游 401，不花额度，直接换下一个。
-	fmt.Printf("\n===== 探测 %s：上游认不认 reasoning_effort（每请求 prompt=hi, max_tokens=8）\n", model)
-	live := false
-	for _, cand := range as {
-		a = cand
-		status, _, rejected := send(base + "}")
-		fmt.Printf("----- A 基线（账号 %s，无额外字段）→ %d %s\n", a.UID, status, short(rejected))
-		if status < 400 {
-			live = true
-			break
-		}
-		fmt.Println("      这个账号不可用，换下一个")
-	}
-	if !live {
-		t.Fatal("没有可用账号，探测无意义（先跑 cmd/signin 刷新 token）")
 	}
 
 	for _, tc := range []struct{ label, extra string }{
@@ -263,4 +237,129 @@ func TestProbeLiveReasoningEffort(t *testing.T) {
 		}
 		fmt.Printf("通了，SSE 前 240 字节: %s\n", short(head))
 	}
+}
+
+// probeChat 加载账号 + 挑一个 session 还活着的（拿调用方给的那次最省请求当探针）。
+// session 死的账号上游 401 code 1001，不花额度；两个都不可用就 Fatal 说清楚，别拿 401 当结论。
+func probeChat(t *testing.T, canary string) (*Client, *auth.Auth) {
+	t.Helper()
+	dir := os.Getenv("TW2A_AUTH_DIR")
+	if dir == "" {
+		dir = "../../auths"
+	}
+	as, err := auth.LoadDir(dir)
+	if err != nil || len(as) == 0 {
+		t.Fatalf("加载账号失败: %v (dir=%s)", err, dir)
+	}
+	c := New()
+	// 探测用的短请求不该挂死：给个总超时（生产流式客户端故意不设）。
+	c.StreamHTTP = &http.Client{Timeout: 60 * time.Second, Transport: c.StreamHTTP.Transport}
+	for _, a := range as {
+		rc, status, _, cerr := c.ChatStream(a, []byte(canary))
+		if cerr != nil {
+			t.Fatalf("传输层错误: %v", cerr)
+		}
+		if rc != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(rc, 4096))
+			rc.Close()
+			fmt.Printf("----- 账号 %s 可用（探针 %d）\n", a.UID, status)
+			return c, a
+		}
+		fmt.Printf("----- 账号 %s 不可用（%d），换下一个\n", a.UID, status)
+	}
+	t.Fatal("没有可用账号，探测无意义（先跑 cmd/signin 刷新 token）")
+	return nil, nil
+}
+
+// TestProbeLiveEffortAB 行为对比：同一个 prompt 发三次，只改 reasoning_effort（不发 / low / high），
+// 比 usage 里的 reasoning_tokens。非法值探测那条路已经走不通（见 TestProbeLiveReasoningEffort 的 E 对照：
+// 这端点连已知字段的类型错误都放过），剩下只有看输出差异。
+//
+// 手动跑：TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v
+// 换模型/换题：TW2A_PROBE_MODEL=Doubao-Seed-Evolving TW2A_PROBE_PROMPT='…'
+//
+// ponytail: 每个档位只跑一次，模型自身有随机性；三个值接近只能说「没看出差异」，
+// 不能断言上游一定不读。要下结论就多跑几轮取中位数（或把 prompt 换成更吃思考的题）。
+func TestProbeLiveEffortAB(t *testing.T) {
+	if os.Getenv("TW2A_PROBE_CHAT") == "" {
+		t.Skip("置 TW2A_PROBE_CHAT=1 才跑（真实发聊天请求，吃额度）")
+	}
+	model := os.Getenv("TW2A_PROBE_MODEL")
+	if model == "" {
+		// kimi-k3 在本账号被套餐挡住（流内 code 1005 plan:2）；glm-5.2 实测能生成。
+		model = "glm-5.2"
+	}
+	prompt := os.Getenv("TW2A_PROBE_PROMPT")
+	if prompt == "" {
+		prompt = "鸡兔同笼：头 35 只，脚 94 只。鸡兔各几只？只给最终答案。"
+	}
+	label := func(e string) string {
+		if e == "" {
+			return "(不发)"
+		}
+		return e
+	}
+	rounds := 3
+	if v := os.Getenv("TW2A_PROBE_ROUNDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rounds = n
+		}
+	}
+	c, a := probeChat(t, fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":8}`, model))
+	fmt.Printf("\n===== 行为对比 %s：同一 prompt × %d 轮，只改 reasoning_effort\n题: %s\n", model, rounds, prompt)
+
+	got := map[string][]int{}
+	for r := 1; r <= rounds; r++ {
+		// 轮次在外、档位在内：把时间漂移摊平到三个档位上（不然同时段整体抖动会被算成档位差异）。
+		for _, effort := range []string{"", "low", "high"} {
+			body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}],"max_tokens":600,"stream":true`,
+				model, prompt)
+			if effort != "" {
+				body += fmt.Sprintf(`,"reasoning_effort":%q`, effort)
+			}
+			body += "}"
+			rc, status, respBody, err := c.ChatStream(a, []byte(body))
+			if err != nil {
+				fmt.Printf("  r%d %-6s 传输层错误: %v\n", r, label(effort), err)
+				continue
+			}
+			if rc == nil {
+				fmt.Printf("  r%d %-6s 被拒 %d: %.200s\n", r, label(effort), status, respBody)
+				continue
+			}
+			out, aerr := Aggregate(rc) // 整条读完才拿得到 token_usage
+			rc.Close()
+			if aerr != nil {
+				fmt.Printf("  r%d %-6s 流内错误: %v\n", r, label(effort), aerr)
+				continue
+			}
+			usage, _ := out["usage"].(map[string]any)
+			n, _ := usage["reasoning_tokens"].(float64)
+			got[effort] = append(got[effort], int(n))
+			fmt.Printf("  r%d %-6s reasoning_tokens=%-4d completion=%-4v total=%-4v | 答: %s\n",
+				r, label(effort), int(n), usage["completion_tokens"], usage["total_tokens"], answerOf(out))
+		}
+	}
+
+	fmt.Println("----- 汇总（中位数才作数，单轮不看）")
+	for _, e := range []string{"", "low", "high"} {
+		v := got[e]
+		if len(v) == 0 {
+			continue
+		}
+		sort.Ints(v)
+		fmt.Printf("  %-6s 各轮 %v → 中位数 %d\n", label(e), v, v[len(v)/2])
+	}
+}
+
+// answerOf 取聚合结果的回答正文，压成一行（探针只关心「答对没」和思考长度）。
+func answerOf(out map[string]any) string {
+	ch, _ := out["choices"].([]any)
+	if len(ch) == 0 {
+		return ""
+	}
+	c0, _ := ch[0].(map[string]any)
+	msg, _ := c0["message"].(map[string]any)
+	ans, _ := msg["content"].(string)
+	return strings.Join(strings.Fields(ans), " ")
 }
