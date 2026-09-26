@@ -224,16 +224,18 @@ func (h *Handler) knownModel(model string) bool {
 // 只列账号可选的官方模型：与 upstream.pickOfficialModels 同一口径，
 // 不含 is_invisible_to_user 的内部子代理、custom_model_* 槽位与 summary。
 // context_length 取上游 context_window_tokens.dev。
+// 快照口径 = 版本码 20260811（k3 已放量）；上游的可见集合会随版本码/灰度漂移，
+// 动态拉取始终是权威来源，这里只是拉不到时的兜底。
 var staticModels = []map[string]any{
 	{"id": "Doubao-Seed-Evolving", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 256000},
 	{"id": "Doubao-Seed-2.1-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 256000},
 	{"id": "Doubao-Seed-2.1-Turbo", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 256000},
+	{"id": "step-5-preview", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
 	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
-	{"id": "glm-5", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
 	{"id": "DeepSeek-V4-Flash-Official", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
-	{"id": "DeepSeek-V4-Flash", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
 	{"id": "DeepSeek-V4-Pro-Official", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
-	{"id": "DeepSeek-V4-Pro", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
 	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
 	{"id": "kimi-k2.7-code", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
 	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 200000},
@@ -484,13 +486,9 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 	if err != nil {
 		var se *upstream.SOLOStreamError
 		if errors.As(err, &se) {
+			// 流内错误与 HTTP 级错误走同一张分类表（noteFailure），避免两处口径漂移。
 			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
-			switch se.Kind() {
-			case upstream.ErrPlanLimit:
-				h.cfg.Pool.CooldownPlan(acct.UID)
-			default:
-				h.cfg.Pool.NoteError(acct.UID)
-			}
+			h.noteFailure(acct.UID, se.Kind())
 			return false, err
 		}
 		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
@@ -504,14 +502,17 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 	return true, nil
 }
 
-// noteFailure 按错误类型记账：
+// noteFailure 按错误类型记账（HTTP 级与流内错误共用这一张表）：
 //   - 1005 权益不足 → 计划硬冷却（plan_credit）；
-//   - 429 限流 → 软冷却（指数退避到 soft_rate_max）；
-//   - 401 session 失效 → 禁用；
+//   - 429/4008 限流 → 软冷却（指数退避到 soft_rate_max）；
+//   - 401 session 失效 → 连续达阈值才禁用；
 //   - 5xx → 熔断计数；
-//   - 其余 4xx（参数/404 等）→ 降权计数，不罚号。
+//   - 其余 4xx（参数/404 等）→ 降权计数，不罚号；
+//   - ErrNone（模型/参数问题，如 4001）→ 不记账：与账号无关，写进去只会污染状态。
 func (h *Handler) noteFailure(uid string, kind upstream.ErrKind) {
 	switch kind {
+	case upstream.ErrNone:
+		// no-op
 	case upstream.ErrPlanLimit:
 		h.cfg.Pool.CooldownPlan(uid)
 	case upstream.ErrSoftRate:
@@ -534,15 +535,10 @@ func (h *Handler) bindSession(sessKey, uid string) {
 
 // handleStreamError 流式响应中的上游业务错误 → pool 状态机。
 //
-// 1005 → 计划冷却；其余一律按罚号计数：流内错误在上游侧，"不罚号"判定拿不到可靠依据
-// （Kind() 只能区分 1005），宁可让它退到熔断而不是当成客户端问题继续用这个号。
+// 与 HTTP 级错误同一张分类表：Kind() 现在能区分「模型/参数问题」（ErrNone，不记账）
+// 与「限流/会话失效/服务端」，所以不再需要"一律按罚号计数"的粗口径。
 func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
-	switch se.Kind() {
-	case upstream.ErrPlanLimit:
-		h.cfg.Pool.CooldownPlan(uid)
-	default:
-		h.cfg.Pool.NoteError(uid)
-	}
+	h.noteFailure(uid, se.Kind())
 }
 
 // noteUsage 把一次出站尝试记进用量台账。

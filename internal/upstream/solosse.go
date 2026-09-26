@@ -56,12 +56,41 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类。1005 → ErrPlanLimit；其余归 ErrClient。
+// Kind 将 SSE 流内错误分类，口径照抄参考实现 trae-workbuddy-switch 的 classify_solo：
+// 先看业务码，再看文案兜底，最后才按数字区间归类。顺序有讲究 —— 把 1005 当 Client
+// 会让一个额度耗尽的号在几十分钟后被反复重试；把业务码（1005/4001/4023…）按
+// `>= 500` 之类的区间吞掉，则会把最需要单独识别的一类全归成 Server。
 func (e *SOLOStreamError) Kind() ErrKind {
-	if e.Code == 1005 {
+	lower := strings.ToLower(e.Msg)
+	switch {
+	case e.Code == 1005 || strings.Contains(lower, "plan"):
 		return ErrPlanLimit
+	// 模型配置为空 / 参数非法是**模型**问题，不是账号问题，罚号没有意义。
+	// 实测：function 给错通道时上游回 4001 "the param is invalid"，
+	// 旧口径按罚号计数，一次客户端参数错误就把好号推向熔断。
+	case e.Code == 4001 || strings.Contains(lower, "model config is empty"):
+		return ErrNone
+	case e.Code == 4008 || strings.Contains(lower, "quota") ||
+		strings.Contains(lower, "exceeded") || strings.Contains(lower, "rate"):
+		return ErrSoftRate
+	case e.Code == 401:
+		return ErrSessionDead
+	case e.Code == 429:
+		return ErrSoftRate
+	case e.Code == 404:
+		return ErrNotFound
+	// 只有真正的 HTTP 状态码区间才映射为 Client / Server（显式写区间上界）。
+	case e.Code >= 400 && e.Code < 500:
+		return ErrClient
+	case e.Code >= 500 && e.Code < 600:
+		return ErrServer
+	case e.Code == 0:
+		return ErrNone
+	default:
+		// 认不出的业务码按「上游侧故障」处理：与旧口径（一律罚号计数）一致，也与参考实现
+		// 把 BusinessError 映射成 300s 冷却同向。只有明确与账号无关的码才不罚号。
+		return ErrServer
 	}
-	return ErrClient
 }
 
 // ParseSOLOLine 解析一条事件（eventName 为 event 行值，dataLine 为 data 行值）。

@@ -164,6 +164,22 @@ func TestChatStreamCooldownOnStreamError(t *testing.T) {
 	}
 }
 
+// 4001（模型/参数问题）不得罚号：与账号无关的失败写进池只会污染状态、把好号推向熔断。
+func TestChatStreamModelErrorDoesNotPenalize(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "event:error\ndata:{\"code\":4001,\"message\":\"the param is invalid\"}\n\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	st, _ := p.Status("u1")
+	if st.ErrCount != 0 || st.Degraded != 0 || st.Cooling {
+		t.Errorf("4001 不该罚号: %+v", st)
+	}
+}
+
 // 用量台账：成功的调用记 token，失败的尝试只记请求数+失败数（没有 usage 可记）。
 func TestUsageRecordsSuccessAndFailure(t *testing.T) {
 	rec := usage.New("") // 不落盘
@@ -315,10 +331,18 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("models count=%d want 15（官方模型，非上游全量表）", len(data))
 	}
 	found := false
+	hasK3 := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "glm-5.2" {
+		id, _ := m.(map[string]any)["id"].(string)
+		if id == "glm-5.2" {
 			found = true
 		}
+		if id == "kimi-k3" {
+			hasK3 = true
+		}
+	}
+	if !hasK3 {
+		t.Error("kimi-k3 必须在列表里：版本码 20260811 已对免费档放开（旧版本码 20260716 才会 1005）")
 	}
 	if !found {
 		t.Error("glm-5.2 missing")

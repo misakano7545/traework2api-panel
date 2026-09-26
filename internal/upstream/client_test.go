@@ -188,7 +188,7 @@ func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 	if gotAuth != "Cloud-IDE-JWT at" || gotUID != "u1" {
 		t.Errorf("headers: auth=%q uid=%q", gotAuth, gotUID)
 	}
-	if gotAppID != AppID || gotIdeVer != "0.1.43" {
+	if gotAppID != AppID || gotIdeVer != IdeVersion {
 		t.Errorf("app headers: appid=%q idever=%q", gotAppID, gotIdeVer)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) || !bytes.Contains(gotBody, []byte(`"function":"solo_work_lite"`)) {
@@ -300,7 +300,8 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 }
 
 // 官方模型口径：只有「用户可见 + chat_completion」留下。
-// 上游全量表实测 39 条，另外三类必须被挡掉：invisible 子代理、custom_model_* 槽位、summary。
+// 上游全量表实测 39（版本码 20260716）/ 42（20260811）条，另外三类必须被挡掉：
+// invisible 子代理、custom_model_* 槽位、summary。可见集合随版本码漂移，故不做型号名单。
 func TestPickOfficialModels(t *testing.T) {
 	const payload = `{"config_info_list":[
 		{"config_name":"glm-5.2","is_invisible_to_user":false,"usage":"chat_completion",
@@ -311,6 +312,9 @@ func TestPickOfficialModels(t *testing.T) {
 		 "display_config":{"model_capability":"reasoning_model"},
 		 "reasoning_effort_config":{"support_thinking":false},
 		 "context_window_tokens":{"dev":256000},"model_detail_list":[{"max_tokens":32000}]},
+		{"config_name":"kimi-k3","is_invisible_to_user":false,"usage":"chat_completion",
+		 "display_config":{"display_name":"Kimi-K3","model_capability":"reasoning_model"},
+		 "context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":32000}]},
 		{"config_name":"browser_use_subagent","is_invisible_to_user":true,"usage":"chat_completion"},
 		{"config_name":"glm-5-turbo","is_invisible_to_user":true,"usage":"chat_completion"},
 		{"config_name":"custom_model_kimi","is_invisible_to_user":false,"usage":"custom_model"},
@@ -324,10 +328,10 @@ func TestPickOfficialModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := pickOfficialModels(resp.ConfigInfoList)
-	if len(got) != 2 {
-		t.Fatalf("官方模型数=%d want 2: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("官方模型数=%d want 3: %+v", len(got), got)
 	}
-	if got[0].ID != "glm-5.2" || got[1].ID != "Doubao-Seed-Evolving" {
+	if got[0].ID != "glm-5.2" || got[1].ID != "Doubao-Seed-Evolving" || got[2].ID != "kimi-k3" {
 		t.Errorf("顺序/内容错: %+v", got)
 	}
 	if got[0].Name != "GLM-5.2" || got[0].ContextWindow != 200000 || got[0].MaxTokens != 32000 {

@@ -335,8 +335,9 @@ func thinkingType(extraConfig string) string {
 const usageChat = "chat_completion"
 
 // pickOfficialModels 从全量配置表里挑出用户可选的官方模型。
-// 实测上游返回 39 条内部配置，其中官方模型 15 条：
-// 排除 9 条 is_invisible_to_user（子代理等）+ 14 条 custom_model_* + 1 条 summary。
+// 实测上游返回 39 条（版本码 20260716）/ 42 条（20260811）内部配置，
+// 排除 is_invisible_to_user（子代理等）+ custom_model_* 槽位 + summary 之后，
+// 就是客户端模型选择器里能选的那些。
 func pickOfficialModels(list []paramConfig) []ModelInfo {
 	out := make([]ModelInfo, 0, len(list))
 	for _, cfg := range list {

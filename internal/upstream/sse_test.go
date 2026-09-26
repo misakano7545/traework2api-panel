@@ -7,6 +7,36 @@ import (
 	"testing"
 )
 
+// 流内错误分类表（口径对齐参考实现 trae-workbuddy-switch 的 classify_solo）：
+// 业务码必须单独识别，不能被 HTTP 区间吞掉；模型/参数问题不得罚号。
+func TestSOLOStreamErrorKind(t *testing.T) {
+	cases := []struct {
+		code int64
+		msg  string
+		want ErrKind
+	}{
+		{1005, "", ErrPlanLimit},                 // 权益不足 → 12h 硬冷却
+		{0, "you have no plan", ErrPlanLimit},    // 文案兜底
+		{4001, "", ErrNone},                      // 参数非法 → 不罚号
+		{4003, "model config is empty", ErrNone}, // 模型问题 → 不罚号
+		{4008, "", ErrSoftRate},
+		{4000, "quota exceeded", ErrSoftRate},
+		{0, "rate limited", ErrSoftRate},
+		{401, "", ErrSessionDead},
+		{429, "", ErrSoftRate},
+		{404, "", ErrNotFound},
+		{400, "", ErrClient},
+		{503, "", ErrServer},
+		{0, "", ErrNone},
+		{4023, "something went wrong", ErrServer}, // 认不出的业务码：按上游侧故障罚号
+	}
+	for _, c := range cases {
+		if got := (&SOLOStreamError{Code: c.code, Msg: c.msg}).Kind(); got != c.want {
+			t.Errorf("code=%d msg=%q → %s, want %s", c.code, c.msg, got, c.want)
+		}
+	}
+}
+
 func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
 	out := PrepareBody([]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	var m map[string]any
