@@ -1,4 +1,8 @@
 // constants.go SOLO 上游技术常量（SPEC §1，来自实测；改动须附实测证据）。
+//
+// **这一组值 = TRAE Work（原 TRAE SOLO）对话通道的身份**，不是 TRAE IDE 的。
+// function / AppID / ClientID / 主机 / 版本码 任意一项换成 IDE 口径，模型表、门控与
+// 计费归属都会跟着变；`TestWorkChannelIdentityFrozen` 用字面值把它们钉住，改前先看那条测试。
 package upstream
 
 const (

@@ -359,3 +359,90 @@ func TestPickOfficialModels(t *testing.T) {
 		t.Errorf("应返回空: %+v", only)
 	}
 }
+
+// 通道冻结：这条中继转发的是 **TRAE Work**（原 TRAE SOLO）的对话通道，不是 TRAE IDE。
+//
+// 为什么断言字面值而不是常量：常量会被一起改掉，测试就跟着"通过"了。这里钉的是
+// **实际上线的值**——function / AppID / 主机 / 版本码 任意一项漂到 IDE 口径，模型表、
+// 门控（k3 那次就是版本码决定的）、计费归属都会跟着变，必须在这条测试上先响。
+func TestWorkChannelIdentityFrozen(t *testing.T) {
+	const (
+		wantFunction  = "solo_work_lite"
+		wantAgentHost = "https://trae-api-cn.mchost.guru"
+		wantUgHost    = "https://api.trae.cn"
+		wantChatPath  = "/api/agent/v3/llm_utils_chat"
+		wantModelPath = "/api/ide/v1/get_detail_param"
+		wantAppID     = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+		wantClientID  = "en1oxy7wnw8j9n"
+		wantVerCode   = "20260811"
+	)
+	if Function != wantFunction {
+		t.Errorf("function=%q want %q（换掉就是另一条产品线）", Function, wantFunction)
+	}
+	if AgentHost != wantAgentHost || UgHost != wantUgHost {
+		t.Errorf("hosts: agent=%q ug=%q", AgentHost, UgHost)
+	}
+	if EpChat != wantChatPath || EpModels != wantModelPath {
+		t.Errorf("paths: chat=%q models=%q", EpChat, EpModels)
+	}
+	if AppID != wantAppID || ClientID != wantClientID {
+		t.Errorf("appid=%q clientid=%q（都应是 SOLO 的）", AppID, ClientID)
+	}
+	if IdeVersionCode != wantVerCode {
+		t.Errorf("版本码=%q：它是上游的放量开关，往下调 k3 等模型会重新被门控", IdeVersionCode)
+	}
+
+	// 真发一次，抓出站头与请求体。
+	var gotAppID, gotVerCode, gotVerType, gotTraffic string
+	var gotBody []byte
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		gotAppID = r.Header.Get("X-App-Id")
+		gotVerCode = r.Header.Get("X-Ide-Version-Code")
+		gotVerType = r.Header.Get("X-Ide-Version-Type")
+		gotTraffic = r.Header.Get("Request-Traffic-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("event:done\ndata:{\"finish_reason\":\"stop\"}\n\n")),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1", MachineID: "m1", DeviceID: "d1"}
+	rc, _, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if gotAppID != wantAppID || gotVerCode != wantVerCode || gotVerType != "stable" || gotTraffic != "prod" {
+		t.Errorf("出站头: appid=%q verCode=%q type=%q traffic=%q", gotAppID, gotVerCode, gotVerType, gotTraffic)
+	}
+	if !bytes.Contains(gotBody, []byte(`"function":"solo_work_lite"`)) {
+		t.Errorf("请求体 function 不是 Work 通道: %s", gotBody)
+	}
+
+	// 运行期覆盖（面板 upstream.user_agent / client_version）只能改 UA 与版本号字符串
+	// **不能**改产品线：版本码与 AppID 必须纹丝不动。
+	defer SetIdentity("", "")
+	SetIdentity("TraeClient/TTNet", "9.9.9")
+	var hdr http.Header
+	c2 := testClient(func(r *http.Request) (*http.Response, error) {
+		hdr = r.Header.Clone()
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("event:done\ndata:{\"finish_reason\":\"stop\"}\n\n")),
+		}, nil
+	})
+	rc2, _, _, err := c2.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc2.Close()
+	if hdr.Get("X-Ide-Version-Code") != wantVerCode || hdr.Get("X-App-Id") != wantAppID {
+		t.Errorf("运行期覆盖动了产品线关键头: verCode=%q appid=%q",
+			hdr.Get("X-Ide-Version-Code"), hdr.Get("X-App-Id"))
+	}
+	if hdr.Get("X-Ide-Version") != "9.9.9" || hdr.Get("User-Agent") != "TraeClient/TTNet" {
+		t.Errorf("该生效的覆盖没生效: ver=%q ua=%q", hdr.Get("X-Ide-Version"), hdr.Get("User-Agent"))
+	}
+}
