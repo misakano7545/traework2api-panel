@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -123,6 +124,43 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	}
 	if st.Credits != 380 {
 		t.Errorf("credits=%d want 380", st.Credits)
+	}
+}
+
+// 补签循环：Run() 起来后按间隔重扫（没签上的账号下一个整点还有机会）。
+// 修的是「一天只在 checkin_hours 打一枪，撞上 9074 就整天白过」。
+// 这里让 claim 成功，好观察 tick 在扫；失败后进 5 分钟冷却不再扫是设计如此
+// （见 TestCheckinBusinessErrorCoolsAccount）。走 Run() 而不是直接调循环，顺带验接线。
+func TestCheckinRetryLoopRescans(t *testing.T) {
+	f := &fakeUpstream{
+		claimResponse:  `{"code":0,"message":"success"}`,
+		resourceRemain: 4500,
+	}
+	srv := f.server()
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	s := newTestScheduler(f, p, srv)
+	s.mu.Lock()
+	s.cfg.CheckinEnabled = true // 与 catch-up 测试同一套写配置的姿势
+	s.mu.Unlock()
+
+	old := checkinRetryInterval
+	checkinRetryInterval = 20 * time.Millisecond
+	defer func() { checkinRetryInterval = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+
+	// 期望至少两个 tick 各扫一轮。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && f.checkinCalls.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if got := f.checkinCalls.Load(); got < 2 {
+		t.Fatalf("补签扫描次数=%d want ≥2（Run 应起循环并按间隔重扫）", got)
 	}
 }
 

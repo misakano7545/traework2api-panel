@@ -97,6 +97,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 	if balance > 0 {
 		go s.runBalanceLoop(ctx, balance)
 	}
+	s.mu.RLock()
+	checkinOn := s.cfg.CheckinEnabled
+	s.mu.RUnlock()
+	if checkinOn {
+		go s.runCheckinRetryLoop(ctx)
+	}
 	hours := s.allHours()
 	if len(hours) == 0 {
 		// 两个任务都关了：没有时点要等，直接躺到退出（别空转 nextFire）。
@@ -121,6 +127,33 @@ func (s *Scheduler) Run(ctx context.Context) {
 			if doKeepalive {
 				s.RunRefreshNow()
 			}
+		}
+	}
+}
+
+// checkinRetryInterval 补签扫描间隔。
+//
+// 上游 claim 的 9074（「当前参与用户太多」）是**时段性拥塞**，实测换请求头（X-Machine-Id 等）、
+// 换主机都不改变结果，隔离 10 分钟内连打也全是 9074。只在 checkin_hours 每天打一两枪
+// （默认就只有 09:00 一个时点）基本等于全空，所以改成按小时重扫。
+// 变量而非常量只为测试能把它调小。
+var checkinRetryInterval = time.Hour
+
+// runCheckinRetryLoop 当天补签：每小时扫一遍，没签上的账号在下一个整点还有机会。
+//
+// 反复扫是安全的：CheckinUID 先查 status，已签的账号直接跳过（幂等），签到域冷却中的账号
+// 也会被 byUrgency 跳过——上游拥塞时不会退化成连打。
+// 「进程起来先扫一遍」不在这里做：`catchUpCheckin` 已经负责启动补跑，重复调用会对上游连打两次。
+// ponytail: 固定 1 小时。要更密/更疏就把它做成配置项。
+func (s *Scheduler) runCheckinRetryLoop(ctx context.Context) {
+	t := time.NewTicker(checkinRetryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.RunCheckinNow()
 		}
 	}
 }
