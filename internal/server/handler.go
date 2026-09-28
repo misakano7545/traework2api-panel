@@ -60,6 +60,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
+	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -133,23 +136,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// authOK 校验 Bearer 密钥；未设密钥（want 空）= 放行（仅本机）。
+// 各入站协议的 withAuth 包装只负责把失败写成自己协议形状的错误体，比较逻辑只此一份。
+func (h *Handler) authOK(r *http.Request) bool {
+	// 密钥随配置热改（面板改了立刻用新的），所以每次都从 runtime 读，不缓存到局部闭包。
+	want := h.runtime().APIKey
+	if want == "" {
+		return true
+	}
+	authz := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(authz) < len(prefix) || !strings.EqualFold(authz[:len(prefix)], prefix) {
+		return false
+	}
+	// 常量时间比较，防时序攻击（本地代理但按规范）。
+	return subtle.ConstantTimeCompare([]byte(authz[len(prefix):]), []byte(want)) == 1
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 密钥随配置热改（面板改了立刻用新的），所以每次都从 runtime 读，不缓存到局部闭包。
-		want := h.runtime().APIKey
-		if want != "" {
-			authz := r.Header.Get("Authorization")
-			const prefix = "Bearer "
-			if len(authz) < len(prefix) || !strings.EqualFold(authz[:len(prefix)], prefix) {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-				return
-			}
-			key := authz[len(prefix):]
-			// 常量时间比较，防时序攻击（本地代理但按规范）。
-			if subtle.ConstantTimeCompare([]byte(key), []byte(want)) != 1 {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-				return
-			}
+		if !h.authOK(r) {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
 		}
 		next(w, r)
 	}

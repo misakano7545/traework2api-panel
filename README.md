@@ -1,14 +1,20 @@
 # traework2api
 
 TRAE Work (SOLO CN) 的 OpenAI 兼容反向代理。把 TRAE SOLO 免费对话通道
-（`llm_utils_chat` + `function=solo_work_lite`）包装成标准的
-`/v1/chat/completions` + `/v1/models` 接口，支持多账号轮转、自动签到、token 自动刷新。
+（`llm_utils_chat` + `function=solo_work_lite`）包装成统一服务，支持多账号轮转、自动签到、
+token 自动刷新。入站三种协议：`chat_completions`（`POST /v1/chat/completions`）、
+`codex_responses`（`POST /v1/responses`）、`anthropic_messages`（`POST /v1/messages`，
+同样接受 `POST /messages`）。
 
 纯 Go 标准库，零第三方依赖。
 
 ## 功能
 
-- **OpenAI 兼容 API**：`POST /v1/chat/completions`（流式/非流式）、`GET /v1/models`
+- **三种入站协议**：`POST /v1/chat/completions`（OpenAI chat）、`POST /v1/responses`
+  （Codex；`wire_api="chat"` 已在 Codex 0.84+ 移除，只认 Responses）、`POST /v1/messages`
+  与 `POST /messages`（Anthropic Messages，含 `x-api-key` 鉴权）；都是先转成 chat 请求再走
+  **同一条链路**（切号、冷却、会话粘性、提示词改写、出站改写），上游仍是 SOLO chat SSE
+- **`GET /v1/models`**：模型列表
 - **多账号池**：积分加权挑选（闲置补偿 + 快过期优先），在途限额，熔断/降权/计划冷却，
   401 连续 3 次才禁用（一次抖动不杀号），请求级轮转
 - **流内错误分类**（HTTP 级与 `event:error` 共用一张表）：1005 权益不足 → 12h 计划冷却；
@@ -45,6 +51,16 @@ curl -X POST http://127.0.0.1:7864/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $KEY" \            # KEY=$(jq -r .api_key config.json)，或在面板「配置」页复制
   -d '{"model":"glm-5.2","messages":[{"role":"user","content":"你好"}]}'
+
+# Codex Responses（流式，Codex CLI 走这条）
+curl -N http://127.0.0.1:7864/v1/responses \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.2","input":"你好","stream":true}'
+
+# Anthropic Messages（官方 SDK 用 x-api-key）
+curl http://127.0.0.1:7864/v1/messages \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.2","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ## 登录流程
@@ -134,6 +150,12 @@ session 失效（上游 `1001` / `20101`，refresh token 也救不回来）**连
 「模型」页按上游 `get_detail_param` 原值列出模型的 `capability`（`model_capability`）与思考
 相关字段（`model_extra_config` 里的 `Thinking.Type`、`reasoning_effort_config` 原文），不做解释和换算。
 
+三种入站协议在 handler 层先归一成一份 chat 请求（`responses.go` / `messages.go`），再进上面这条
+管线，所以切号/冷却/会话粘性/台账对三条路一样生效。`codex_responses` 不保存
+`previous_response_id` / `store`（Codex 每轮自带全量 input）；`anthropic_messages` 不回传
+thinking（上游没有 signature）。缓存命中各按客户端口径回：responses 出
+`input_tokens_details.cached_tokens`，messages 出 `cache_read_input_tokens`（都取自 SOLO
+`usage.cache_read_input_tokens`，没有就不写，不拿 0 冒充"没命中"）。
 客户端自己带的 `reasoning_effort` 之类字段是**原样透传**上游的，不认的也一个不吞（`PrepareBody` 只改
 `stream`/`function`/`config_name`/`model`/`tools`）。
 
@@ -235,7 +257,7 @@ internal/auth/    auth 文件解析/原子写回
 internal/upstream/ SOLO 上游客户端 + SSE 转换
 internal/pool/    账号池（冷却/禁用/积分）
 internal/scheduler/ 定时签到 + token 保活
-internal/server/  OpenAI 兼容路由
+internal/server/  三种入站协议（chat / responses / messages）+ 共用请求链路
 internal/panel/   /panel/ 管理页（go:embed）
 internal/session/ 会话粘性（会话 → 账号 绑定表）
 internal/prompt/  系统提示词（内置默认 + 文件覆盖 + 改写）
