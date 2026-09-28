@@ -1,0 +1,131 @@
+name: go-binaries
+
+# 发版线（口径对齐 workbuddy2api-panel 的 go-binaries.yml）：
+#   - push main / PR 触碰构建相关文件 → 测试 + 交叉编译，产物只存 artifact，不发布
+#   - push v* tag                     → 同上 + 打包（zip/tar.gz + checksums）挂到 GitHub Release
+# 版本号是上海时间，形如 v2026.9.28.1530；标签、Release、二进制里的版本串用同一个号
+# （见 README「发版」）。源码不钉版本号，所以这里不做 tag↔源码一致性断言——参考项目那条
+# 断言是给「源码里写死 appVersion」的仓库用的；本仓库版本只有 CI 注入这一个来源。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "go.mod"
+      - "cmd/**"
+      - "internal/**"
+      - "config.example.json"
+      - ".github/workflows/go-binaries.yml"
+  workflow_dispatch:
+
+# PR 取消过时构建；main/tag 按引用串行（发版时 main+tag 同推不双跑同一份代码）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # ubuntu runner 自带 node → 面板包的 JS 冒烟测试（frontend_chart_test.go）会真实执行
+      - run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # 服务端二进制：linux 两个架构 + windows amd64（本地开发用）。
+      # ponytail: 没上 windows/arm64 与 darwin；真要就在这个 matrix 里加一行。
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # 标签发版用标签名：CI 时钟和标签差一分钟就会变成两个号
+      - name: 取版本号
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)
+          fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 构建（剥离符号 + 注入面板版本）
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          BIN=tw2api
+          [ "$GOOS" = windows ] && BIN=tw2api.exe
+          go build -trimpath -ldflags "-s -w -X main.appVersion=${{ steps.ver.outputs.v }}" -o "$BIN" ./cmd/server
+
+      # 断言二进制里的版本串：交叉编译矩阵里编错树/漏 ldflags 都靠这条拦住
+      - name: 断言二进制版本串
+        run: |
+          BIN=tw2api
+          [ "${{ matrix.goos }}" = windows ] && BIN=tw2api.exe
+          if ! grep -qa "${{ steps.ver.outputs.v }}" "$BIN"; then
+            echo "::error::binary missing version string ${{ steps.ver.outputs.v }}"
+            exit 1
+          fi
+          echo "version assert OK: ${{ steps.ver.outputs.v }}"
+
+      - name: 打包（二进制 + config.example.json + README.md）
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.v }}"
+          if [ "${{ matrix.goos }}" = windows ]; then
+            NAME="traework2api-panel-v${V}-windows-${{ matrix.goarch }}.zip"
+            zip -q "$NAME" tw2api.exe config.example.json README.md
+          else
+            NAME="traework2api-panel-v${V}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+            tar czf "$NAME" tw2api config.example.json README.md
+          fi
+          echo "name=$NAME" >> "$GITHUB_ENV"
+          ls -la "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.name }}
+          path: ${{ env.name }}
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum *.zip *.tar.gz > checksums.txt && ls -la
+      # gh 是 runner 自带 CLI，不再引第三方 release action
+      - name: 建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          gh release create "v${V}" dist/*.zip dist/*.tar.gz dist/checksums.txt \
+            --title "v${V}" --generate-notes

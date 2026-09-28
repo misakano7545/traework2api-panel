@@ -26,6 +26,10 @@ import (
 	"traework2api/internal/usage"
 )
 
+// appVersion 面板版本，透出到 /panel/api/overview 的 version（与 workbuddy2api-panel 同口径）。
+// 本地构建/源码跑显示 dev；发版由 CI 用 -X main.appVersion=<tag 版本> 注入。
+var appVersion = "dev"
+
 // limitsOf 把配置翻成池参数（唯一转换点：启动与热改走同一个函数，不会两处漂移）。
 func limitsOf(c *Config) pool.Limits {
 	return pool.Limits{
@@ -152,7 +156,7 @@ func main() {
 		Scheduler:  sch,
 		AuthDir:    cfg.AuthDir,
 		APIKey:     cfg.APIKey,
-		Version:    "traework2api",
+		Version:    appVersion,
 		Logs:       logs,
 		Models:     h.Models,
 		Usage:      rec,

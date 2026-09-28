@@ -25,6 +25,7 @@ docs/
 *.tmp
 *.log
 __pycache__/
+/dist/
 
 # IDE
 .idea/

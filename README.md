@@ -121,6 +121,25 @@ go build -o tw2api ./cmd/server
 `pool.cost_explore_interval`（成本分层探索）、`upstream.device_token*/cli_version` 未提供——
 写成空壳字段只会让人以为改了有效果。
 
+## 发版
+
+版本号是上海时间，形如 `v2026.9.28.1530`（`2026.9.28` 日期，月日不补零；`1530` 是 15:30，
+时不补零、分两位、不带秒）。发版就是打标签并推送，工作流看到 `v*` 才建 Release：
+
+```bash
+VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)
+git tag "v$VERSION" && git push origin "v$VERSION"
+```
+
+- **`go-binaries.yml`**：push main / PR → `go test ./...` + linux(amd64/arm64)、windows(amd64)
+  交叉编译，产物只进 artifact；打 `v*` tag → 同一个版本号注入 `-X main.appVersion=`（面板
+  「概览」显示它），打包成 `traework2api-panel-v<版本>-<系统>-<架构>.zip|tar.gz`（含
+  `config.example.json` 与 README）挂到 Release，另附 `checksums.txt`。
+- **`docker-ghcr.yml`**：多架构（amd64/arm64）镜像推 `ghcr.io/misakano7545/traework2api-panel`，
+  main 推 `latest` / `main` / `sha-xxxxxx`，PR 只构建不推送。
+- 源码里 `appVersion` 默认 `dev`（本地 `go build` 与 Docker 镜像里都是 dev），只有 CI 发版会
+  注入真实版本号；不要手改它。
+
 ## 运维
 
 ```bash

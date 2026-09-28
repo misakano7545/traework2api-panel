@@ -1,0 +1,82 @@
+name: docker-ghcr
+
+# 多架构镜像（amd64/arm64）构建并发布到 ghcr.io：
+#   - push main / 打 v* tag / 手动触发 → 构建并推送
+#   - PR 触碰构建相关文件 → 仅构建验证，不推送
+# tag 说明：main 推 latest + main + sha-xxxxxx；v2026.9.28.1530 这类时间标签不匹配 semver
+# 规则，所以只额外推一个 sha-xxxxxx（不发 2026.9 / 2026 那种缩写标签）。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "cmd/**"
+      - "internal/**"
+      - "*.sh"
+      - "config.example.json"
+      - ".github/workflows/docker-ghcr.yml"
+  workflow_dispatch:
+
+# 并发组：PR 取消过时构建；main/tag 按引用串行——发版时 main+tag 同推不再双跑
+# 同一份代码的多架构构建（QEMU arm64 一次不便宜）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository 自动小写化，得到 ghcr.io/misakano7545/traework2api-panel
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU（arm64 交叉模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 关闭 provenance attestation：避免 ghcr 页面出现 unknown/unknown 架构条目
+          provenance: false
