@@ -164,18 +164,45 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 `step-5-preview` 那一行全 0 是模型特性不是失败：它 33 发全程 `reasoning_tokens=0`（`completion` 80~109 正常出答案）。
 本轮 495 发（15 模型 × 11 列 × 3 轮，版本码 20260811）零失败。
 
-**`kimi-k3` 的开关是「客户端版本码」，不是账号档位**（实测，2026-09）：上游按 `X-Ide-Version-Code`
-下发不同的模型表与门控，`X-Ide-Version` 字符串本身不影响结果。
+**`kimi-k3` 的开关是「客户端版本码」，不是账号档位**（实测 2026-09-27）：上游按 `X-Ide-Version-Code`
+下发不同的模型表与门控，`X-Ide-Version` 字符串本身不影响结果（`0.1.43`/`0.1.50`/`1.0.0` 同码同表）。
 
 | 版本码 | 模型表 | k3 的 `access.identity_list` | 结果 |
 |:--|:--|:--|:--|
 | `20260716`（旧） | 39 条 | `[2,3,100]` | 免费档被挡，请求回 `1005 plan:2` |
 | `20260811`（当前，见 `constants.go`） | 42 条 | `[0,5,1,2,3,100]` | 免费档**可用**，实测出流正常 |
+| `20260814` / `20260821` / `20260927` / `20261231` | 42 条 | `[0,5,1,2,3,100]` | **与 `20260811` 逐字一致**（含故意超前的未来码） |
 
-版本码 `20260811` 的可见集合（15 个）多出 `kimi-k3` / `glm-5.3` / `step-5-preview` /
-`deepseek-v4.1-flash`，少掉 `glm-5` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro`（后三个在新版
-客户端里已 `is_invisible_to_user`）。可见集合本身还会随灰度漂移（实测同一版本码下 `qwen*`
-时有时无），所以**动态拉取才是权威**，静态表只是拉不到时的兜底快照。
+- 可见集合在 `20260811` 换过一茬：多出 `kimi-k3` / `glm-5.3` / `step-5-preview` /
+  `deepseek-v4.1-flash`，少掉 `glm-5` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro`（后三个在新版客户端里
+  已 `is_invisible_to_user`）。可见集合本身还会随灰度漂移（同一版本码下 `qwen*` 时有时无），
+  所以**动态拉取才是权威**，静态表只是拉不到时的兜底快照。
+- **官方版本号在更新日志里**：`https://docs.trae.cn/work_changelog`（TraeWork 最新 `v0.1.52`，
+  2026-08-21 那批；IDE 侧另见 `ide_changelog`）。客户端自带的更新接口
+  `log.snssdk.com/service/2/app_alert_check/` 实测只回 `{"message":"success"}`，取不到版本。
+- **冒充最新版能请求到模型，但没有收益**：用 `0.1.52 / 20260821` 的身份发 `kimi-k3` 拿到
+  `HTTP 200` 出流，可模型表与门控跟 `20260811` 逐字一致；上游也不校验版本码（`1.0.0 / 20261231`
+  照收）。所以 `constants.go` 保持 `0.1.50 / 20260811`，不追官方版本号。
+- 复跑矩阵（只读，6 个请求 + 一发 k3）：
+  `TW2A_PROBE_VERCODE=1 go test ./internal/upstream -run TestProbeLiveVersionCode -v`
+  —— 哪天阵容出现 `+`/`−` 变化，才需要动 `constants.go`（`TestWorkChannelIdentityFrozen` 会拦住改动）。
+
+实测输出（2026-09-27；`可见` 是 13 还是 15 随 `qwen*` 灰度浮动）：
+
+```
+===== 版本码矩阵（get_detail_param, function=solo_work_lite），账号 uid=253358232317424
+  ver / code          表   可见  k3 门控                          阵容变化
+  0.1.43 / 20260716    39   13  identity_list":[2,3,100]}        旧档
+  0.1.48 / 20260811    42   13  identity_list":[0,5,1,2,3,100]} +[deepseek-v4.1-flash glm-5.3 step-5-preview]
+                                                              −[DeepSeek-V4-Flash DeepSeek-V4-Pro glm-5]
+  0.1.51 / 20260814    42   13  identity_list":[0,5,1,2,3,100]} （与上一档逐字一致）
+  0.1.52 / 20260821    42   13  identity_list":[0,5,1,2,3,100]} （与上一档逐字一致）
+  0.1.60 / 20260927    42   13  identity_list":[0,5,1,2,3,100]} （与上一档逐字一致）
+  1.0.0  / 20261231    42   13  identity_list":[0,5,1,2,3,100]} （与上一档逐字一致）
+
+===== 用最新档身份（0.1.52 / 20260821）真发 kimi-k3
+  HTTP 200，流开头: event:metadata data:{"session_id":"e3841837-…","prompt_cache_pool_record":null}
+```
 
 复跑：`TW2A_PROBE_CHAT=1 go test ./internal/upstream -run TestProbeLiveEffortAB -v`（吃额度；档位清单
 `TW2A_PROBE_EFFORTS=`、模型 `TW2A_PROBE_MODEL=`、样本 `TW2A_PROBE_ROUNDS=`、上限 `TW2A_PROBE_MAXTOKENS=`）。

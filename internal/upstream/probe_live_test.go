@@ -436,3 +436,163 @@ func answerOf(out map[string]any) string {
 	ans, _ := msg["content"].(string)
 	return strings.Join(strings.Fields(ans), " ")
 }
+
+// ---------------------------------------------------------------------------
+// 版本码矩阵探针
+// ---------------------------------------------------------------------------
+
+// vcodeTable 用指定版本/版本码取一次模型表：返回条数、可见官方模型、k3 的门控片段。
+// 只读（get_detail_param），不改任何本地状态。
+func vcodeTable(c *Client, a *auth.Auth, ver, code string) (int, []string, string, error) {
+	body, _ := json.Marshal(map[string]any{
+		"function": Function, "config_names": nil, "need_prompt": false,
+		"current_config_info": nil, "poly_prompt": true, "mode_type": nil, "agent_type": nil,
+	})
+	req, err := http.NewRequest(http.MethodPost, c.AgentHost+EpModels, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, "", err
+	}
+	SOLOHeaders(req, a, false)
+	req.Header.Set("X-Ide-Version", ver)
+	req.Header.Set("X-Ide-Version-Code", code)
+	req.Header.Set("X-App-Version-Code", code)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, nil, "", err
+	}
+	var top struct {
+		ConfigInfoList []map[string]any `json:"config_info_list"`
+	}
+	if err := json.Unmarshal(data, &top); err != nil {
+		return 0, nil, "", err
+	}
+	k3 := "无 k3"
+	var vis []string
+	for _, cfg := range top.ConfigInfoList {
+		name, _ := cfg["config_name"].(string)
+		if name == "kimi-k3" {
+			dcc, _ := cfg["display_contact_config"].(string)
+			k3 = "无门控字段"
+			if i := strings.Index(dcc, "identity_list"); i >= 0 {
+				k3 = dcc[i:]
+				if j := strings.Index(k3, "}"); j >= 0 {
+					k3 = k3[:j+1]
+				}
+			}
+		}
+		if cfg["is_invisible_to_user"] == false && cfg["usage"] == "chat_completion" && name != "" {
+			vis = append(vis, name)
+		}
+	}
+	sort.Strings(vis)
+	return len(top.ConfigInfoList), vis, k3, nil
+}
+
+// vcodeChat 用指定版本/版本码真发一发对话（只读式小请求：max_tokens=16，读 300 字节即断）。
+func vcodeChat(c *Client, a *auth.Auth, model, ver, code string) (int, []byte, error) {
+	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"只回两个字：收到"}],"max_tokens":16}`, model)
+	req, err := http.NewRequest(http.MethodPost, c.AgentHost+EpChat, bytes.NewReader(PrepareBody([]byte(body))))
+	if err != nil {
+		return 0, nil, err
+	}
+	SOLOHeaders(req, a, true)
+	req.Header.Set("X-Ide-Version", ver)
+	req.Header.Set("X-Ide-Version-Code", code)
+	req.Header.Set("X-App-Version-Code", code)
+	httpc := c.StreamHTTP
+	if httpc == nil {
+		httpc = c.HTTP
+	}
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	return resp.StatusCode, head, nil
+}
+
+// vcodeDiff 两档阵容的差集（+ 新增 / − 移除），都一样则返回空串。
+func vcodeDiff(prev, cur []string) string {
+	inPrev, inCur := map[string]bool{}, map[string]bool{}
+	for _, s := range prev {
+		inPrev[s] = true
+	}
+	for _, s := range cur {
+		inCur[s] = true
+	}
+	var add, del []string
+	for _, s := range cur {
+		if !inPrev[s] {
+			add = append(add, s)
+		}
+	}
+	for _, s := range prev {
+		if !inCur[s] {
+			del = append(del, s)
+		}
+	}
+	if len(add) == 0 && len(del) == 0 {
+		return "（与上一档逐字一致）"
+	}
+	return fmt.Sprintf("+%v −%v", add, del)
+}
+
+// TestProbeLiveVersionCode 只读诊断：`X-Ide-Version-Code` 是上游的**放量开关**（见 constants.go），
+// 这里把候选版本码逐个打一遍 get_detail_param，打印表条数 / 可见阵容 / k3 门控，并与上一档做差集；
+// 最后用最新那档的身份真发一发 kimi-k3，回答「冒充最新版客户端能不能请求到模型」。
+//
+// 默认跳过，手动跑：TW2A_PROBE_VERCODE=1 go test ./internal/upstream -run TestProbeLiveVersionCode -v
+//
+// 2026-09-27 实测：20260716 是旧阵容（k3 被 [2,3,100] 挡）；20260811 起换新阵容并放开 k3，
+// 再往新码（含故意超前的 20261231）**逐字一致** —— 顶版本码没有收益，保持 constants 的取值即可。
+func TestProbeLiveVersionCode(t *testing.T) {
+	if os.Getenv("TW2A_PROBE_VERCODE") == "" {
+		t.Skip("置 TW2A_PROBE_VERCODE=1 才跑（需要真实凭据与网络）")
+	}
+	dir := os.Getenv("TW2A_AUTH_DIR")
+	if dir == "" {
+		dir = "../../auths"
+	}
+	as, err := auth.LoadDir(dir)
+	if err != nil || len(as) == 0 {
+		t.Fatalf("加载账号失败: %v (dir=%s)", err, dir)
+	}
+	a := as[0]
+	c := New()
+
+	cands := []struct{ ver, code, note string }{
+		{"0.1.43", "20260716", "旧档（constants 改动前的取值）"},
+		{"0.1.48", "20260811", "我们当前发的码"},
+		{"0.1.51", "20260814", "0.1.51 构建日期（社区日志）"},
+		{"0.1.52", "20260821", "官方更新日志最新那批 2026-08-21"},
+		{"0.1.60", "20260927", "超前码（今天）"},
+		{"1.0.0", "20261231", "故意超前的未来码"},
+	}
+	fmt.Printf("\n===== 版本码矩阵（get_detail_param, function=%s），账号 uid=%s\n", Function, a.UID)
+	fmt.Println("  ver / code          表   可见  k3 门控                          阵容变化")
+	var prev []string
+	latest := cands[3] // 0.1.52 / 20260821：官方更新日志里的最新那批
+	for _, cd := range cands {
+		n, vis, k3, err := vcodeTable(c, a, cd.ver, cd.code)
+		if err != nil {
+			fmt.Printf("  %-6s / %-10s 失败: %v\n", cd.ver, cd.code, err)
+			continue
+		}
+		diff := ""
+		if prev != nil {
+			diff = vcodeDiff(prev, vis)
+		}
+		fmt.Printf("  %-6s / %-10s %3d  %3d  %-30s %s  %s\n",
+			cd.ver, cd.code, n, len(vis), k3, diff, cd.note)
+		prev = vis
+	}
+
+	fmt.Printf("\n===== 用最新档身份（%s / %s）真发 kimi-k3\n", latest.ver, latest.code)
+	status, head, err := vcodeChat(c, a, "kimi-k3", latest.ver, latest.code)
+	if err != nil {
+		fmt.Printf("  传输层错误: %v\n", err)
+		return
+	}
+	fmt.Printf("  HTTP %d，流开头: %s\n", status, truncate(strings.Join(strings.Fields(string(head)), " "), 200))
+}
