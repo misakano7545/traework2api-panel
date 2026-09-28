@@ -569,6 +569,11 @@ func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstr
 	if tt, has := numField(upstreamUsage, "total_tokens"); has {
 		d.TotalTokens, d.HasTotal = tt, true
 	}
+	// 缓存命中：SOLO 的 token_usage 用 cache_read_input_tokens 报命中量。
+	// 上游没报这个键就是没有缓存信息（不是 0% 命中），HasCacheHit 保持 false。
+	if ch, has := numField(upstreamUsage, "cache_read_input_tokens"); has {
+		d.CacheHitTokens, d.HasCacheHit = ch, true
+	}
 	h.cfg.Usage.Add(time.Now(), uid, model, d, ok)
 }
 

@@ -56,6 +56,10 @@ type bucket struct {
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
 	TPSN  int64   `json:"vn"` // 速率样本数
+	// CH/CHN：缓存命中 token 与「报了缓存字段的样本数」。样本数是命中率能否算的依据——
+	// 上游没给 cache 字段时不能拿 0 当 0% 命中（见 Agg.CacheSamples）。
+	CH  int64 `json:"ch,omitempty"`
+	CHN int64 `json:"chn,omitempty"`
 	// OKAt 本片最后一次成功的时间（Unix 秒，0 = 本片没成功过）。面板「最近成功」列的
 	// 依据：只有时间戳能回答"这个号最后一次干活是什么时候"，累计数答不了。
 	OKAt int64 `json:"k,omitempty"`
@@ -143,6 +147,10 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+	// CacheHitTokens：上游 usage 里的缓存命中 token（SOLO 是 cache_read_input_tokens）。
+	// 命中率 = 命中 / prompt；HasCacheHit=false 表示这次上游没报，不能当成 0% 命中。
+	CacheHitTokens int64
+	HasCacheHit    bool
 }
 
 // Add 记录一次请求尝试。
@@ -192,6 +200,10 @@ func (r *Recorder) Add(now time.Time, uid, model string, d Delta, ok bool) {
 	if d.HasTPS {
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
+	}
+	if d.HasCacheHit {
+		b.CH += d.CacheHitTokens
+		b.CHN++
 	}
 	r.dirty = true
 }
@@ -324,6 +336,10 @@ type Agg struct {
 	TotalTokens   int64   `json:"total_tokens"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+	// 缓存命中 token 与「报了缓存字段的样本数」：前端只在 CacheSamples>0 的片上画命中率，
+	// 缺失的片把线断开——0% 命中与「上游没报」是两件事。omitempty 让老桶不带这两个键。
+	CacheHitTokens int64 `json:"cache_hit_tokens,omitempty"`
+	CacheSamples   int64 `json:"cache_samples,omitempty"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -342,6 +358,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.PromptTokens += b.PT
 	g.CompletionTok += b.CT
 	g.TotalTokens += b.TT
+	g.CacheHitTokens += b.CH
+	g.CacheSamples += b.CHN
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS

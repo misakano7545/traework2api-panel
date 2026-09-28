@@ -320,6 +320,120 @@ function usEmpty(tb, cols, msg) {
   tb.innerHTML = '<tr><td colspan="' + cols + '"><div class="empty">' + esc(msg) + '</div></td></tr>';
 }
 
+/* ── 用量时序图（抄自 WorkBuddy 面板那张 SVG，砍掉缓存命中率线）────────────
+   纯 SVG 手写，不引图表库：面板通篇零第三方依赖。
+   三个函数都保持**纯函数**（只吃参数、只返字符串），源码里有一条 node 断言测试盯着它们。 */
+
+/* 解析时间片标签："2026-09-25T15"（小时桶）/ "2026-09-25"（日桶）。
+   手写而不用 Date.parse：缺分钟的时刻（"…T15"）在部分引擎里直接 NaN，
+   而 NaN 会传染整张图。返回 null 让调用方丢掉这个点。 */
+function usagePointTime(t) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}))?$/.exec(String(t || ''));
+  if (!m) return null;
+  // 标签用匹配到的**字符串**（保住前导零），数值只在算 ms 时转换。
+  const mo = m[2], d = m[3], h = m[4] || null;
+  return {
+    ms: Date.UTC(+m[1], +m[2] - 1, +m[3], h ? +h : 0), // 只用来算横向相对位置，不做时区换算
+    label: h ? mo + '-' + d + ' ' + h + ':00' : mo + '-' + d,
+  };
+}
+
+/* 坐标轴刻度用的紧凑数字：1234 → 1.2k、1200000 → 1.2M。 */
+function fmtShortTok(v) {
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + 'k';
+  return String(Math.round(v));
+}
+
+/* 堆叠柱：输入在下、输出在上；命中率折线（有缓存数据的片才画）；三条网格线 + 首/中/尾刻度。 */
+function usageChartSVG(series) {
+  const pts = [];
+  for (const p of series || []) {
+    const t = usagePointTime(p && p.t);
+    if (!t) continue;
+    const pt = Number(p.prompt_tokens || 0), ct = Number(p.completion_tokens || 0);
+    const hit = Number(p.cache_hit_tokens || 0), samples = Number(p.cache_samples || 0);
+    pts.push({
+      ms: t.ms, label: t.label, pt, ct, tt: Number(p.total_tokens || 0) || pt + ct,
+      // 命中率只在「确实观测到缓存字段」的片上算；上游没报就是 null，线在那里断开——
+      // 0% 命中与「没观测到」是两件事（同 WB 面板的口径）。
+      rate: samples > 0 && pt > 0 ? Math.min(1, hit / pt) : null,
+    });
+  }
+  if (!pts.length) return '<div class="us-empty">这个窗口内还没有调用。</div>';
+
+  const W = 760, H = 180, PL = 46, PR = 12, PT = 12, PB = 28;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const t0 = pts[0].ms, span = Math.max(1, pts[pts.length - 1].ms - t0);
+  const max = Math.max(1, ...pts.map(p => p.tt));
+  const x = ms => PL + (ms - t0) / span * iw;
+  const y = v => PT + ih - (v / max) * ih;
+
+  // 柱宽取「最小真实间隔」的 70%，夹在 2~26px：窗口拉到 30 天会变细但看得见。
+  let gap = span;
+  for (let i = 1; i < pts.length; i++) gap = Math.min(gap, pts[i].ms - pts[i - 1].ms);
+  const bw = Math.max(2, Math.min(26, (gap / span) * iw * 0.7));
+
+  let grid = '';
+  for (let g = 0; g <= 2; g++) {
+    const yy = y(max * g / 2);
+    grid += '<line class="ax" x1="' + PL + '" x2="' + (W - PR) + '" y1="' + yy.toFixed(1) +
+      '" y2="' + yy.toFixed(1) + '"/><text class="lbl" x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) +
+      '" text-anchor="end">' + fmtShortTok(max * g / 2) + '</text>';
+  }
+
+  let bars = '';
+  for (const p of pts) {
+    // 夹进绘图区：首尾柱子的半个柱宽会探出 PL / W-PR，压在 y 轴刻度或右边界上。
+    const bx = Math.min(W - PR - bw, Math.max(PL, x(p.ms) - bw / 2)).toFixed(1);
+    const hp = (p.pt / max) * ih, hc = (p.ct / max) * ih;
+    if (hp > 0) {
+      bars += '<rect class="bar-p" x="' + bx + '" y="' + y(p.pt).toFixed(1) + '" width="' + bw.toFixed(1) +
+        '" height="' + hp.toFixed(1) + '" rx="1.5"/>';
+    }
+    if (hc > 0) {
+      // 中间留 1px 缝：同色堆叠时分不出哪段是输入哪段是输出
+      bars += '<rect class="bar-c" x="' + bx + '" y="' + (y(p.tt) + 1).toFixed(1) + '" width="' + bw.toFixed(1) +
+        '" height="' + Math.max(0, hc - 1).toFixed(1) + '" rx="1.5"/>';
+    }
+  }
+
+  let axis = '<line class="ax" x1="' + PL + '" x2="' + (W - PR) + '" y1="' + (PT + ih) + '" y2="' + (PT + ih) + '"/>';
+  for (const m of [pts[0], pts[Math.floor(pts.length / 2)], pts[pts.length - 1]]) {
+    axis += '<text class="lbl" x="' + x(m.ms).toFixed(1) + '" y="' + (PT + ih + 16) +
+      '" text-anchor="middle">' + m.label + '</text>';
+  }
+
+  // 命中率折线：0% 贴基线、100% 贴顶线；空档处断开成多段。单点不成线，但仍给个圆点。
+  let hit = '', seg = [];
+  const flush = () => {
+    if (seg.length > 1) hit += '<polyline class="hitline" points="' + seg.join(' ') + '"/>';
+    seg = [];
+  };
+  for (const p of pts) {
+    if (p.rate === null) {
+      flush();
+      continue;
+    }
+    const cx = x(p.ms).toFixed(1), cy = (PT + ih - p.rate * ih).toFixed(1);
+    seg.push(cx + ',' + cy);
+    hit += '<circle class="hitdot" cx="' + cx + '" cy="' + cy + '" r="2"><title>缓存命中率 ' +
+      Math.round(p.rate * 100) + '%</title></circle>';
+  }
+  flush();
+
+  return '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="token 时序">' +
+    grid + bars + hit + axis + '</svg>';
+}
+
+function renderUsageChart(series) {
+  const host = $('usChart');
+  if (!host) return;
+  host.innerHTML = usageChartSVG(series);
+  $('usChartNote').textContent = (series || []).length
+    ? '堆叠柱：输入 + 输出，共 ' + series.length + ' 个时间片' : '';
+}
+
 function renderUsage(d) {
   const t = d.totals || {};
   $('usReq').textContent = fmtNum(t.requests);
@@ -352,6 +466,7 @@ function renderUsage(d) {
       p.t, p.scope === 'day' ? '日' : '小时', p)).join('');
   } else usEmpty($('usSeriesBody'), 7, '这个窗口内还没有调用');
   $('usSeriesNote').textContent = usHours === '0' ? '全部历史（含折叠日桶）' : '按小时分片';
+  renderUsageChart(series);
 }
 
 async function loadUsage(quiet) {

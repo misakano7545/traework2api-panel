@@ -183,6 +183,28 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .usage-total em { color: var(--ink-2); }
 .usage-latency { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
 .usage-rate { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 18%, transparent); }
+
+/* 用量时序图（参考 WorkBuddy 面板那张 SVG，砍掉缓存命中率线：我们的台账还没记缓存字段）。
+   纯手写 SVG，不引图表库。 */
+.uschart { border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; }
+.uschart-hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-bottom: 1px solid var(--line-soft); background: var(--surface-2); }
+.uschart-hd .lb { color: var(--ink-2); font-weight: 550; }
+.uschart-hd .grow { flex: 1; }
+.uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
+.uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
+.uschart-hd .sw-p { background: var(--accent); }
+.uschart-hd .sw-c { background: var(--ok); }
+.uschart-hd .sw-hit { background: var(--warn); }
+.uschart-body { padding: 10px 12px 6px; }
+.uschart-body svg { display: block; width: 100%; height: auto; }
+.uschart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
+.uschart-body .lbl { fill: var(--ink-3); font: 500 10px var(--mono); }
+.uschart-body .bar-p { fill: var(--accent); }
+.uschart-body .bar-c { fill: var(--ok); }
+.uschart-body .hitline { fill: none; stroke: var(--warn); stroke-width: 1.6; }
+.uschart-body .hitdot { fill: var(--warn); }
+.us-empty { color: var(--ink-3); padding: 22px 12px; text-align: center; }
 .cred { min-width: 84px; }
 .cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
 .cred .n .tot { color: var(--ink-3); font-size: 11px; }
@@ -542,6 +564,20 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
         <div class="stat"><div class="v" id="usCt">-</div><div class="k">输出 tokens</div></div>
         <div class="stat good"><div class="v" id="usTt">-</div><div class="k">合计 tokens</div></div>
         <div class="stat"><div class="v" id="usLat">-</div><div class="k">平均延迟</div></div>
+      </div>
+
+      <div class="box">
+        <header><h3>Token 时序</h3><span class="grow"></span><span class="note" id="usChartNote"></span></header>
+        <div class="pad">
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">按时间片堆叠</span>
+              <span class="grow"></span>
+              <span class="legend"><i class="sw sw-p"></i>输入<i class="sw sw-c"></i>输出<i class="sw sw-hit"></i>缓存命中率</span>
+            </div>
+            <div id="usChart" class="uschart-body"></div>
+          </div>
+        </div>
       </div>
 
       <div class="box">
