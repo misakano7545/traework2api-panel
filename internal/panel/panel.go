@@ -158,7 +158,11 @@ type accountRow struct {
 	LastSuccess  time.Time `json:"last_success,omitempty"`
 }
 
-func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
+func (p *Panel) overview(w http.ResponseWriter, r *http.Request) { p.writeOverview(w, nil) }
+
+// writeOverview 面板首屏 JSON。extra 让动作类端点（签到）把「本次发生了什么」搭车带回：
+// 前端一次请求就拿到账号状态 + 结果，不必再猜本次拿了多少分。
+func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 	list := p.cfg.Pool.List()
 	var healthy, cooling, disabled int
 	for _, st := range list {
@@ -194,7 +198,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"version":       p.cfg.Version,
 		"uptime_sec":    int(time.Since(p.started).Seconds()),
 		"auth_required": p.key() != "",
@@ -204,7 +208,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":      disabled,
 		"usage_hours":   usagePanelHours,
 		"accounts":      rows,
-	})
+	}
+	for k, v := range extra {
+		body[k] = v
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // nicks 池内 uid→昵称，仅供展示（不含任何凭证）。
@@ -299,11 +307,12 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
 		return
 	}
-	if errs := p.cfg.Scheduler.RunCheckinNow(); len(errs) != 0 {
+	results, errs := p.cfg.Scheduler.RunCheckinNow()
+	if len(errs) != 0 {
 		writeErr(w, checkinErrorStatus(errs[0]), publicErr(errs[0]))
 		return
 	}
-	p.overview(w, r)
+	p.writeOverview(w, map[string]any{"checkin": results})
 }
 
 // keepaliveAll 立即对全账号刷一遍 token（保活）。不花积分：只刷新凭证，不调对话。
@@ -336,7 +345,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
 		return
 	}
-	err := p.cfg.Scheduler.CheckinUID(uid)
+	res, err := p.cfg.Scheduler.CheckinUID(uid)
 	if errors.Is(err, scheduler.ErrDisabled) {
 		writeErr(w, http.StatusConflict, "account disabled")
 		return
@@ -350,7 +359,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st, _ := p.cfg.Pool.Status(uid)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "status": res.Status, "earned": res.Credits, "account": st,
+	})
 }
 
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {

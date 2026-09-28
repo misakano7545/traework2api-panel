@@ -552,10 +552,34 @@ function boot() {
     history.replaceState(null, '', '#' + a.dataset.view);
   });
 
+/* 签到结果如实回报：本次 +N 分（分账号列出来），已签/冷却/失败分开说。
+   以前这里拿「积分包合计」冒充签到收益，签失败也像成功。 */
+function checkinMsg(rs, accounts) {
+  const ok = rs.filter(r => r.status === 'ok' && r.credits > 0);
+  const already = rs.filter(r => r.status === 'already').length;
+  if (!rs.length) {
+    // 冷却中的账号会被自动签到跳过（避免对拥塞的上游连打），这不是成功也不是失败。
+    const cool = (accounts || []).filter(a => a.checkin_cooling && !a.disabled).length;
+    return cool ? '本次没有账号可签：' + cool + ' 个在签到冷却中，下一轮补签会再试'
+      : '本次没有账号需要签到';
+  }
+  const total = ok.reduce((s, r) => s + (r.credits || 0), 0);
+  let msg;
+  if (ok.length) {
+    msg = '签到完成：' + ok.map(r => (r.nickname || r.uid) + ' +' + r.credits).join('、') + '（合计 +' + total + ' 分）';
+  } else if (already) {
+    msg = '今天 ' + already + ' 个账号都已签过，本次没有新增积分';
+  } else {
+    msg = '签到完成，本次没有新增积分';
+  }
+  if (ok.length && already) msg += '，另有 ' + already + ' 个今天已签';
+  return msg;
+}
+
   $('btnCheckinAll').onclick = async () => {
     try {
       const d = await api('checkin', { method: 'POST', body: '{}' });
-      toast('签到完成，积分合计 ' + (d.accounts || []).reduce((s, a) => s + (a.credits || 0), 0), 'ok');
+      toast(checkinMsg(d.checkin || [], d.accounts || []), 'ok');
     } catch (e) { toast(e.message, 'err'); }
     loadOverview(true);
   };
@@ -584,8 +608,12 @@ function boot() {
     b.disabled = true;
     try {
       const r = await api('accounts/' + encodeURIComponent(u) + '/' + a, { method: 'POST', body: '{}' });
-      if (a === 'checkin' || a === 'balance') {
-        toast((a === 'checkin' ? '签到完成' : '积分已刷新') + (r.account ? '，积分 ' + r.account.credits : ''), 'ok');
+      if (a === 'checkin') {
+        toast(r.status === 'already' ? '今天已经签过了'
+          : (r.earned ? '签到完成 +' + r.earned + ' 分' : '签到完成，本次没有新增积分'), 'ok');
+      } else if (a === 'balance') {
+        toast('积分已刷新' + (r.account ? '，积分包 ' + r.account.credits +
+          (r.account.credits_total ? '/' + r.account.credits_total : '') : ''), 'ok');
       } else if (a === 'clear-cooldown') toast('已解除冷却', 'ok');
       else if (a === 'disable') toast('已禁用', 'ok');
       else if (a === 'enable') toast('已启用', 'ok');

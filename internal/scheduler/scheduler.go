@@ -212,16 +212,18 @@ func contains(hours []int, h int) bool {
 // RunCheckinNow 立即对所有账号执行签到 + 积分刷新 + 解冻。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 //
-// 顺序按积分到期紧迫度，不是池内顺序：上游对每日签发存在限频约束，
-// 把快过期的账号排前面，限频窗口用尽时有效积分留存最大。
-func (s *Scheduler) RunCheckinNow() []error {
+// 返回逐账号结果（面板据此回报「本次 +N 分 / 已签 / 失败原因」）与失败列表（日志与 HTTP 状态码用）。
+func (s *Scheduler) RunCheckinNow() ([]CheckinResult, []error) {
+	results := []CheckinResult{} // 非 nil：面板拿到的是 [] 而不是 null
 	var errs []error
 	for _, uid := range s.byUrgency() {
-		if err := s.CheckinUID(uid); err != nil {
+		res, err := s.CheckinUID(uid)
+		results = append(results, res)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", uid, err))
 		}
 	}
-	return errs
+	return results, errs
 }
 
 // byUrgency 探一轮余额，按最早到期时间升序返回待签 uid；无到期信息的排最后。
@@ -269,38 +271,64 @@ func (s *Scheduler) byUrgency() []string {
 	return uids
 }
 
+// CheckinResult 单个账号的签到结果，给面板如实回报用：
+// 用户签完得知道「本次拿了多少分」，而不是只看到一句「签到完成」。
+type CheckinResult struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Status   string `json:"status"`            // ok | already | skipped（上游未开）| failed
+	Credits  int64  `json:"credits,omitempty"` // 本次到账（仅 ok 非 0，取上游 status 告知的可领额度）
+	Reason   string `json:"reason,omitempty"`  // 失败原因原文
+}
+
 // CheckinUID 签到并按剩余积分解冻单个账号。禁用返回 ErrDisabled。
-func (s *Scheduler) CheckinUID(uid string) error {
+// 返回的 CheckinResult 说明这次到底发生了什么（含本次拿到的积分），错误路径同样带结果。
+func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
+	res := CheckinResult{UID: uid}
 	st, ok := s.cfg.Pool.Status(uid)
 	if !ok {
-		return ErrNotFound
+		return res, ErrNotFound
 	}
+	res.Nickname = st.Nickname
 	if st.Disabled {
-		return ErrDisabled
+		return res, ErrDisabled
 	}
 	a := s.cfg.Pool.AuthByUID(uid)
 	if a == nil || a.RefreshTokenValue() == "" {
-		return fmt.Errorf("no refresh token")
+		return res, fmt.Errorf("no refresh token")
 	}
-	checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
+	checkedIn, reward, enable, serr := s.cfg.Upstream.CheckinStatus(a)
 	var checkinErr error
-	if err != nil {
-		checkinErr = err
-		log.Printf("checkin status %s: %v", uid, err)
-	} else if !checkedIn && enable {
+	switch {
+	case serr != nil:
+		checkinErr = serr
+		log.Printf("checkin status %s: %v", uid, serr)
+	case checkedIn:
+		res.Status = "already"
+		log.Printf("checkin %s: already checked in", uid)
+	case !enable:
+		// 上游把签到关了这个账号（enable=false）：什么都没做，如实报出来。
+		res.Status = "skipped"
+		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
+	default:
 		if err := s.claimWithRetry(a); err != nil {
 			checkinErr = err
 			log.Printf("checkin claim %s: %v", uid, err)
 		} else {
-			log.Printf("checkin %s: ok", uid)
+			res.Status, res.Credits = "ok", reward
+			log.Printf("checkin %s: ok +%d", uid, reward)
 		}
-	} else if checkedIn {
-		log.Printf("checkin %s: already checked in", uid)
+	}
+	if res.Status == "" {
+		res.Status = "failed"
+	}
+	if checkinErr != nil {
+		res.Reason = checkinErr.Error()
 	}
 	remain, total, expire, err := s.cfg.Upstream.UserEntUsage(a)
 	if err != nil {
 		log.Printf("ent-usage %s: %v", uid, err)
-		return err
+		return res, err
 	}
 	// 先落余额与到期时间（签到后的新值），再谈解冻/冷却。
 	s.cfg.Pool.SetCreditsExpire(uid, remain, total, expire)
@@ -309,7 +337,7 @@ func (s *Scheduler) CheckinUID(uid string) error {
 	s.cfg.Pool.ReenableIfCredits(uid, remain)
 	if checkinErr == nil {
 		s.cfg.Pool.ClearCheckinCooldown(uid)
-		return nil
+		return res, nil
 	}
 	// 签到失败：记一次签到域冷却，避免下一轮对拥塞的上游反复重试
 	// （9074「当前参与用户太多」是上游拥塞，重试只会更堵）。
@@ -317,7 +345,7 @@ func (s *Scheduler) CheckinUID(uid string) error {
 	if d, ok := checkinCooldown(checkinErr); ok {
 		s.cfg.Pool.CooldownCheckin(uid, d, checkinErr.Error())
 	}
-	return checkinErr
+	return res, checkinErr
 }
 
 // checkinCooldown 按签到失败类型决定冷却时长。
@@ -374,7 +402,7 @@ func (s *Scheduler) CatchUp() {
 		return
 	}
 	log.Printf("checkin catch-up: 已过 %d 点签到小时，补跑一轮", earliest)
-	if errs := s.RunCheckinNow(); len(errs) != 0 {
+	if _, errs := s.RunCheckinNow(); len(errs) != 0 {
 		log.Printf("checkin catch-up: %d 个账号失败", len(errs))
 	}
 }

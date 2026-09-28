@@ -285,12 +285,13 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 		if r.Header.Get("X-User-Region") != "CN" {
 			return nil, errors.New("missing X-User-Region")
 		}
-		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
+		return jsonResp(200, `{"checked_in":false,"credits":150,"extra_credits":50,"enable":true}`), nil
 	})
 	checkedIn, credits, enable, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// credits 是「本次可领」= credits + extra_credits（免费档 150+50）。
 	if checkedIn || !enable || credits != 200 {
 		t.Errorf("status: checked=%v enable=%v credits=%d", checkedIn, enable, credits)
 	}

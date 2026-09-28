@@ -397,7 +397,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// CheckinStatus 查询签到状态。
+// CheckinStatus 查询签到状态；credits 返回**本次可领**的积分（上游 credits + extra_credits，
+// 实测免费档 150+50=200，与官方「每日签到」口径一致）。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -409,14 +410,15 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 		return false, 0, false, err
 	}
 	var resp struct {
-		CheckedIn bool  `json:"checked_in"`
-		Credits   int64 `json:"credits"`
-		Enable    bool  `json:"enable"`
+		CheckedIn    bool  `json:"checked_in"`
+		Credits      int64 `json:"credits"`
+		ExtraCredits int64 `json:"extra_credits"`
+		Enable       bool  `json:"enable"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return false, 0, false, fmt.Errorf("checkin status parse: %w", err)
 	}
-	return resp.CheckedIn, resp.Credits, resp.Enable, nil
+	return resp.CheckedIn, resp.Credits + resp.ExtraCredits, resp.Enable, nil
 }
 
 // CheckinClaim 执行签到。

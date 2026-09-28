@@ -164,6 +164,24 @@ func TestCheckinRetryLoopRescans(t *testing.T) {
 	}
 }
 
+// 签到结果要带出「本次拿多少分」：上游 status 的 credits + extra_credits 落到 result.Credits，
+// 面板据此回报「+200 分」而不是拿积分包合计冒充。
+func TestCheckinUIDReportsEarnedCredits(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 4500} // claim 默认成功；status 固定 credits=200
+	srv := f.server()
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", Nickname: "甲", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	res, err := newTestScheduler(f, p, srv).CheckinUID("u1")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if res.Status != "ok" || res.Credits != 200 || res.Nickname != "甲" {
+		t.Errorf("结果=%+v want ok/200/甲", res)
+	}
+}
+
 func TestCheckinUIDReturnsClaimBusinessError(t *testing.T) {
 	f := &fakeUpstream{
 		claimResponse:  `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`,
@@ -174,7 +192,7 @@ func TestCheckinUIDReturnsClaimBusinessError(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 
-	err := newTestScheduler(f, p, srv).CheckinUID("u1")
+	_, err := newTestScheduler(f, p, srv).CheckinUID("u1")
 	if err == nil || !strings.Contains(err.Error(), "当前参与用户太多") {
 		t.Fatalf("err=%v", err)
 	}
@@ -187,7 +205,7 @@ func TestRunCheckinNowReturnsFailures(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 
-	errs := newTestScheduler(f, p, srv).RunCheckinNow()
+	_, errs := newTestScheduler(f, p, srv).RunCheckinNow()
 	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "u1") {
 		t.Fatalf("errs=%v", errs)
 	}
@@ -312,7 +330,7 @@ func TestCheckinBusinessErrorCoolsAccount(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 
-	_ = newTestScheduler(f, p, srv).CheckinUID("u1")
+	_, _ = newTestScheduler(f, p, srv).CheckinUID("u1")
 	st, _ := p.Status("u1")
 	if !st.CheckinCooling {
 		t.Fatalf("business error must set checkin cooldown: %+v", st)
@@ -332,7 +350,7 @@ func TestCheckinFailureAddsNoGatewayCooldown(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 
-	_ = newTestScheduler(f, p, srv).CheckinUID("u1")
+	_, _ = newTestScheduler(f, p, srv).CheckinUID("u1")
 	st, _ := p.Status("u1")
 	if st.Cooling {
 		t.Fatalf("签到失败把账号踢出了代理选号: %+v", st)
@@ -352,7 +370,7 @@ func TestClaimRetriesNetworkError(t *testing.T) {
 
 	up, tr := flakyClient(srv, 1)
 	s := New(Config{Pool: p, Upstream: up, CheckinHours: []int{9}})
-	if err := s.CheckinUID("u1"); err != nil {
+	if _, err := s.CheckinUID("u1"); err != nil {
 		t.Fatalf("retry should recover: %v", err)
 	}
 	if got := tr.attempts.Load(); got != 2 {
@@ -370,7 +388,7 @@ func TestClaimNotRetriedOnBusinessError(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 
-	_ = newTestScheduler(f, p, srv).CheckinUID("u1")
+	_, _ = newTestScheduler(f, p, srv).CheckinUID("u1")
 	if got := f.claimCalls.Load(); got != 1 {
 		t.Fatalf("claim calls=%d want 1, business failure must not retry", got)
 	}
@@ -505,7 +523,7 @@ func TestManualCheckinIgnoresCheckinCooldown(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	p.CooldownCheckin("u1", 5*time.Minute, "congested")
 
-	if err := newTestScheduler(f, p, srv).CheckinUID("u1"); err != nil {
+	if _, err := newTestScheduler(f, p, srv).CheckinUID("u1"); err != nil {
 		t.Fatalf("manual checkin must run: %v", err)
 	}
 	if got := f.checkinCalls.Load(); got != 1 {

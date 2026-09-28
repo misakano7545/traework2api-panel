@@ -288,6 +288,47 @@ func TestCheckinAllSurfacesUpstreamFailure(t *testing.T) {
 	}
 }
 
+// 签到成功要如实回报本次到账积分——前端 toast 读的就是这个数，不能只回一句"签到完成"。
+func TestCheckinAllReportsEarnedCredits(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
+			_, _ = w.Write([]byte(`{"checked_in":false,"credits":150,"extra_credits":50,"enable":true}`))
+		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
+			_, _ = w.Write([]byte(`{"code":0,"message":"success"}`))
+		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
+			_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[]}`))
+		}
+	}))
+	defer srv.Close()
+	pl := pool.New("")
+	pl.Add(&auth.Auth{UID: "u1", Nickname: "甲", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), UgHost: srv.URL}
+	sch := scheduler.New(scheduler.Config{Pool: pl, Upstream: up})
+	p := New(Config{Pool: pl, Upstream: up, Scheduler: sch, APIKey: "k"})
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/checkin", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer k")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Checkin []struct {
+			Nickname string `json:"nickname"`
+			Status   string `json:"status"`
+			Credits  int64  `json:"credits"`
+		} `json:"checkin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Checkin) != 1 || resp.Checkin[0].Status != "ok" ||
+		resp.Checkin[0].Credits != 200 || resp.Checkin[0].Nickname != "甲" {
+		t.Fatalf("回报不对: %+v（body=%s）", resp.Checkin, rec.Body)
+	}
+}
+
 // 用量端点：带鉴权可读聚合、昵称带出；记录器缺失时 501 而不是空数据；未鉴权 401。
 func TestUsageEndpoint(t *testing.T) {
 	rec := usage.New("")
