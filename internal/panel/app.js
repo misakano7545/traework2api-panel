@@ -27,6 +27,29 @@ function applyTheme() {
   $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
 }
 
+/* ── 手机抽屉导航（≤760px）─────────────────────────────────────────
+   本脚本在 <head> 加载（DOM 未就绪），故：元素惰性查询 + 点击事件委托。 */
+function navSet(open) {
+  const navEl = document.querySelector('.nav'), scrim = document.getElementById('navScrim');
+  if (!navEl || !scrim) return;
+  navEl.classList.toggle('open', open);
+  scrim.classList.toggle('on', open);
+  document.body.classList.toggle('nav-open', open);
+  const btn = document.getElementById('btnNav');
+  if (btn) btn.setAttribute('aria-expanded', String(open));
+}
+document.addEventListener('click', e => {
+  const t = e.target;
+  if (!(t && t.closest)) return;
+  if (t.closest('#btnNav')) {
+    const n = document.querySelector('.nav');
+    navSet(!!(n && !n.classList.contains('open')));
+  } else if (t.closest('#navScrim')) {
+    navSet(false);
+  }
+});
+addEventListener('keydown', e => { if (e.key === 'Escape') navSet(false); });
+
 /* ── 请求 ─────────────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
@@ -91,6 +114,7 @@ async function submitKey() {
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 const TITLES = { accounts: '账号池', models: '模型', usage: '用量', config: '配置', logs: '运行日志' };
 function go(v) {
+  navSet(false);
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));

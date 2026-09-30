@@ -278,15 +278,27 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
 
+/* 手机版（≤760px）：导航 = 左侧抽屉（桌面隐藏） */
+#btnNav { display: none; }
+.nav-scrim { display: none; }
 @media (max-width: 760px) {
   .shell { grid-template-columns: 1fr; }
-  /* 导航：品牌 + 状态一行，导航项独立一行横滑（防止挤压成竖排字） */
-  .nav { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; overflow: visible; min-width: 0; }
-  .nav ul { flex: 1 1 100%; min-width: 0; display: flex; gap: 2px; padding: 6px 8px; overflow-x: auto; }
-  .nav ul li { flex: none; }
+  /* 导航：左侧模态抽屉（默认收纳、滑出式） */
+  #btnNav { display: inline-flex; align-items: center; justify-content: center; }
+  .nav-scrim { display: block; position: fixed; inset: 0; background: rgba(6,8,13,.62); opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 65; }
+  .nav-scrim.on { opacity: 1; pointer-events: auto; }
+  .nav {
+    position: fixed; left: 0; top: 0; bottom: 0; height: auto; z-index: 70;
+    width: min(300px, 84vw); min-width: 0; border-right: none;
+    transform: translateX(-105%); visibility: hidden;
+    transition: transform .25s ease-out, visibility .25s;
+    box-shadow: 0 4px 32px rgba(0,0,0,.45);
+  }
+  .nav.open { transform: none; visibility: visible; }
+  .nav ul { overflow-y: auto; min-height: 0; }
   .nav a { white-space: nowrap; }
-  .nav .sig { margin-left: auto; border: none; padding: 10px 14px 0; }
   .nav .sig .row { white-space: nowrap; }
+  body.nav-open { overflow: hidden; }
   /* 顶栏：允许换行，控件不竖排 */
   .topbar { flex-wrap: wrap; gap: 8px 12px; padding: 10px 14px; }
   .topbar h2, .topbar .sep, .topbar .meta { white-space: nowrap; }
@@ -345,9 +357,13 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
       <div class="row" style="margin-top:5px"><span id="navVer">v-</span></div>
     </div>
   </nav>
+  <div class="nav-scrim" id="navScrim"></div>
 
   <div class="main">
     <div class="topbar">
+      <button class="icon ghost" id="btnNav" title="导航" aria-label="打开导航" aria-expanded="false">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/></svg>
+      </button>
       <h2 id="ttl">账号池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
