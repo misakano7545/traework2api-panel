@@ -280,8 +280,38 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 @media (max-width: 760px) {
   .shell { grid-template-columns: 1fr; }
-  .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
-  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
+  /* 导航：品牌 + 状态一行，导航项独立一行横滑（防止挤压成竖排字） */
+  .nav { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; overflow: visible; min-width: 0; }
+  .nav ul { flex: 1 1 100%; min-width: 0; display: flex; gap: 2px; padding: 6px 8px; overflow-x: auto; }
+  .nav ul li { flex: none; }
+  .nav a { white-space: nowrap; }
+  .nav .sig { margin-left: auto; border: none; padding: 10px 14px 0; }
+  .nav .sig .row { white-space: nowrap; }
+  /* 顶栏：允许换行，控件不竖排 */
+  .topbar { flex-wrap: wrap; gap: 8px 12px; padding: 10px 14px; }
+  .topbar h2, .topbar .sep, .topbar .meta { white-space: nowrap; }
+  .topbar .grow { display: none; }
+  .view { padding: 14px 12px 60px; }
+  /* 表格：整表横向滑动（保持桌面列布局，不被压扁） */
+  table.acc { display: block; overflow-x: auto; white-space: nowrap; }
+  /* 分类条 / 选项 chips：横向滑动 */
+  .chips { display: flex; min-width: 0; overflow-x: auto; padding-bottom: 2px; }
+  .chips .chip { flex: none; }
+  /* 触控：按钮放大；输入 16px 防 iOS 聚焦自动放大 */
+  button.xs { padding: 6px 12px; }
+  .chips .chip { padding: 5px 12px; }
+  input, select, textarea { font-size: 16px; }
+  /* 弹窗：底部抽屉式（!important 压过内联 width） */
+  .veil.on { align-items: flex-end; padding: 0; }
+  .dlg { width: 100% !important; max-width: 100% !important; max-height: 92vh; border-radius: 16px 16px 0 0; }
+  /* 详情类弹窗表格：长值折行而不是横向溢出 */
+  .dlg table.acc { white-space: normal; }
+  .dlg table.acc td { word-break: break-word; }
+  /* Toast：全宽 */
+  #toasts { left: 12px; right: 12px; bottom: 14px; align-items: stretch; }
+  .tst { max-width: none; }
+  /* 卡片头允许换行（计数等不被挤成竖排） */
+  .box header { flex-wrap: wrap; row-gap: 6px; }
   .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
 }
 </style>
