@@ -2,6 +2,11 @@
 package upstream
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 
 	"traework2api/internal/auth"
@@ -46,16 +51,88 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	}
 }
 
-// UgHeaders 设置签到/积分（api.trae.cn）所需头。
-func UgHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", currentUA())
-	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
-	req.Header.Set("X-User-Region", "CN")
-	if a.DeviceID != "" {
-		req.Header.Set("X-Device-Id", a.DeviceID)
+// ── ug 族（签到/积分）的客户端伪装头 ──────────────────────────────────────
+//
+// 2026-10-02 实测：只带零星设备头（旧版 6 个头）时 claim 接口 100% 回 9074
+// 「当前参与用户太多」（fork 三天 ~150 次全灭，连凌晨时段也不通）；换成下面
+// 这套完整客户端伪装头 + 按 UID 确定性派生的伪设备身份后实测一次通过。
+// 参考 AiCheckin / trae-mate 的实现（派生算法测试向量已交叉验证）。
+
+// ugUA ug 族固定 UA：client 伪装要求，不跟随面板的运行期 UA 覆盖。
+const ugUA = "VSCode 1.107.1 (TRAE SOLO CN)"
+
+// traeDeviceIdentity 按 uid 确定性派生伪设备身份（trae-mate gen2 算法）：
+// 同一账号永远同一套标识，服务端按设备维度记账保持稳定。
+func traeDeviceIdentity(uid string) (deviceID, marketUserID, sessionID string) {
+	dv := seededStream(uid, "devid", 15)
+	dev := make([]byte, len(dv))
+	for i, b := range dv {
+		dev[i] = '0' + b%10
 	}
+	deviceID = string(dev)
+
+	bs := seededStream(uid, "market", 16)
+	bs[6] = (bs[6] & 0x0F) | 0x40 // UUID v4 版本位
+	bs[8] = (bs[8] & 0x3F) | 0x80 // RFC 4122 variant 位
+	h := hex.EncodeToString(bs)
+	marketUserID = h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+
+	sessionID = hex.EncodeToString(seededStream(uid, "sess", 32))[:64]
+	return
+}
+
+// seededStream 确定性字节流：SHA-256("<salt>:<seed>" ‖ counter_be32) 连续拼接。
+func seededStream(seed, salt string, n int) []byte {
+	base := []byte(salt + ":" + seed)
+	out := make([]byte, 0, n+32)
+	for i := 0; len(out) < n; i++ {
+		var ctr [4]byte
+		binary.BigEndian.PutUint32(ctr[:], uint32(i))
+		sum := sha256.Sum256(append(append([]byte{}, base...), ctr[:]...))
+		out = append(out, sum[:]...)
+	}
+	return out[:n]
+}
+
+func ugRandHex(nBytes int) string {
+	b := make([]byte, nBytes)
+	_, _ = rand.Read(b) // crypto/rand 在 Linux 上不会失败；失败也仅退化为零值
+	return hex.EncodeToString(b)
+}
+
+func ugUUIDv4() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0F) | 0x40
+	b[8] = (b[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// UgHeaders 设置签到/积分（api.trae.cn）所需头：完整客户端伪装 + 派生设备身份。
+func UgHeaders(req *http.Request, a *auth.Auth) {
+	dev, market, sess := traeDeviceIdentity(a.UID)
+	h := req.Header
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "*/*")
+	h.Set("User-Agent", ugUA)
+	h.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
+	h.Set("X-Market-Client-Id", "VSCode 1.107.1")
+	h.Set("X-Market-User-Id", market)
+	h.Set("X-User-Region", "CN")
+	h.Set("X-Device-Id", dev)
+	h.Set("X-Lgw-Req-Sdk-Type", "3")
+	h.Set("Package-Type", "stable_cn")
+	h.Set("X-Lscbd-Aid", "787976")
+	h.Set("X-Lscbd-Platform", "windows")
+	h.Set("App-Version", "0.1.45")
+	h.Set("X-Tt-Trace-Id", "00-"+ugRandHex(8)+"-01")
+	h.Set("Vscode-Sessionid", sess)
+	h.Set("Sec-Fetch-Dest", "empty")
+	h.Set("Sec-Fetch-Mode", "no-cors")
+	h.Set("Sec-Fetch-Site", "none")
+	h.Set("X-Request-Id", ugUUIDv4())
+	// ponytail: 不带 accept-encoding —— Go transport 自动加 gzip 并透明解压，
+	// 手动设置反而会关掉自动解压（参考实现里的显式 gzip 行故意省略）。
 }
 
 // OAuthHeaders 设置 ExchangeToken / GetUserInfo 所需头（无签名，仅 UA）。

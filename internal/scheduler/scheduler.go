@@ -133,9 +133,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 // checkinRetryInterval 补签扫描间隔。
 //
-// 上游 claim 的 9074（「当前参与用户太多」）是**时段性拥塞**，实测换请求头（X-Machine-Id 等）、
-// 换主机都不改变结果，隔离 10 分钟内连打也全是 9074。只在 checkin_hours 每天打一两枪
-// （默认就只有 09:00 一个时点）基本等于全空，所以改成按小时重扫。
+// 上游 claim 的 9074（「当前参与用户太多」）此前误判为纯时段性拥塞；2026-10-02 实测：
+// 零星设备头会被系统性拒绝（三天 ~150 次全灭），完整客户端伪装头（headers.go ug 族）
+// 修复后一次通过。每小时重扫保留作波动保险。
 // 变量而非常量只为测试能把它调小。
 var checkinRetryInterval = time.Hour
 
