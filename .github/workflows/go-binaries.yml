@@ -125,6 +125,8 @@ jobs:
       - name: 建 Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # publish 是独立 job、无 git 检出：gh 无法从 .git 推断仓库，必须显式给。
+          GH_REPO: ${{ github.repository }}
         run: |
           V="${GITHUB_REF_NAME#v}"
           gh release create "v${V}" dist/*.zip dist/*.tar.gz dist/checksums.txt \
