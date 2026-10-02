@@ -21,6 +21,15 @@ CONTAINER="traework2api"
 CLIENT_ID="en1oxy7wnw8j9n"          # SOLO stable
 APP_VERSION="0.1.43"
 API_HOST="https://api.trae.com.cn"  # ExchangeToken / GetUserInfo host（auth.apiHost）
+# 地区：REALM=intl 走国际版（域 + 客户端版本号不同，实测 2026-09-28）。
+# 国际账号的 OAuth host 不用手填——回调里的 host 参数会盖掉 API_HOST（见 python 段）。
+REALM="${REALM:-cn}"
+if [ "$REALM" = "intl" ]; then
+  LOGIN_HOST="https://www.trae.ai"
+  APP_VERSION="1.0.2"
+else
+  LOGIN_HOST="https://www.trae.cn"
+fi
 
 mkdir -p "$AUTH_DIR"
 
@@ -39,7 +48,7 @@ echo "  3. 复制浏览器地址栏的完整链接，粘贴到下面"
 echo ""
 
 # ─── 构造登录链接（内嵌 python 保证 URL 编码正确）───
-LOGIN_URL="$(MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" CLIENT_ID="$CLIENT_ID" APP_VERSION="$APP_VERSION" python3 - <<'PYEOF'
+LOGIN_URL="$(MACHINE_ID="$MACHINE_ID" DEVICE_ID="$DEVICE_ID" CLIENT_ID="$CLIENT_ID" APP_VERSION="$APP_VERSION" LOGIN_HOST="$LOGIN_HOST" python3 - <<'PYEOF'
 import os, secrets, urllib.parse
 
 params = {
@@ -62,7 +71,7 @@ params = {
     "x_app_version": os.environ["APP_VERSION"],
     "x_app_type": "stable",
 }
-print("https://www.trae.cn/authorization?" + urllib.parse.urlencode(params))
+print(os.environ["LOGIN_HOST"] + "/authorization?" + urllib.parse.urlencode(params))
 PYEOF
 )"
 
@@ -129,6 +138,10 @@ def parse_json_param(raw):
 
 # ─── 解析回调链接（parse_qs + unquote 处理 URL 编码）───
 qs = urllib.parse.parse_qs(urllib.parse.urlparse(CALLBACK).query)
+# 回调自带 OAuth host（国际版是 api-sg-central.trae.ai）：认它，别用写死的国内域。
+cb_host = (qs.get("host") or [""])[0]
+if "trae.ai" in cb_host or "byteintlapi" in cb_host:
+    API_HOST = cb_host
 refresh_token = (qs.get("refreshToken") or [""])[0]
 user_info = parse_json_param((qs.get("userInfo") or [""])[0]) or {}
 user_jwt = parse_json_param((qs.get("userJwt") or [""])[0]) or {}
@@ -232,8 +245,8 @@ auth = {
         "accessToken": os.environ["TOKEN"],
         "refreshToken": os.environ["REFRESH"],
         "expiresAt": int(os.environ["EXPIRES_AT"]),
-        "domain": "trae.cn",
-        "apiHost": "https://api.trae.com.cn",
+        "domain": "trae.ai" if ("trae.ai" in API_HOST or "byteintlapi" in API_HOST) else "trae.cn",
+        "apiHost": API_HOST,
         "machineId": os.environ["MACHINE_ID"],
         "deviceId": os.environ["DEVICE_ID"],
     },

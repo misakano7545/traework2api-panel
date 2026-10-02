@@ -47,6 +47,17 @@ type callbackCreds struct {
 	Nickname string
 	Ent      string
 	Expires  int64
+	Host     string // 回调里的 host 参数：OAuth host，国际版靠它认（api-sg-central.trae.ai）
+}
+
+// intlHost 回调里的 host 参数是不是国际 OAuth host；是就返回 (domain, apiHost)，
+// 不是（国内回调 / 老回调 / 测试里的假上游）返回空串，由调用方决定回落。
+// ponytail: 判据与 auth.Realm() 同一套（trae.ai / byteintlapi 家族）。
+func intlHost(host string) (string, string) {
+	if strings.Contains(host, "trae.ai") || strings.Contains(host, "byteintlapi") {
+		return "trae.ai", host
+	}
+	return "", ""
 }
 
 func randHex(n int) (string, error) {
@@ -57,7 +68,9 @@ func randHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func loginURL(machine, device string) (string, error) {
+// loginURL 按地区生成登录链接：国际版同参数换域（www.trae.ai）+ 国际版客户端版本号。
+// ponytail: 参数集与国内版逐项一致——实测国际版登录页认这套（client_id 两边相同）。
+func loginURL(machine, device, realm string) (string, error) {
 	trace, err := randHex(8)
 	if err != nil {
 		return "", err
@@ -79,9 +92,13 @@ func loginURL(machine, device string) (string, error) {
 	q.Set("x_device_brand", "PC")
 	q.Set("x_device_type", "PC")
 	q.Set("x_os_version", "1.0")
-	q.Set("x_app_version", upstream.IdeVersion)
+	host, ver := "https://www.trae.cn", upstream.IdeVersion
+	if realm == auth.RealmIntl {
+		host, ver = "https://www.trae.ai", upstream.IdeVersionIntl
+	}
+	q.Set("x_app_version", ver)
 	q.Set("x_app_type", "stable")
-	return "https://www.trae.cn/authorization?" + q.Encode(), nil
+	return host + "/authorization?" + q.Encode(), nil
 }
 
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -100,7 +117,17 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "random failed")
 		return
 	}
-	link, err := loginURL(machine, device)
+	// 面板可以带 {"realm":"intl"} 要一条国际版链接（缺省国内版）。
+	realm := auth.RealmCN
+	if raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<12)); len(raw) > 0 {
+		var reqBody struct {
+			Realm string `json:"realm"`
+		}
+		if json.Unmarshal(raw, &reqBody) == nil && reqBody.Realm == auth.RealmIntl {
+			realm = auth.RealmIntl
+		}
+	}
+	link, err := loginURL(machine, device, realm)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "login url failed")
 		return
@@ -166,13 +193,18 @@ func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, co
 	if p.cfg.Upstream == nil {
 		return "", "", http.StatusServiceUnavailable, errors.New("上游不可用")
 	}
+	// 国际账号的 OAuth host 来自回调的 host 参数——必须在换票之前落到 a.ApiHost 上，
+	// RefreshToken（ExchangeToken）就是拿它当 base 的。国内回调留空，让客户端回落到
+	// 自己的 OAuthHost（测试注入的假上游也是靠这个回落接上的）。
 	a := &auth.Auth{
 		RefreshToken: cb.Refresh,
 		AccessToken:  cb.Access,
 		ExpiresAt:    cb.Expires,
 		MachineID:    sess.Machine,
 		DeviceID:     sess.Device,
-		Domain:       "trae.cn",
+	}
+	if domain, apiHost := intlHost(cb.Host); domain != "" {
+		a.Domain, a.ApiHost = domain, apiHost
 	}
 	if cb.Refresh != "" {
 		if err := p.cfg.Upstream.RefreshToken(a); err != nil {
@@ -206,8 +238,10 @@ func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, co
 	a.UID = uid
 	a.Nickname = nick
 	a.EnterpriseID = ent
-	a.Domain = "trae.cn"
-	a.ApiHost = upstream.OAuthHost
+	a.Domain, a.ApiHost = "trae.cn", upstream.OAuthHost
+	if domain, apiHost := intlHost(cb.Host); domain != "" {
+		a.Domain, a.ApiHost = domain, apiHost
+	}
 	a.FilePath = path
 	if err := a.SaveAtomic(); err != nil {
 		log.Printf("panel: login save failed uid=%s", uid)
@@ -233,6 +267,7 @@ func parseCallback(raw string) (callbackCreds, error) {
 	q := u.Query()
 	var cb callbackCreds
 	cb.Refresh = q.Get("refreshToken")
+	cb.Host = q.Get("host")
 	if ui := parseJSONParam(q.Get("userInfo")); ui != nil {
 		cb.UID = asString(ui["UserID"])
 		cb.Nickname = asString(ui["ScreenName"])

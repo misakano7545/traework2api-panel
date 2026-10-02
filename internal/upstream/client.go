@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,10 @@ const (
 	ErrServer                     // 5xx
 	ErrClient                     // 其他 4xx
 )
+
+// ErrNoIntlUG 国际版没有签到/积分接口（实测两个国际域上 EpCheckin*/EpEntUsage 全 404）。
+// 返回值语义：签到布尔 false、额度 0，调用方据此跳过即可，不要当失败重试。
+var ErrNoIntlUG = errors.New("国际版没有签到/积分接口")
 
 func (k ErrKind) String() string {
 	switch k {
@@ -114,9 +119,11 @@ type Client struct {
 	idleTimeout time.Duration
 
 	AgentHost string // https://trae-api-cn.mchost.guru
-	UgHost    string // https://api.trae.cn
-	OAuthHost string // https://api.trae.com.cn
-	ClientID  string // en1oxy7wnw8j9n
+	// AgentHostIntl 国际版（realm=intl）的 agent host；空则用内置默认。
+	AgentHostIntl string // https://a0ai-api-sg.byteintlapi.com
+	UgHost        string // https://api.trae.cn
+	OAuthHost     string // https://api.trae.com.cn
+	ClientID      string // en1oxy7wnw8j9n
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -128,18 +135,39 @@ func New() *Client {
 		ResponseHeaderTimeout: 120 * time.Second, // 首字节兜底（长推理预留），不限制整流时长
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr}, // 无总超时
-		AgentHost:  AgentHost,
-		UgHost:     UgHost,
-		OAuthHost:  OAuthHost,
-		ClientID:   ClientID,
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP:    &http.Client{Transport: tr}, // 无总超时
+		AgentHost:     AgentHost,
+		AgentHostIntl: AgentHostIntl,
+		UgHost:        UgHost,
+		OAuthHost:     OAuthHost,
+		ClientID:      ClientID,
 	}
 }
 
 func (c *Client) agentBase() string { return c.AgentHost }
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
+
+// agentBaseFor 按账号地区选 agent host（对话 + 模型表都走这里）。
+// Auth 为 nil（如配置校验路径）按国内版。
+func (c *Client) agentBaseFor(a *auth.Auth) string {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		if c.AgentHostIntl != "" {
+			return c.AgentHostIntl
+		}
+		return AgentHostIntl
+	}
+	return c.agentBase()
+}
+
+// identFor 账号地区对应的身份版本组（User-Agent / X-Ide-Version / *-Version-Code）。
+func identFor(a *auth.Auth) (version, versionCode string) {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		return IdeVersionIntl, IdeVersionCodeIntl
+	}
+	return currentIdeVersion(), IdeVersionCode
+}
 
 // doJSON 发请求并解 JSON；HTTP 非 2xx 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
@@ -247,7 +275,7 @@ func normalizeExpiresAt(v int64) int64 {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpChat, bytes.NewReader(PrepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -290,6 +318,10 @@ type ModelInfo struct {
 	Capability string
 	Thinking   string
 	Effort     string
+
+	// Function 该模型属于哪条通道（solo_work_lite / solo_coder）：出站 function 要跟着模型走，
+	// 不然 coder 面的模型会被 Work 通道判 4001。
+	Function string
 }
 
 // paramConfig 是 get_detail_param 响应里的一条模型配置。
@@ -338,16 +370,32 @@ const usageChat = "chat_completion"
 // 实测上游返回 39 条（版本码 20260716）/ 42 条（20260811）内部配置，
 // 排除 is_invisible_to_user（子代理等）+ custom_model_* 槽位 + summary 之后，
 // 就是客户端模型选择器里能选的那些。
-func pickOfficialModels(list []paramConfig) []ModelInfo {
+// ponytail: 国际版把 5 个官方模型全标成 is_invisible_to_user=true 却照样能调
+// （实测 gpt-5.2 / kimi-k3 / gpt-5.4 都出正文）。国际版因此不按可见性一刀切，改按
+// 「有没有显示名」判：官方模型都有 display_name（GPT-5.2/Kimi-K3…），内部子代理
+// （browser_use_subagent）没有，正好分得开。国内版口径不变。
+func pickOfficialModels(list []paramConfig, a *auth.Auth, function string) []ModelInfo {
+	intl := a != nil && a.Realm() == auth.RealmIntl
 	out := make([]ModelInfo, 0, len(list))
 	for _, cfg := range list {
-		if cfg.ConfigName == "" || cfg.IsInvisibleToUser || cfg.Usage != usageChat {
+		if cfg.ConfigName == "" || cfg.Usage != usageChat {
+			continue
+		}
+		if cfg.IsInvisibleToUser {
+			if !intl || cfg.DisplayConfig.DisplayName == "" {
+				continue
+			}
+		}
+		// coder 通道混着内部子代理（search_agent* 一族 12 个），用户侧没有它们；
+		// Work 通道靠 is_invisible_to_user 判就够（实测只有 browser_use_subagent 等 2 个）。
+		if function == FunctionCoder && strings.HasPrefix(cfg.ConfigName, "search_agent") {
 			continue
 		}
 		mi := ModelInfo{
 			ID:            cfg.ConfigName,
 			Name:          cfg.DisplayConfig.DisplayName,
 			ContextWindow: cfg.ContextWindowTokens.Dev,
+			Function:      function,
 		}
 		if len(cfg.ModelDetailList) > 0 {
 			mi.MaxTokens = cfg.ModelDetailList[0].MaxTokens
@@ -374,25 +422,45 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		"mode_type":           nil,
 		"agent_type":          nil,
 	}
-	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
+	// 两条通道各拉一份并合并：Work（solo_work_lite）与 coder（solo_coder，网页端那批）。
+	// 同一台主机、同一个端点，只有 body 里的 function 不同。
+	var out []ModelInfo
+	seen := map[string]bool{}
+	var lastErr error
+	for _, fn := range []string{Function, FunctionCoder} {
+		body["function"] = fn
+		raw, _ := json.Marshal(body)
+		req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpModels, bytes.NewReader(raw))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		SOLOHeaders(req, a, false)
+		data, err := c.doJSON(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var resp struct {
+			ConfigInfoList []paramConfig `json:"config_info_list"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			lastErr = fmt.Errorf("models parse: %w", err)
+			continue
+		}
+		for _, mi := range pickOfficialModels(resp.ConfigInfoList, a, fn) {
+			if seen[mi.ID] {
+				continue
+			}
+			seen[mi.ID] = true
+			out = append(out, mi)
+		}
 	}
-	SOLOHeaders(req, a, false)
-	data, err := c.doJSON(req)
-	if err != nil {
-		return nil, err
-	}
-	var resp struct {
-		ConfigInfoList []paramConfig `json:"config_info_list"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
-	}
-	out := pickOfficialModels(resp.ConfigInfoList)
 	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned no official model (got %d raw configs)", len(resp.ConfigInfoList))
+		if lastErr == nil {
+			lastErr = fmt.Errorf("models api returned no official model")
+		}
+		return nil, lastErr
 	}
 	return out, nil
 }
@@ -400,6 +468,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 // CheckinStatus 查询签到状态；credits 返回**本次可领**的积分（上游 credits + extra_credits，
 // 实测免费档 150+50=200，与官方「每日签到」口径一致）。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		return false, 0, false, ErrNoIntlUG
+	}
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return false, 0, false, err
@@ -423,6 +494,9 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 
 // CheckinClaim 执行签到。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		return ErrNoIntlUG
+	}
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return err
@@ -450,6 +524,9 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 // used 为 usage.credits_amount（与 cmd/credit 同一口径，截断为整数）。
 // expire 只在 expire_time > now 的包里取最小值（已过期的包不影响紧迫度排序），无则 0。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err error) {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		return 0, 0, 0, ErrNoIntlUG
+	}
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return 0, 0, 0, err

@@ -142,8 +142,13 @@ func TestChatCompletionToResponse(t *testing.T) {
 	if len(out) != 3 {
 		t.Fatalf("output len=%d %#v", len(out), out)
 	}
-	if out[0].(map[string]any)["type"] != "reasoning" {
+	r0 := out[0].(map[string]any)
+	if r0["type"] != "reasoning" {
 		t.Fatalf("item0=%v", out[0])
+	}
+	sum, _ := r0["summary"].([]any)
+	if len(sum) != 1 || sum[0].(map[string]any)["text"] != "think" || sum[0].(map[string]any)["type"] != "summary_text" {
+		t.Fatalf("reasoning summary=%v", r0)
 	}
 	if out[1].(map[string]any)["type"] != "message" {
 		t.Fatalf("item1=%v", out[1])
@@ -187,7 +192,10 @@ func TestResponsesStreamEventOrder(t *testing.T) {
 		t.Fatalf("last=%v", types)
 	}
 	need := []string{
-		"response.reasoning_text.delta",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.done",
+		"response.reasoning_summary_part.done",
 		"response.output_text.delta",
 		"response.function_call_arguments.delta",
 		"response.completed",
@@ -195,6 +203,16 @@ func TestResponsesStreamEventOrder(t *testing.T) {
 	for _, n := range need {
 		if !containsStr(types, n) {
 			t.Fatalf("missing %s in %v", n, types)
+		}
+	}
+	// 每个事件都带递增的 sequence_number（当前 Responses wire 契约，Codex 会读）。
+	seqs := sseSequenceNumbers(rec.Body.String())
+	if len(seqs) != len(types) {
+		t.Fatalf("sequence_number 覆盖不全: seqs=%d events=%d %v", len(seqs), len(types), types)
+	}
+	for i, n := range seqs {
+		if int(n) != i {
+			t.Fatalf("sequence_number[%d]=%v want %d: %v", i, n, i, seqs)
 		}
 	}
 	body := rec.Body.String()
@@ -314,6 +332,122 @@ func containsStr(ss []string, want string) bool {
 	return false
 }
 
+// sseSequenceNumbers 收集每个事件的 sequence_number。
+func sseSequenceNumbers(body string) []float64 {
+	var seqs []float64
+	for _, block := range strings.Split(body, "\n\n") {
+		for _, line := range strings.Split(block, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var m map[string]any
+			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+				continue
+			}
+			if _, ok := m["type"]; !ok {
+				continue
+			}
+			if n, ok := m["sequence_number"].(float64); ok {
+				seqs = append(seqs, n)
+			}
+		}
+	}
+	return seqs
+}
+
+// TestResponsesStreamIncompleteOnLength 上游截断（finish_reason=length）不得伪装成
+// response.completed——Codex 据此判断输出完整性，事件与 item 状态都要标 incomplete。
+func TestResponsesStreamIncompleteOnLength(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responsesWriter{ResponseWriter: rec, stream: true}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		`data: {"id":"chatcmpl-1","model":"glm-5.2","choices":[{"index":0,"delta":{"content":"部分输出"}}]}` + "\n\n",
+		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, f := range frames {
+		if _, err := rw.Write([]byte(f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rw.finish()
+	types := sseTypes(rec.Body.String())
+	if len(types) == 0 || types[len(types)-1] != "response.incomplete" {
+		t.Fatalf("last=%v", types)
+	}
+	if containsStr(types, "response.completed") {
+		t.Fatalf("截断流不得报 completed: %v", types)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"status":"incomplete"`) {
+		t.Fatalf("status missing: %s", body)
+	}
+	if !strings.Contains(body, `"incomplete_details":{"reason":"max_output_tokens"}`) {
+		t.Fatalf("incomplete_details missing: %s", body)
+	}
+	// 应答对象 + message item（含 output 数组里的副本）至少两处标 incomplete。
+	if n := strings.Count(body, `"status":"incomplete"`); n < 2 {
+		t.Fatalf("item status incomplete 次数=%d body=%s", n, body)
+	}
+}
+
+// TestResponsesStreamHoldsNamelessTool 无名 function_call 不是合法 Responses item：
+// 名字到达前不宣告，宣告时把已攒参数一次性发出（relaykit 同款）。
+func TestResponsesStreamHoldsNamelessTool(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responsesWriter{ResponseWriter: rec, stream: true}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		`data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]}}]}` + "\n\n",
+		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"Bash","arguments":"1}"}}]}}]}` + "\n\n",
+		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, f := range frames {
+		if _, err := rw.Write([]byte(f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rw.finish()
+	body := rec.Body.String()
+	if !strings.Contains(body, `"delta":"{\"a\":1}"`) {
+		t.Fatalf("整段参数 delta missing: %s", body)
+	}
+	if !strings.Contains(body, `"arguments":"{\"a\":1}"`) || !strings.Contains(body, `"name":"Bash"`) {
+		t.Fatalf("item done missing: %s", body)
+	}
+	if n := strings.Count(body, `"type":"function_call"`); n != 3 {
+		t.Fatalf("function_call item 次数=%d want 3（added/done/最终 output）body=%s", n, body)
+	}
+}
+
+// TestResponsesStreamDropsNamelessTool 全程无名的 tool_calls 视为无效：不宣告、不进 output。
+func TestResponsesStreamDropsNamelessTool(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responsesWriter{ResponseWriter: rec, stream: true}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		`data: {"id":"chatcmpl-1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}` + "\n\n",
+		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, f := range frames {
+		if _, err := rw.Write([]byte(f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rw.finish()
+	body := rec.Body.String()
+	if strings.Contains(body, "function_call") {
+		t.Fatalf("无名调用泄漏: %s", body)
+	}
+	types := sseTypes(body)
+	if types[len(types)-1] != "response.completed" {
+		t.Fatalf("types=%v", types)
+	}
+}
+
 func TestResponsesToChatInvalidJSON(t *testing.T) {
 	_, err := responsesToChat([]byte(`{`))
 	if err == nil {
@@ -331,15 +465,22 @@ func TestResponsesToChatInvalidJSON(t *testing.T) {
 // 客户端和面板都看不见缓存是否生效）。
 func TestUsageCacheFields(t *testing.T) {
 	up := map[string]any{
-		"prompt_tokens":     float64(100),
-		"completion_tokens": float64(5),
-		// SOLO 上游口径（实测 2026-09-28 全字段 dump）：没有 prompt_cache_hit_tokens，
-		// 真实命中数就在这两个字段里。
+		"prompt_tokens":               float64(10000),
+		"completion_tokens":           float64(5),
 		"cache_read_input_tokens":     float64(8960),
-		"cache_creation_input_tokens": float64(0),
+		"cache_creation_input_tokens": float64(100),
 	}
-	if got := anthropicUsage(up)["cache_read_input_tokens"]; got != float64(8960) {
-		t.Fatalf("anthropic cache_read_input_tokens=%v want 8960", got)
+	au := anthropicUsage(up)
+	if au["cache_read_input_tokens"] != float64(8960) {
+		t.Fatalf("anthropic cache_read_input_tokens=%v want 8960", au["cache_read_input_tokens"])
+	}
+	if au["cache_creation_input_tokens"] != float64(100) {
+		t.Fatalf("anthropic cache_creation_input_tokens=%v want 100", au["cache_creation_input_tokens"])
+	}
+	// SOLO 直报口径：input_tokens 原样取 prompt_tokens，不做缓存扣减
+	//（是否需要扣减取决于 prompt 是否含缓存读——待实测证据，见实验记录）。
+	if au["input_tokens"] != float64(10000) {
+		t.Fatalf("anthropic input_tokens=%v want 10000（原样透传）", au["input_tokens"])
 	}
 	if got := anthropicUsage(nil)["cache_read_input_tokens"]; got != nil {
 		t.Fatalf("nil usage 不该凭空造缓存字段, got=%v", got)

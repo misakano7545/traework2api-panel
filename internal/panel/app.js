@@ -197,7 +197,7 @@ function renderAccounts(list) {
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
     acts.push('<button class="xs danger" data-a="remove" data-u="' + esc(a.uid) + '">移除</button>');
     return '<tr class="' + cls + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + esc(a.nickname || a.uid) + '</div><div class="id">' + esc(a.uid) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (a.realm === 'intl' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + esc(a.uid) + '</div></td>' +
       '<td>' + st.join(' ') + '</td>' +
       '<td class="cred" title="剩余 / 总额（上游积分包）"><div class="n">' + (a.credits || 0) +
         (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div></td>' +
@@ -602,6 +602,9 @@ function collectConfig() {
 }
 
 /* ── 添加账号（不轮询：贴回调地址换票）────────────────────────────── */
+// 地区：链接按地区切域（国内 www.trae.cn / 国际 www.trae.ai）。回调自带 OAuth host，
+// 所以换票那步不用再选一次——面板按 host 自动落 domain/apiHost。
+let addRealm = 'cn';
 function openAdd() {
   loginID = '';
   $('addLoad').hidden = false;
@@ -612,7 +615,7 @@ function openAdd() {
   $('btnAddFinish').hidden = true;
   $('callback').value = '';
   $('addVeil').classList.add('on');
-  api('login/start', { method: 'POST', body: '{}' }).then(d => {
+  api('login/start', { method: 'POST', body: JSON.stringify({ realm: addRealm }) }).then(d => {
     loginID = d.id;
     $('addUrl').textContent = d.url;
     $('addLoad').hidden = true;
@@ -674,6 +677,13 @@ function boot() {
     if (view === 'logs') loadLogs();
   };
   $('btnAdd').onclick = openAdd;
+  $('addRealm').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-realm]');
+    if (!b || b.classList.contains('on')) return;
+    addRealm = b.dataset.realm;
+    document.querySelectorAll('#addRealm .chip').forEach(c => c.classList.toggle('on', c === b));
+    openAdd(); // 换地区就换一条链接，免得拿国内链接登国际号
+  });
   $('btnAddClose').onclick = () => $('addVeil').classList.remove('on');
   $('btnCopyUrl').onclick = () => {
     if (navigator.clipboard) navigator.clipboard.writeText($('addUrl').textContent).catch(() => {});

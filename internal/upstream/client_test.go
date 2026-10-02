@@ -317,7 +317,8 @@ func TestPickOfficialModels(t *testing.T) {
 		 "display_config":{"display_name":"Kimi-K3","model_capability":"reasoning_model"},
 		 "context_window_tokens":{"dev":200000},"model_detail_list":[{"max_tokens":32000}]},
 		{"config_name":"browser_use_subagent","is_invisible_to_user":true,"usage":"chat_completion"},
-		{"config_name":"glm-5-turbo","is_invisible_to_user":true,"usage":"chat_completion"},
+		{"config_name":"glm-5-turbo","is_invisible_to_user":true,"usage":"chat_completion",
+		 "display_config":{"display_name":"GLM-5-Turbo","model_capability":"reasoning_model"}},
 		{"config_name":"custom_model_kimi","is_invisible_to_user":false,"usage":"custom_model"},
 		{"config_name":"summary","is_invisible_to_user":false,"usage":"summary"},
 		{"config_name":"","is_invisible_to_user":false,"usage":"chat_completion"}
@@ -328,7 +329,7 @@ func TestPickOfficialModels(t *testing.T) {
 	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
 		t.Fatal(err)
 	}
-	got := pickOfficialModels(resp.ConfigInfoList)
+	got := pickOfficialModels(resp.ConfigInfoList, &auth.Auth{Domain: "trae.cn"}, Function)
 	if len(got) != 3 {
 		t.Fatalf("官方模型数=%d want 3: %+v", len(got), got)
 	}
@@ -356,8 +357,21 @@ func TestPickOfficialModels(t *testing.T) {
 	}
 
 	// 全被挡掉时必须返回空，让上层回退静态表，而不是回一张空清单。
-	if only := pickOfficialModels([]paramConfig{{ConfigName: "summary", Usage: "summary"}}); len(only) != 0 {
+	if only := pickOfficialModels([]paramConfig{{ConfigName: "summary", Usage: "summary"}}, nil, Function); len(only) != 0 {
 		t.Errorf("应返回空: %+v", only)
+	}
+
+	// 国际版（realm=intl）：官方模型全被上游标成 is_invisible_to_user=true 却照样能调，
+	// 按「有显示名」放行（glm-5-turbo），没显示名的内部子代理（browser_use_subagent）
+	// 与 custom_model_* / summary 仍要挡掉。
+	intl := &auth.Auth{Domain: "trae.ai"}
+	gotIntl := pickOfficialModels(resp.ConfigInfoList, intl, Function)
+	ids := make([]string, 0, len(gotIntl))
+	for _, m := range gotIntl {
+		ids = append(ids, m.ID)
+	}
+	if strings.Join(ids, ",") != "glm-5.2,Doubao-Seed-Evolving,kimi-k3,glm-5-turbo" {
+		t.Fatalf("国际版模型表=%v want [glm-5.2 Doubao-Seed-Evolving kimi-k3 glm-5-turbo]", ids)
 	}
 }
 

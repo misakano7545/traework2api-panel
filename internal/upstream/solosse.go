@@ -70,6 +70,10 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	// 旧口径按罚号计数，一次客户端参数错误就把好号推向熔断。
 	case e.Code == 4001 || strings.Contains(lower, "model config is empty"):
 		return ErrNone
+	// 4011 = 通道级速率/额度限制（实测 2026-09-28）：同一账号在 coder 通道被 4011 拒的同时，
+	// Work 通道立刻照常出正文。罚整个账号会让另一条通道的模型跟着躺 60 秒，所以不罚号。
+	case e.Code == 4011:
+		return ErrNone
 	case e.Code == 4008 || strings.Contains(lower, "quota") ||
 		strings.Contains(lower, "exceeded") || strings.Contains(lower, "rate"):
 		return ErrSoftRate

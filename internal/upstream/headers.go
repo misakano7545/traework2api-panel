@@ -28,9 +28,11 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	}
 	req.Header.Set("X-App-Id", AppID)
 	req.Header.Set("X-App-Version", "default")
-	req.Header.Set("X-Ide-Version", currentIdeVersion())
-	req.Header.Set("X-Ide-Version-Code", IdeVersionCode)
-	req.Header.Set("X-App-Version-Code", IdeVersionCode)
+	// 版本组按账号地区：国际版是另一套（X-App-Version-Code 必须非空，缺了上游 4001）。
+	ver, verCode := identFor(a)
+	req.Header.Set("X-Ide-Version", ver)
+	req.Header.Set("X-Ide-Version-Code", verCode)
+	req.Header.Set("X-App-Version-Code", verCode)
 	req.Header.Set("X-Ide-Version-Type", "stable")
 	req.Header.Set("X-Device-Type", "windows")
 	req.Header.Set("X-OS-Version", OSVersion)

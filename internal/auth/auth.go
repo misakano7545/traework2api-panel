@@ -54,6 +54,23 @@ func (a *Auth) JWT() string {
 	return a.AccessToken
 }
 
+// 地区（realm）：国内版与国际版是同一套 API 的两套域 + 两套身份版本组。
+const (
+	RealmCN   = "cn"
+	RealmIntl = "intl"
+)
+
+// Realm 从凭证自带的 Domain/ApiHost 判地区。老 auth 文件没有这两个字段（或写成
+// trae.cn 口径）一律按国内版；国际版是登录回调里的 host 参数写进来的。
+func (a *Auth) Realm() string {
+	for _, s := range []string{a.Domain, a.ApiHost} {
+		if strings.Contains(s, "trae.ai") || strings.Contains(s, "byteintlapi") {
+			return RealmIntl
+		}
+	}
+	return RealmCN
+}
+
 // RefreshTokenValue 返回当前 refreshToken 的读锁快照，防与 RefreshToken 写并发竞态。
 func (a *Auth) RefreshTokenValue() string {
 	a.mu.RLock()

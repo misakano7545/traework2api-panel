@@ -184,24 +184,32 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 //	"glm-5.2__dev"（内部名）        → 去掉后缀映射回 config_name
 //	"auto" / ""                     → 默认模型
 //	其他未知                        → 400
-func (h *Handler) mapModel(model string) (string, error) {
+func (h *Handler) mapModel(model, realm string) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "auto" {
-		def := h.runtime().DefaultModel
-		return def, nil
+		// 网页端的「TraeWork Auto Model」= 各地区各自的旗舰：国际账号上没有 glm-5.2，
+		// 反之国内账号上没有 gpt-5.2。国内版保留面板里可配的默认模型。
+		if realm == auth.RealmIntl {
+			return upstream.DefaultConfigNameIntl, nil
+		}
+		return h.runtime().DefaultModel, nil
 	}
 	// 去掉内部名后缀（__dev / __max 等）
 	base := model
 	if i := strings.Index(model, "__"); i >= 0 {
 		base = model[:i]
 	}
-	if h.knownModel(base) {
-		return base, nil
+	if canon, ok := h.resolveKnownModel(base); ok {
+		return canon, nil
 	}
 	// 宽松匹配：下划线 → 横线，大小写不敏感（deepseek_v4_pro → DeepSeek-V4-Pro）
 	norm := normalizeModelName(base)
-	if h.knownModel(norm) {
-		return norm, nil
+	if canon, ok := h.resolveKnownModel(norm); ok {
+		return canon, nil
+	}
+	// 上游表里没有：查客户端别名（claude-* / gpt-4o …），照社区实现的别名表做法。
+	if alias, ok := aliasModel(realm, norm); ok {
+		return alias, nil
 	}
 	return "", fmt.Errorf("unknown model %q", model)
 }
@@ -218,14 +226,18 @@ func normalizeModelName(s string) string {
 	return strings.Join(parts, "-")
 }
 
-// knownModel 判断 model 是否在动态/静态模型表中。
-func (h *Handler) knownModel(model string) bool {
+// resolveKnownModel 在模型表里按「大小写不敏感」找这个裸名，命中就返回**表里的规范 id**。
+// 列表 id 带 realm 前缀（见 modelList），剥掉前缀再比：客户端带不带前缀都认。
+// 客户端抄的是网页端显示名（GPT-5.4 / MiniMax-M2.7 / GLM-5.2），大小写跟表里不一样；
+// 出站必须用表里的规范名，否则上游回 4001。
+func (h *Handler) resolveKnownModel(model string) (string, bool) {
 	for _, m := range h.modelList() {
-		if m["id"] == model {
-			return true
+		id, _ := m["id"].(string)
+		if _, bare := resolveModel(id); strings.EqualFold(bare, model) {
+			return bare, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // 静态官方模型表（上游拉取失败时的回退快照）。
@@ -255,9 +267,13 @@ var staticModels = []map[string]any{
 // dynamicModelsCache 动态模型缓存（成功 1h / 失败负缓存 5min）。
 var dynamicModelsCache struct {
 	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time
-	lastFail time.Time
+	ids []upstream.ModelInfo
+	// realmByModel 模型 → 归属地区（国际版模型国内号接不了，选号要用它过滤）。
+	realmByModel map[string]string
+	// fnByModel 模型 → 所属通道（solo_work_lite / solo_coder）：出站 function 跟着模型走。
+	fnByModel map[string]string
+	fetched   time.Time
+	lastFail  time.Time
 }
 
 const (
@@ -277,8 +293,14 @@ func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
+			// realm 前缀是网关路由协议（见 resolve_model.go）：两侧都带前缀，
+			// 客户端把 id 原样回传就带上了地区，不用猜。
+			realm := h.modelRealm(mi.ID)
+			if realm == "" {
+				realm = auth.RealmCN
+			}
 			entry := map[string]any{
-				"id":             mi.ID,
+				"id":             realm + ":" + mi.ID,
 				"object":         "model",
 				"created":        1753600000,
 				"owned_by":       "trae-solo",
@@ -304,7 +326,9 @@ func (h *Handler) modelList() []map[string]any {
 	return staticModels
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。
+// fetchDynamicModels 拉模型列表（get_detail_param），缓存 1h。
+// 池里出现过的每个地区（realm）各拉一份并合并：国内版与国际版的模型表不是同一张，
+// 只拉一边会让另一边的模型在 /v1/models 与 mapModel 校验里凭空消失。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -318,24 +342,87 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	// 只读探询不占在途名额：这里的 Pick 若带租约，几次列模型就会把账号占到不可用。
-	acct := h.cfg.Pool.Peek()
-	if acct == nil {
-		return nil
+	var merged []upstream.ModelInfo
+	realmByModel := map[string]string{}
+	fnByModel := map[string]string{}
+	seen := map[string]bool{}
+	for _, acct := range h.realmReps() {
+		realm := acct.Realm()
+		// 只读探询不占在途名额：这里若带租约，几次列模型就会把账号占到不可用。
+		infos, err := h.cfg.Upstream.FetchModels(acct)
+		if err != nil {
+			continue
+		}
+		for _, mi := range infos {
+			// 两个地区同名的（如 kimi-k3）只留先到的那个：名字一样，调用哪个号都能出。
+			if seen[mi.ID] {
+				continue
+			}
+			seen[mi.ID] = true
+			merged = append(merged, mi)
+			realmByModel[mi.ID] = realm
+			fnByModel[mi.ID] = mi.Function
+		}
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
+	if len(merged) == 0 {
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
 		return nil
 	}
 	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
+	dynamicModelsCache.ids = merged
+	dynamicModelsCache.realmByModel = realmByModel
+	dynamicModelsCache.fnByModel = fnByModel
 	dynamicModelsCache.fetched = time.Now()
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
-	return infos
+	return merged
+}
+
+// modelRealm 该模型归属的地区；未知返回空（= 不限制选号，交给上游判）。
+func (h *Handler) modelRealm(model string) string {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return dynamicModelsCache.realmByModel[model]
+}
+
+// modelFunction 该模型属于哪条出站通道（solo_work_lite / solo_coder）；未知返回空（用默认）。
+func (h *Handler) modelFunction(model string) string {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return dynamicModelsCache.fnByModel[model]
+}
+
+// setFunctionInBody 把出站 function 换成该模型所属通道（PrepareBody 不覆盖显式 function）。
+func setFunctionInBody(body []byte, fn string) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	obj["function"] = fn
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// realmReps 池里每个地区挑一个账号代表去拉模型表。
+// ponytail: 挑到谁不定（List 顺序来自 map），也不挑健康度——拉模型表只用 token，
+// 冷却中的号照样能拉；真要按健康度挑再加 pool 的按 realm 选号。
+func (h *Handler) realmReps() []*auth.Auth {
+	seen := map[string]bool{}
+	var out []*auth.Auth
+	for _, st := range h.cfg.Pool.List() {
+		a := h.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || seen[a.Realm()] {
+			continue
+		}
+		seen[a.Realm()] = true
+		out = append(out, a)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +436,22 @@ func setModelInBody(body []byte, configName string) []byte {
 		return body
 	}
 	obj["model"] = configName
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// setSlotInBody 把 body 换成「槽位 + 具体模型」：上游拿 config_name 找槽位、
+// 拿 model 找槽位里的具体模型（PrepareBody 不再覆盖显式 config_name）。
+func setSlotInBody(body []byte, r upstream.SlotRoute) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	obj["config_name"] = r.Slot
+	obj["model"] = r.Model
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
@@ -375,21 +478,49 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var peek chatRequest
 	_ = json.Unmarshal(body, &peek)
 
+	// 地区前缀（[realm:]model）在这里剥掉：后面 mapModel / 出站 body / 台账都用裸名。
+	realm, bareModel := resolveModel(peek.Model)
+	prefixed := bareModel != peek.Model
+	if !prefixed {
+		// 裸名：按模型表里该名字的归属地区兜底（表里没有 = 国内版，老客户端零回归）。
+		if r := h.modelRealm(strings.TrimSpace(bareModel)); r != "" {
+			realm = r
+		}
+	}
+
 	// 会话键必须在改写提示词之前取：改写会动 messages，之后取会让键漂移。
 	sessKey := session.ExtractKey(body)
 
-	configName, err := h.mapModel(peek.Model)
+	configName, err := h.mapModel(bareModel, realm)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 裸名经别名落到别的地区（如 Gemini-3.1-Pro-Preview → gemini-3.1-pro）：地区以模型为准，
+	// 否则会拿国内号去接国际模型。带前缀的请求_prefix 权威，不动。
+	if !prefixed {
+		if r := h.modelRealm(configName); r != "" {
+			realm = r
+		}
+	}
+
 	body = setModelInBody(body, configName)
 	body = h.applyPrompt(body)
+	// 国际版：没开档位的模型走租户槽位（config_name=槽位 + model=具体模型）。
+	if route, ok := upstream.IntlSlotRoute(configName); ok && realm == auth.RealmIntl {
+		body = setSlotInBody(body, route)
+	}
+	// 出站通道跟着模型走：网页端那批（gemini-3.1-pro / minimax-m2.7 / kimi-k2.5 …）在
+	// solo_coder 通道，发在 Work 通道会被判 4001。
+	if fn := h.modelFunction(configName); fn != "" {
+		body = setFunctionInBody(body, fn)
+	}
 
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct, release := h.acquireAccount(tried, sessKey)
+		// 按地区选号：国际版模型只有国际号能做，反之亦然。
+		acct, release := h.acquireAccount(tried, sessKey, realm)
 		if acct == nil {
 			break
 		}
@@ -403,6 +534,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = err
 		}
 	}
+	// 上游明确说是「这个模型/通道不行」（4001 参数、4011 通道限流…，Kind()==ErrNone）时，
+	// 别再报「账号都不可用」——号是好的，是请求本身被上游拒了。照实回上游的原话。
+	// 实测 2026-09-28：coder 通道 4011 期间，同一账号的 Work 通道照常出正文。
+	if lastErr != nil {
+		var se *upstream.SOLOStreamError
+		if errors.As(lastErr, &se) && se.Kind() == upstream.ErrNone {
+			writeOpenAIError(w, http.StatusTooManyRequests, "upstream_rejected", se.Error())
+			return
+		}
+	}
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
@@ -414,17 +555,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //
 // 返回的 release 必须在这次尝试结束（无论成败）后调用一次——在途名额泄漏会把账号
 // 慢慢挤出池（达到 max_in_flight 后不再可选）。
-func (h *Handler) acquireAccount(tried map[string]bool, sessKey string) (*auth.Auth, func()) {
+func (h *Handler) acquireAccount(tried map[string]bool, sessKey, realm string) (*auth.Auth, func()) {
 	if sessKey != "" && h.cfg.Session != nil {
 		if uid, ok := h.cfg.Session.Resolve(sessKey); ok && !tried[uid] {
 			if a, ok := h.cfg.Pool.AcquireIfHealthy(uid); ok {
-				return a, func() { h.cfg.Pool.Release(uid) }
+				if realm == "" || a.Realm() == realm {
+					return a, func() { h.cfg.Pool.Release(uid) }
+				}
+				// 粘住的号地区不符（换模型/换地区了）→ 还回在途名额再解绑，别白占着。
+				h.cfg.Pool.Release(uid)
 			}
-			// 粘住的号不可用（冷却/禁用/在途满）→ 解绑，本轮重新分配。
+			// 粘住的号不可用（冷却/禁用/在途满/地区不符）→ 解绑，本轮重新分配。
 			h.cfg.Session.Unbind(sessKey)
 		}
 	}
-	a := h.cfg.Pool.PickExcluding(tried)
+	a := h.cfg.Pool.PickRealmExcluding(realm, tried)
 	if a == nil {
 		return nil, func() {}
 	}
@@ -472,10 +617,15 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 
 	if peek.Stream {
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 截断自动续写（见 upstream/continue.go）：SOLO 32000 硬截断（done 仍报 stop）
+		// 时同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流；
+		// 续写失败/显式限额/工具分片 → 自动降级为旧行为（截断终态）。
+		cont := upstream.NewContinueReader(h.cfg.Upstream, acct, body, rc)
 		// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-		usg, serr := upstream.StreamWithError(w, rc, func(se *upstream.SOLOStreamError) {
+		usg, serr := upstream.StreamWithError(w, cont, func(se *upstream.SOLOStreamError) {
 			h.handleStreamError(acct.UID, se)
 		})
+		cont.Close()
 		rc.Close()
 		// 流内 error 事件走 onErr 回调后本函数仍返回 nil，所以「有 token_usage」才是这次
 		// 尝试真的产出了回复的判据；只看返回 err 会把 1005 记成成功。

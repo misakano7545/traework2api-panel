@@ -229,14 +229,16 @@ func TestChatCompletionToMessage(t *testing.T) {
 	if got["id"] != "msg_chatcmpl-1" || got["type"] != "message" || got["stop_reason"] != "tool_use" {
 		t.Fatalf("envelope=%v", got)
 	}
-	if strings.Contains(mustJSON(got), "think") {
-		t.Fatalf("reasoning leaked: %v", got)
-	}
 	content := got["content"].([]any)
-	if content[0].(map[string]any)["text"] != "hi" {
-		t.Fatalf("text=%v", content[0])
+	// reasoning_content 无 signature，作为 thinking 块下发展示（客户端回传时丢弃）。
+	th := content[0].(map[string]any)
+	if th["type"] != "thinking" || th["thinking"] != "think" {
+		t.Fatalf("thinking=%v", th)
 	}
-	tu := content[1].(map[string]any)
+	if content[1].(map[string]any)["text"] != "hi" {
+		t.Fatalf("text=%v", content[1])
+	}
+	tu := content[2].(map[string]any)
 	in := tu["input"].(map[string]any)
 	if tu["type"] != "tool_use" || tu["id"] != "call_a" || in["cmd"] != "ls" {
 		t.Fatalf("tool_use=%v", tu)
@@ -244,6 +246,22 @@ func TestChatCompletionToMessage(t *testing.T) {
 	u := got["usage"].(map[string]any)
 	if u["input_tokens"] != 1 || u["output_tokens"] != 2 {
 		t.Fatalf("usage=%v", u)
+	}
+}
+
+// TestAnthropicStopMapping 截断/内容过滤不得静默映射成 end_turn（Claude 侧语义）。
+func TestAnthropicStopMapping(t *testing.T) {
+	for fr, want := range map[string]string{
+		"stop":           "end_turn",
+		"length":         "max_tokens",
+		"max_tokens":     "max_tokens",
+		"tool_calls":     "tool_use",
+		"function_call":  "tool_use",
+		"content_filter": "refusal",
+	} {
+		if got := anthropicStop(fr); got != want {
+			t.Fatalf("anthropicStop(%s)=%s want %s", fr, got, want)
+		}
 	}
 }
 
@@ -276,8 +294,18 @@ func TestMessagesStreamEventOrder(t *testing.T) {
 	if types[0] != "message_start" || types[len(types)-1] != "message_stop" {
 		t.Fatalf("order=%v", types)
 	}
-	if strings.Contains(body, "think") || strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("leak: %s", body)
+	if strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("chat [DONE] 泄漏: %s", body)
+	}
+	// reasoning_content 以 thinking 块下发（Claude Code 展示），且先于文本块。
+	if !strings.Contains(body, `"type":"thinking_delta"`) || !strings.Contains(body, `"thinking":"think"`) {
+		t.Fatalf("thinking 块 missing: %s", body)
+	}
+	if ti, xi := strings.Index(body, "thinking_delta"), strings.Index(body, `"type":"text_delta"`); ti < 0 || xi < 0 || ti > xi {
+		t.Fatalf("thinking 应先于文本: ti=%d xi=%d", ti, xi)
+	}
+	if n := strings.Count(body, `"type":"content_block_stop"`); n < 2 {
+		t.Fatalf("thinking/文本块都要关闭: stops=%d body=%s", n, body)
 	}
 	if !strings.Contains(body, `"text":"hi"`) || !strings.Contains(body, `"partial_json":"{\"x\":"`) || !strings.Contains(body, `"partial_json":"1}"`) {
 		t.Fatalf("deltas missing: %s", body)
@@ -305,7 +333,14 @@ func TestMessagesEndpoint(t *testing.T) {
 		if obj["type"] != "message" || obj["stop_reason"] != "end_turn" {
 			t.Fatalf("%s got=%v", path, obj)
 		}
-		text := obj["content"].([]any)[0].(map[string]any)["text"]
+		content := obj["content"].([]any)
+		// soloSSE 夹具带 reasoning_content（"想一下"）：移植后以 thinking 块下发，
+		// 文本块顺延到第 2 个。
+		th, _ := content[0].(map[string]any)
+		if th["type"] != "thinking" || th["thinking"] != "想一下" {
+			t.Fatalf("%s thinking=%v", path, th)
+		}
+		text := content[1].(map[string]any)["text"]
 		if text != "你好" {
 			t.Fatalf("%s text=%v", path, text)
 		}

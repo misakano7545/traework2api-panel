@@ -50,7 +50,9 @@ func (k CoolKind) String() string {
 type Status struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname,omitempty"`
-	Credits  int64  `json:"credits"`
+	// Realm 账号地区（cn / intl）：国际版账号没有签到接口、只能做国际版模型。
+	Realm   string `json:"realm,omitempty"`
+	Credits int64  `json:"credits"`
 	// CreditsTotal 上游给的积分总额（各包 credits_limit 之和），只作分母：
 	// 「积分」列显示 剩余/总额。0 表示还没查到过，界面只显示剩余。
 	CreditsTotal int64     `json:"credits_total,omitempty"`
@@ -276,7 +278,7 @@ func (p *Pool) Pick() *auth.Auth {
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e := p.pickLocked(tried)
+	e := p.pickLocked(tried, "")
 	if e == nil {
 		return nil
 	}
@@ -289,21 +291,43 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // 探询要是也占名额，几次取模型列表就能把账号占到不可用。
 func (p *Pool) Peek() *auth.Auth { return p.PeekExcluding(nil) }
 
+// PickRealmExcluding 只在指定地区的账号里挑（占用在途名额，语义同 PickExcluding）。
+// realm 空 = 不限，等同 PickExcluding。
+func (p *Pool) PickRealmExcluding(realm string, tried map[string]bool) *auth.Auth {
+	if realm == "" {
+		return p.PickExcluding(tried)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.pickLocked(tried, realm)
+	if e == nil {
+		return nil
+	}
+	e.inFlight++
+	e.lastUsed = time.Now()
+	return e.a
+}
+
 func (p *Pool) PeekExcluding(tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if e := p.pickLocked(tried); e != nil {
+	if e := p.pickLocked(tried, ""); e != nil {
 		return e.a
 	}
 	return nil
 }
 
 // pickLocked 选号策略本体（调用方持锁）：healthy + 未达在途上限 → 快过期优先 → 权重最大。
-func (p *Pool) pickLocked(tried map[string]bool) *entry {
+// pickLocked 选号。realm 非空时只在该地区的账号里挑：国际版模型国内号做不了、
+// 国内版模型国际号做不了，混着挑等于随机把请求打到一个必然 4001 的号上。
+func (p *Pool) pickLocked(tried map[string]bool, realm string) *entry {
 	now := time.Now()
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
 		if !e.healthy(now) {
@@ -729,6 +753,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	return Status{
 		UID:          uid,
 		Nickname:     e.a.Nickname,
+		Realm:        e.a.Realm(),
 		Credits:      e.credits,
 		CreditsTotal: e.creditsTotal,
 		Expire:       e.expire,

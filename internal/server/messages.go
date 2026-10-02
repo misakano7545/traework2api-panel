@@ -1,7 +1,9 @@
 // messages.go Anthropic Messages 入站：POST /v1/messages 与 /messages ↔ 现有 chatCompletions。
-// ponytail: 不存会话；客户端每轮带全量 messages。thinking 无 signature，不回传。
+// ponytail: 不存会话；客户端每轮带全量 messages。上游 reasoning_content 无 signature，
+// 作为 thinking 块下发展示；客户端回传的 thinking 块丢弃（不触发签名校验）。
 // top_k / cache_control / context_management / betas / count_tokens 上游 chat 没有对应物，丢掉。
 // 内置服务端工具（web_search / code_execution / bash_* …）没有本地执行器，丢掉并在 system 里写明。
+// usage 缓存字段走 SOLO 直报（cache_read_/cache_creation_input_tokens 原样透出），截断映射 refusal。
 package server
 
 import (
@@ -433,7 +435,11 @@ func chatCompletionToMessage(obj map[string]any) map[string]any {
 	}
 	content := []any{}
 	if msg != nil {
-		// ponytail: reasoning_content 没有 signature，回传 thinking 会让下一轮 400。
+		// 上游 reasoning_content 无 signature，作为 thinking 块下发（Claude Code 展示用）；
+		// 客户端回传的 thinking 块在 blocksToMessages 里被丢弃，不会触发签名校验。
+		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+			content = append(content, map[string]any{"type": "thinking", "thinking": rc})
+		}
 		if text := messageText(msg["content"]); text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
@@ -502,10 +508,12 @@ func parseToolInput(v any) any {
 
 func anthropicStop(fr string) string {
 	switch fr {
-	case "length":
+	case "length", "max_tokens":
 		return "max_tokens"
 	case "tool_calls", "function_call":
 		return "tool_use"
+	case "content_filter":
+		return "refusal"
 	default:
 		return "end_turn"
 	}
@@ -590,6 +598,8 @@ type messagesWriter struct {
 type anthState struct {
 	started, failed, done bool
 	id, model, stop       string
+	thinkOpen             bool
+	thinkIdx              int
 	textOpen              bool
 	textIdx, next         int
 	tools                 map[int]*anthTool
@@ -738,6 +748,19 @@ func (w *messagesWriter) handleChunk(obj map[string]any) error {
 		return nil
 	}
 	if d, _ := c["delta"].(map[string]any); d != nil {
+		// 上游 reasoning_content → thinking 块（Claude Code 会展示）。无 signature：
+		// 客户端回传时被 blocksToMessages 丢掉，不会触发校验。
+		if rc, ok := d["reasoning_content"].(string); ok && rc != "" {
+			if err := w.ensureThinking(); err != nil {
+				return err
+			}
+			if err := w.emit("content_block_delta", map[string]any{
+				"index": w.x.thinkIdx,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": rc},
+			}); err != nil {
+				return err
+			}
+		}
 		if s, ok := d["content"].(string); ok && s != "" {
 			if err := w.ensureText(); err != nil {
 				return err
@@ -785,7 +808,37 @@ func (w *messagesWriter) ensureStart(obj map[string]any) error {
 	})
 }
 
+func (w *messagesWriter) ensureThinking() error {
+	if w.x.thinkOpen {
+		return nil
+	}
+	if w.x.textOpen {
+		if err := w.emit("content_block_stop", map[string]any{"index": w.x.textIdx}); err != nil {
+			return err
+		}
+		w.x.textOpen = false
+	}
+	w.x.thinkIdx = w.x.next
+	w.x.next++
+	w.x.thinkOpen = true
+	return w.emit("content_block_start", map[string]any{
+		"index":         w.x.thinkIdx,
+		"content_block": map[string]any{"type": "thinking", "thinking": ""},
+	})
+}
+
+func (w *messagesWriter) closeThinking() error {
+	if !w.x.thinkOpen {
+		return nil
+	}
+	w.x.thinkOpen = false
+	return w.emit("content_block_stop", map[string]any{"index": w.x.thinkIdx})
+}
+
 func (w *messagesWriter) ensureText() error {
+	if err := w.closeThinking(); err != nil {
+		return err
+	}
 	if w.x.textOpen {
 		return nil
 	}
@@ -849,6 +902,9 @@ func (w *messagesWriter) openTool(acc *anthTool) error {
 	if acc.opened {
 		return nil
 	}
+	if err := w.closeThinking(); err != nil {
+		return err
+	}
 	if w.x.textOpen {
 		if err := w.emit("content_block_stop", map[string]any{"index": w.x.textIdx}); err != nil {
 			return err
@@ -881,6 +937,9 @@ func (w *messagesWriter) closeAndStop() error {
 		if err := w.ensureStart(nil); err != nil {
 			return err
 		}
+	}
+	if err := w.closeThinking(); err != nil {
+		return err
 	}
 	if w.x.textOpen {
 		if err := w.emit("content_block_stop", map[string]any{"index": w.x.textIdx}); err != nil {

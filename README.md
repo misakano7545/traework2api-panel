@@ -266,6 +266,63 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 平均延迟与吐字速率，可按模型、按账号、按时序下钻。失败尝试也计入请求数——重试放大正是
 靠这一列才看得见。数据落在 `data/usage.json`（与 `state_file` 同目录，30 秒防抖落盘）。
 
+## 国际版（Trae 国际 / TRAE SOLO 国际）
+
+国内版与国际版是**同一套 API 的两套域 + 两套身份版本组**，所以入站协议、SSE 事件、`function=solo_work_lite`
+全都不变，只有域和版本号不同（实测 2026-09-28，见下表）。账号按 `auth.domain` 自动分地区（`auth.Realm()`），
+不需要开关：
+
+| 面 | 国内版 | 国际版 |
+|---|---|---|
+| agent host（对话 / 模型表） | `trae-api-cn.mchost.guru` | `a0ai-api-sg.byteintlapi.com` |
+| OAuth host | `api.trae.com.cn` | 登录回调里的 `host` 参数（本次实测 `api-sg-central.trae.ai`） |
+| 登录页 | `www.trae.cn/authorization` | `www.trae.ai/authorization`（同参数集，`x_app_version=1.0.2`） |
+| 模型名 | `glm-5.2` / `kimi-k2.6` … | `gpt-5.2` / `gpt-5.4` / `kimi-k3`（`gpt-6-sol`/`gpt-6-luna` 见下） |
+| 签到 / 积分 | `/trae/api/v2/ug/*` | **没有**：两个国际域上都是 404，国际账号跳过签到与余额刷新 |
+
+**`gpt-6-sol` / `gpt-6-luna`（官方门控 + 旁路）**：这两个在模型表里带
+`display_contact_config.access.identity_list=[4,1,2,3]`，免费档（identity 0/5）不在内，直接发回
+`1005 {"plan":4}`（要付费档；与客户端版本码无关，试过 6 个版本码门控一字不变）。**但同一批模型在租户
+自定义槽位里能走**：`config_name=custom_model_gpt-5` + `model=openai/gpt-5.6-sol|luna` 实测出正文，
+代理已给这两个名字挂了旁路（`intlSlotRoutes`），所以 `intl:gpt-6-sol` 直接可用。
+槽位是租户配置，换账号可能没有——没有就照常报上游错误。其余 `custom_model_*` 槽位（gemini / kimi / minimax /
+claude 系列）在这台账号上全回 `4023`，是租户没配那些 provider，不是模型不存在。
+
+`work.trae.ai` 网页端列出的 11 个名字**不在同一通道上**，出站 `function` 现在跟着模型走
+（`fnByModel`，客户端不用关心）：
+
+| 网页端名字 | 内部模型 / 通道 | 状态 |
+|---|---|---|
+| TraeWork Auto Model | `auto` → 该地区旗舰（国际 `gpt-5.2`） | 可用 |
+| GPT-6-Sol · GPT-6-Luna | `gpt-6-sol` / `gpt-6-luna`（Work 通道，走槽位旁路） | 可用 |
+| GPT-5.4 · GPT-5.2 · Kimi-K3 | 同名，Work 通道（`solo_work_lite`） | 可用 |
+| Gemini-3.1-Pro-Preview | `gemini-3.1-pro`，**coder 通道**（`solo_coder`） | 通道已接；本账号受上游速率/额度限制，忙时报 4011 |
+| Gemini-3-Flash-Preview | `gemini-3-flash-solo`，coder 通道 | 同上 |
+| MiniMax-M2.7 | `minimax-m2.7`，coder 通道 | 同上 |
+| Kimi-K2.5 | `kimi-k2.5`，coder 通道 | 同上 |
+| MiniMax-M3 | 这张账号的两张表里都没有（网页端列着，API 侧不下发） | 照实 400 |
+
+coder 表怎么来的：同一台 agent 主机、同一个 `/api/agent/v3/llm_utils_chat`，只把 body 里的
+`function` 换成 `solo_coder`。网页端（`work.trae.ai`）自己的模型接口
+`GET /api/remote/v1/models` 用同一个票据就能读，列出的 `function=solo_coder` 组正是那 6 个名字
+（`/api/remote/v1/*` 是它完整的会话/沙箱 API，反代只用到 `/models` 做对照，没接那套）。
+
+**加账号**：面板「添加账号」里选「国际版」（链接自动切 `www.trae.ai`），或 `REALM=intl ./login.sh`。
+回调链接里自带 `host`，换票与落盘按它写 `domain`/`apiHost`，不用手填；换票后 `apiHost` 也会随 token 轮换一起用。
+
+**调模型**：模型名带地区前缀，`/v1/models` 列出的 id 就带（`cn:glm-5.2`、`intl:gpt-5.2`），原样回传即可；
+不带前缀按国内版走（老客户端零变化），但名字在模型表里属于国际版的（如 `gpt-5.2`）会自动落到国际账号。
+选号按前缀过滤——国际模型只发国际号，反之亦然，所以国内号不会被 `intl:` 请求误伤。
+
+**别名层（客户端自带模型名）**：Claude Code / Cursor / Cline 把 `claude-*`、`gpt-4o` 写死在配置里，
+这里照社区现成实现的做法把它们落到真模型上（`internal/server/model_alias.go`，别名表是唯一改动点；
+口径参考 `ZedeX/trae-local-api` 的 `model-config.json` 与 `linqiu919/trae2api` 的 `convertModelName`）：
+`claude-*`（含各种日期后缀）→ 该地区旗舰；`gpt-4o` / `gpt-4o-mini` / `gpt-4.1` / `gpt-3.5-turbo` →
+国内 `glm-5.2`、国际 `gpt-5.2`。未知名字仍然 400，不会静默塞默认模型。
+
+国际版的 `X-App-Version-Code` **必须非空**：缺了上游直接 `4001 missing required parameter`（实测），
+代码里由 `identFor()` 按地区给。用量台账暂不区分地区（`workbuddy2api-panel` 有，按需再加一列）。
+
 ## 目录结构
 
 ```

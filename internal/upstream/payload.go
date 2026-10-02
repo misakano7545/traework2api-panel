@@ -27,7 +27,10 @@ func PrepareBody(src []byte) []byte {
 		return src
 	}
 	obj["stream"] = true
-	obj["function"] = Function
+	// 显式给了 function 就别覆盖：coder 通道的模型要带 function=solo_coder。
+	if _, has := obj["function"]; !has {
+		obj["function"] = Function
+	}
 
 	if msgs, ok := obj["messages"].([]any); ok {
 		for _, mi := range msgs {
@@ -88,7 +91,10 @@ func PrepareBody(src []byte) []byte {
 	if model == "" {
 		model = DefaultConfigName
 	}
-	obj["config_name"] = model
+	// 显式给了 config_name 就别覆盖：国际版槽位旁路要 config_name=槽位 + model=具体模型。
+	if _, has := obj["config_name"]; !has {
+		obj["config_name"] = model
+	}
 	obj["model"] = model
 
 	normalizeToolChoice(obj)

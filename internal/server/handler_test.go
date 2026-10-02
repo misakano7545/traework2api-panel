@@ -180,6 +180,42 @@ func TestChatStreamModelErrorDoesNotPenalize(t *testing.T) {
 	}
 }
 
+// 上游 4011（通道级限流）也是「这个模型/通道不行」：不能报成「账号都不可用」，
+// 也不能罚号——同一账号另一条通道当时是好的。
+func TestChatUpstreamChannelRejectSurfacesAs429(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "event:error\ndata:{\"code\":4011,\"message\":\"your requests have exceeded the rate limit\"}\n\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":false,"messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("code=%d want 429 body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "4011") {
+		t.Errorf("该把上游原话透出来: %s", rec.Body.String())
+	}
+	st, _ := p.Status("u1")
+	if st.ErrCount != 0 || st.Degraded != 0 || st.Cooling {
+		t.Errorf("4011 不该罚号: %+v", st)
+	}
+}
+
+// 客户端抄网页端显示名（GPT-5.4 / MiniMax-M2.7 / GLM-5.2）时大小写跟表里不一致：
+// 要按大小写不敏感命中，并且出站用表里的规范名。
+func TestMapModelDisplayNameCaseInsensitive(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) { return 200, "", false })
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	for in, want := range map[string]string{"GLM-5.2": "glm-5.2", "Kimi-K2.6": "kimi-k2.6", "GLM-5.3": "glm-5.3"} {
+		got, err := h.mapModel(in, auth.RealmCN)
+		if err != nil || got != want {
+			t.Errorf("mapModel(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+}
+
 // 用量台账：成功的调用记 token，失败的尝试只记请求数+失败数（没有 usage 可记）。
 func TestUsageRecordsSuccessAndFailure(t *testing.T) {
 	rec := usage.New("") // 不落盘

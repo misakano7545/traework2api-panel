@@ -1,5 +1,7 @@
 // responses.go Codex Responses 入站适配：POST /v1/responses ↔ 现有 chatCompletions。
 // ponytail: 不存 previous_response_id / store；Codex 每轮带全量 input。
+// 事件语义对齐 relaykit（new-api 拆出的协议转换模块，AGPL 仅作行为参考，未拷代码）：
+// 推理走 reasoning_summary_* 事件族、截断如实报 response.incomplete、每事件带 sequence_number。
 package server
 
 import (
@@ -8,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
@@ -254,19 +257,22 @@ func chatCompletionToResponse(obj map[string]any) map[string]any {
 		created = int64(v)
 	}
 	var msg map[string]any
+	fr := ""
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
 		if c, ok := chs[0].(map[string]any); ok {
 			msg, _ = c["message"].(map[string]any)
+			fr, _ = c["finish_reason"].(string)
 		}
 	}
+	status, details := responsesStatusFromFinish(fr)
 	output := []any{}
 	if msg != nil {
 		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
 			output = append(output, map[string]any{
 				"id":      "rs_" + id,
 				"type":    "reasoning",
-				"summary": []any{},
-				"content": []any{map[string]any{"type": "reasoning_text", "text": rc}},
+				"status":  status,
+				"summary": []any{map[string]any{"type": "summary_text", "text": rc}},
 			})
 		}
 		content, _ := msg["content"].(string)
@@ -275,7 +281,7 @@ func chatCompletionToResponse(obj map[string]any) map[string]any {
 			output = append(output, map[string]any{
 				"id":      "msg_" + id,
 				"type":    "message",
-				"status":  "completed",
+				"status":  status,
 				"role":    "assistant",
 				"content": []any{map[string]any{"type": "output_text", "text": content}},
 			})
@@ -298,7 +304,7 @@ func chatCompletionToResponse(obj map[string]any) map[string]any {
 				"call_id":   callID,
 				"name":      name,
 				"arguments": args,
-				"status":    "completed",
+				"status":    status,
 			})
 		}
 	}
@@ -306,9 +312,12 @@ func chatCompletionToResponse(obj map[string]any) map[string]any {
 		"id":         respID(id),
 		"object":     "response",
 		"created_at": created,
-		"status":     "completed",
+		"status":     status,
 		"model":      model,
 		"output":     output,
+	}
+	if details != nil {
+		out["incomplete_details"] = details
 	}
 	if u, ok := obj["usage"].(map[string]any); ok && u != nil {
 		out["usage"] = convertUsage(u)
@@ -330,7 +339,7 @@ func convertUsage(u map[string]any) map[string]any {
 	// ponytail: Responses 客户端的缓存读数在 input_tokens_details.cached_tokens
 	// （Codex 据此显示 cached）；SOLO 上游的真实命中数在 cache_read_input_tokens
 	// （实测 2026-09-28：cache_read=45 / prompt=45）。没有该字段就不写，
-	// 不拿 0 冒充"没命中"。
+	// 不拿 0 冒充「没命中」。
 	if v, ok := u["cache_read_input_tokens"]; ok && v != nil {
 		out["input_tokens_details"] = map[string]any{"cached_tokens": v}
 	}
@@ -360,7 +369,11 @@ type responsesWriter struct {
 type streamState struct {
 	created, failed, completed bool
 	id, model                  string
+	createdAt                  int64
 	outN                       int
+	seq                        int // SSE 事件序号（sequence_number，当前 Responses wire 契约要求）
+	status                     string
+	incompleteDetails          map[string]any
 	reasoningOpen              bool
 	reasoningIdx               int
 	reasoningID                string
@@ -493,13 +506,19 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 		w.x.id = id
 		w.x.model = model
 		w.x.created = true
+		if v, ok := obj["created"].(float64); ok && v > 0 {
+			w.x.createdAt = int64(v)
+		} else {
+			w.x.createdAt = time.Now().Unix()
+		}
 		if err := w.emit("response.created", map[string]any{
 			"response": map[string]any{
-				"id":     respID(id),
-				"object": "response",
-				"status": "in_progress",
-				"model":  model,
-				"output": []any{},
+				"id":         respID(id),
+				"object":     "response",
+				"status":     "in_progress",
+				"created_at": w.x.createdAt,
+				"model":      model,
+				"output":     []any{},
 			},
 		}); err != nil {
 			return err
@@ -522,10 +541,10 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 				return err
 			}
 			w.x.reasoningText.WriteString(rc)
-			if err := w.emit("response.reasoning_text.delta", map[string]any{
+			if err := w.emit("response.reasoning_summary_text.delta", map[string]any{
 				"item_id":       w.x.reasoningID,
 				"output_index":  w.x.reasoningIdx,
-				"content_index": 0,
+				"summary_index": 0,
 				"delta":         rc,
 			}); err != nil {
 				return err
@@ -552,9 +571,40 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 		}
 	}
 	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+		w.applyFinishReason(fr)
 		return w.closeOpenItems()
 	}
 	return nil
+}
+
+// applyFinishReason 把上游截断如实映射成 incomplete（relaykit 同款语义）：
+// max_output_tokens / content_filter 都不允许伪装成 completed，否则客户端
+// （Codex）会把被截断的输出当作完整结果。
+func (w *responsesWriter) applyFinishReason(fr string) {
+	status, details := responsesStatusFromFinish(fr)
+	if status != "" {
+		w.x.status = status
+		w.x.incompleteDetails = details
+	}
+}
+
+func responsesStatusFromFinish(fr string) (string, map[string]any) {
+	switch strings.TrimSpace(fr) {
+	case "length", "max_tokens":
+		return "incomplete", map[string]any{"reason": "max_output_tokens"}
+	case "content_filter":
+		return "incomplete", map[string]any{"reason": "content_filter"}
+	default:
+		return "completed", nil
+	}
+}
+
+// itemStatus 关闭 item 时用的状态：截断时 item 也要标 incomplete。
+func (w *responsesWriter) itemStatus() string {
+	if w.x.status == "incomplete" {
+		return "incomplete"
+	}
+	return "completed"
 }
 
 func (w *responsesWriter) nextIdx() int {
@@ -570,14 +620,21 @@ func (w *responsesWriter) ensureReasoning() error {
 	w.x.reasoningIdx = w.nextIdx()
 	w.x.reasoningID = "rs_" + w.x.id
 	w.x.reasoningOpen = true
-	return w.emit("response.output_item.added", map[string]any{
+	if err := w.emit("response.output_item.added", map[string]any{
 		"output_index": w.x.reasoningIdx,
 		"item": map[string]any{
 			"id":      w.x.reasoningID,
 			"type":    "reasoning",
 			"summary": []any{},
-			"content": []any{},
 		},
+	}); err != nil {
+		return err
+	}
+	return w.emit("response.reasoning_summary_part.added", map[string]any{
+		"item_id":       w.x.reasoningID,
+		"output_index":  w.x.reasoningIdx,
+		"summary_index": 0,
+		"part":          map[string]any{"type": "summary_text"},
 	})
 }
 
@@ -642,29 +699,43 @@ func (w *responsesWriter) handleToolDeltas(tcs []any) error {
 		if id := asString(tc["id"]); id != "" {
 			acc.id = id
 		}
-		if fn, _ := tc["function"].(map[string]any); fn != nil {
+		fn, _ := tc["function"].(map[string]any)
+		args := ""
+		if fn != nil {
 			if n := asString(fn["name"]); n != "" {
 				acc.name = n
 			}
-			if a, ok := fn["arguments"].(string); ok && a != "" {
-				acc.args.WriteString(a)
-				if !acc.opened {
-					if err := w.openTool(acc); err != nil {
-						return err
-					}
-				}
+			args = asString(fn["arguments"])
+		}
+		if args != "" {
+			acc.args.WriteString(args)
+		}
+		// ponytail: 无名调用不是合法 Responses item——先攒着，等名字到了再宣告，
+		// 宣告时把已攒参数作为整段 delta 一次性发出（relaykit 同款）。
+		if !acc.opened {
+			if acc.name == "" {
+				continue
+			}
+			if err := w.openTool(acc); err != nil {
+				return err
+			}
+			if acc.args.Len() > 0 {
 				if err := w.emit("response.function_call_arguments.delta", map[string]any{
 					"item_id":      acc.id,
 					"output_index": acc.outIdx,
-					"delta":        a,
+					"delta":        acc.args.String(),
 				}); err != nil {
 					return err
 				}
-				continue
 			}
+			continue
 		}
-		if !acc.opened {
-			if err := w.openTool(acc); err != nil {
+		if args != "" {
+			if err := w.emit("response.function_call_arguments.delta", map[string]any{
+				"item_id":      acc.id,
+				"output_index": acc.outIdx,
+				"delta":        args,
+			}); err != nil {
 				return err
 			}
 		}
@@ -703,12 +774,21 @@ func (w *responsesWriter) closeOpenItems() error {
 	}
 	for _, idx := range w.x.toolOrder {
 		acc := w.x.tools[idx]
-		if acc == nil || acc.closed {
-			continue
+		if acc == nil || acc.closed || acc.name == "" {
+			continue // 无名调用不是合法 item，丢弃
 		}
 		if !acc.opened {
 			if err := w.openTool(acc); err != nil {
 				return err
+			}
+			if acc.args.Len() > 0 {
+				if err := w.emit("response.function_call_arguments.delta", map[string]any{
+					"item_id":      acc.id,
+					"output_index": acc.outIdx,
+					"delta":        acc.args.String(),
+				}); err != nil {
+					return err
+				}
 			}
 		}
 		if err := w.emit("response.function_call_arguments.done", map[string]any{
@@ -721,7 +801,7 @@ func (w *responsesWriter) closeOpenItems() error {
 		item := map[string]any{
 			"id":        acc.id,
 			"type":      "function_call",
-			"status":    "completed",
+			"status":    w.itemStatus(),
 			"call_id":   acc.id,
 			"name":      acc.name,
 			"arguments": acc.args.String(),
@@ -742,19 +822,30 @@ func (w *responsesWriter) closeReasoning() error {
 	if !w.x.reasoningOpen {
 		return nil
 	}
-	if err := w.emit("response.reasoning_text.done", map[string]any{
+	text := w.x.reasoningText.String()
+	if err := w.emit("response.reasoning_summary_text.done", map[string]any{
 		"item_id":       w.x.reasoningID,
 		"output_index":  w.x.reasoningIdx,
-		"content_index": 0,
-		"text":          w.x.reasoningText.String(),
+		"summary_index": 0,
+		"text":          text,
 	}); err != nil {
 		return err
 	}
+	if err := w.emit("response.reasoning_summary_part.done", map[string]any{
+		"item_id":       w.x.reasoningID,
+		"output_index":  w.x.reasoningIdx,
+		"summary_index": 0,
+		"part":          map[string]any{"type": "summary_text", "text": text},
+	}); err != nil {
+		return err
+	}
+	// ponytail: Codex 消费 summary 事件族；聊天上游的 reasoning_content 无
+	// 「摘要 vs 原文」之分，统一作为 summary 下发（relaykit 同款）。
 	item := map[string]any{
 		"id":      w.x.reasoningID,
 		"type":    "reasoning",
-		"summary": []any{},
-		"content": []any{map[string]any{"type": "reasoning_text", "text": w.x.reasoningText.String()}},
+		"status":  w.itemStatus(),
+		"summary": []any{map[string]any{"type": "summary_text", "text": text}},
 	}
 	if err := w.emit("response.output_item.done", map[string]any{
 		"output_index": w.x.reasoningIdx,
@@ -792,7 +883,7 @@ func (w *responsesWriter) closeMessage() error {
 	item := map[string]any{
 		"id":     w.x.msgID,
 		"type":   "message",
-		"status": "completed",
+		"status": w.itemStatus(),
 		"role":   "assistant",
 		"content": []any{
 			map[string]any{"type": "output_text", "text": w.x.messageText.String()},
@@ -814,17 +905,25 @@ func (w *responsesWriter) emitCompleted() error {
 		return nil
 	}
 	w.x.completed = true
+	typ, status := "response.completed", "completed"
+	if w.x.status == "incomplete" {
+		typ, status = "response.incomplete", "incomplete"
+	}
 	resp := map[string]any{
-		"id":     respID(w.x.id),
-		"object": "response",
-		"status": "completed",
-		"model":  w.x.model,
-		"output": w.x.output,
+		"id":         respID(w.x.id),
+		"object":     "response",
+		"status":     status,
+		"created_at": w.x.createdAt,
+		"model":      w.x.model,
+		"output":     w.x.output,
+	}
+	if w.x.incompleteDetails != nil {
+		resp["incomplete_details"] = w.x.incompleteDetails
 	}
 	if w.x.usage != nil {
 		resp["usage"] = convertUsage(w.x.usage)
 	}
-	return w.emit("response.completed", map[string]any{"response": resp})
+	return w.emit(typ, map[string]any{"response": resp})
 }
 
 func (w *responsesWriter) emitFailed(errObj any) error {
@@ -850,6 +949,9 @@ func (w *responsesWriter) emit(typ string, payload map[string]any) error {
 		payload = map[string]any{}
 	}
 	payload["type"] = typ
+	// ponytail: 当前 Responses wire 契约要求每个事件带递增 sequence_number（Codex 会读）。
+	payload["sequence_number"] = w.x.seq
+	w.x.seq++
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err

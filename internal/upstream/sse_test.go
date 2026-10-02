@@ -20,6 +20,7 @@ func TestSOLOStreamErrorKind(t *testing.T) {
 		{4001, "", ErrNone},                      // 参数非法 → 不罚号
 		{4003, "model config is empty", ErrNone}, // 模型问题 → 不罚号
 		{4008, "", ErrSoftRate},
+		{4011, "your requests have exceeded the rate limit", ErrNone}, // 通道级限流：不罚号（同一账号另一条通道还能用）
 		{4000, "quota exceeded", ErrSoftRate},
 		{0, "rate limited", ErrSoftRate},
 		{401, "", ErrSessionDead},
