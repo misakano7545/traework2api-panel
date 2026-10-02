@@ -190,8 +190,10 @@ function renderAccounts(list) {
     if (!a.disabled && a.checkin_cooling) {
       st.push(tag('warn', '签到冷却', a.checkin_reason || '签到失败，已暂停自动签到'));
     }
-    const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '">签到</button>',
-      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>'];
+    // 国际版（trae.ai）没有签到/积分接口（实测两域全 404）：按钮置灰 + 提示，点了只会得到同一句解释。
+    const intlOff = a.realm === 'intl' ? ' disabled title="国际版无签到"' : '';
+    const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '"' + intlOff + '>签到</button>',
+      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '"' + intlOff + '>刷新</button>'];
     if (a.cooling) acts.push('<button class="xs" data-a="clear-cooldown" data-u="' + esc(a.uid) + '">解除冷却</button>');
     if (a.disabled) acts.push('<button class="xs" data-a="enable" data-u="' + esc(a.uid) + '">启用</button>');
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
