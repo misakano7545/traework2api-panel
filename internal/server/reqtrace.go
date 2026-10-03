@@ -2,9 +2,13 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"traework2api/internal/reqlog"
@@ -154,6 +158,35 @@ func (t *traceWriter) Flush() {
 // Unwrap 让 http.ResponseController 能穿透这层包装（Go 1.20+）。
 func (t *traceWriter) Unwrap() http.ResponseWriter { return t.ResponseWriter }
 
+// chatSeq 对话流水行的序号（只用于面板里一眼数得清第几条）。
+var chatSeq atomic.Uint64
+
+// logChatRow 每个对话请求往标准日志打一行流水。
+//
+// 为什么要这一行：面板「运行日志」页的「对话」频道是日志环按前缀归类的（见
+// panel/ring.go 的 classifyLine），而此前只有**出错**才打 chat_stream 行——成功请求在
+// 运行日志里完全看不见，用户报「请求不会记录在运行日志里面」就是这个。
+// 前缀用 "| #"（与 WB 面板的表格行同一前缀），ring 据此归到「对话」。
+//
+// 字段都是面板已经展示的同一批：不发请求体、不发凭证、不发上游原始响应。
+// withSource 关闭时不追加 src/ua（与请求归档同一个开关，见 logging.request_client_info）。
+func logChatRow(tr *reqTrace, status int, outcome string, dur time.Duration, withSource bool) {
+	tok, credit := "-", "-"
+	if n := tr.PromptTokens + tr.CompletionTokens; n > 0 {
+		tok = strconv.FormatInt(n, 10)
+	}
+	if tr.HasCredit {
+		credit = strconv.FormatFloat(tr.Credit, 'f', 4, 64)
+	}
+	src := ""
+	if withSource {
+		src = fmt.Sprintf(" | src=%s ua=%q", tr.ClientIP, tr.UA)
+	}
+	log.Printf("| #%03d | %s | %s | %s | %d | tok=%s | credit=%s | dur=%s | rid=%s | out=%s%s",
+		chatSeq.Add(1), tr.Start.Format("15:04:05"), tr.Model, tr.Account, status,
+		tok, credit, dur.Round(time.Millisecond), tr.ID, outcome, src)
+}
+
 // ServeHTTP 在有记录器时给对话路径套追踪，其余路径原样透传。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec, clientInfo := h.cfg.RequestLog, h.traceClientInfo()
@@ -198,6 +231,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ClientIP:         tr.ClientIP,
 		UserAgent:        tr.UA,
 	})
+	// 运行日志的「对话」频道（面板「运行日志」页）：归档开关关着也要打，这行是内存日志。
+	logChatRow(tr, status, outcome, time.Since(tr.Start), clientInfo)
 }
 
 // traceClientInfo 读「记录调用来源」开关（热改，每次请求现读）。

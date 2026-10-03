@@ -735,9 +735,6 @@ func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
 // ok 以「上游是否给了 usage」为准：流内 error 事件（如 1005）响应体正常写完、
 // 函数返回 nil，只有 token_usage 才证明这次真的产出了回复。
 func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstreamUsage map[string]any, tr *reqTrace) {
-	if h.cfg.Usage == nil {
-		return
-	}
 	// 延迟下界 1ms：本地极快响应算 TPS 时不能除以 0。
 	latencyMs := time.Since(started).Milliseconds()
 	if latencyMs < 1 {
@@ -761,11 +758,17 @@ func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstr
 	if ch, has := numField(upstreamUsage, "cache_read_input_tokens"); has {
 		d.CacheHitTokens, d.HasCacheHit = ch, true
 	}
-	h.cfg.Usage.Add(time.Now(), uid, model, d, ok)
 	// 请求记录（面板「运行日志」页的请求表）与用量台账吃同一个 Delta：token/积分/缓存命中
 	// 在这里一次性带上，避免两处各算一遍再对不上。失败尝试同样带 token（上游有时在错误
 	// 响应里也回了 usage），积分则由单价估算——和台账的「积分≈」是同一套口径。
+	//
+	// 先喂请求记录、再写台账：台账 recorder 为 nil（未接用量）时请求记录仍要有 token，
+	// 否则这两件事被隐式绑在一起——「没用量台账」会顺带让运行日志的请求行也变成 tok=-。
 	tr.addUsage(model, d)
+	if h.cfg.Usage == nil {
+		return
+	}
+	h.cfg.Usage.Add(time.Now(), uid, model, d, ok)
 }
 
 // usageOf 取聚合响应里的 usage（上游没给时为 nil，不伪造）。

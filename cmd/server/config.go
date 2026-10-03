@@ -163,6 +163,9 @@ func Default() *Config {
 	// ParseBody 的结果不一致，RestartFields 每次保存都误报一条「需重启」。
 	c.Logging.RequestArchiveRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 64
+	// 记录调用来源（IP/UA）缺省开：与同族的 workbuddy2api-panel 一致（那边也是显式 true）。
+	// 「显式 false 才关闭」靠这里赋值实现——JSON 里键缺席时字段保留本值，写 false 则覆盖。
+	c.Logging.RequestClientInfo = true
 	return c
 }
 

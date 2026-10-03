@@ -224,3 +224,31 @@ func writeTempConfig(t *testing.T, body string) string {
 	}
 	return fp
 }
+
+// TestRequestClientInfoDefaultOn 「记录调用来源」缺省开，与同族的 workbuddy2api-panel 一致。
+// 两仓默认值相反时行为会莫名其妙地不同（同一份逻辑，一边有 src/ua 一边没有），用户直接
+// 报过「请求记录不会取来源 IP 和 User-Agent」。这条同时钉住语义：JSON 显式写 false 才关。
+func TestRequestClientInfoDefaultOn(t *testing.T) {
+	if !Default().Logging.RequestClientInfo {
+		t.Fatal("Default() 应缺省开启调用来源记录（对齐 WB 仓）")
+	}
+	dir := t.TempDir()
+	// 键缺席 → 保留默认 true
+	fp := filepath.Join(dir, "on.json")
+	os.WriteFile(fp, []byte(`{"listen":":9999"}`), 0o600)
+	if c, err := Load(fp); err != nil {
+		t.Fatal(err)
+	} else if !c.Logging.RequestClientInfo {
+		t.Error("JSON 里没写 logging.request_client_info 时应保留缺省 true")
+	}
+	// 显式 false → 必须被尊重（隐私开关不能被默认值悄悄覆盖）
+	fp2 := filepath.Join(dir, "off.json")
+	os.WriteFile(fp2, []byte(`{"logging":{"request_client_info":false}}`), 0o600)
+	c2, err := Load(fp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Logging.RequestClientInfo {
+		t.Error("显式 false 应关闭来源记录，不能被缺省值覆盖")
+	}
+}
