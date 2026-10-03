@@ -5,7 +5,21 @@
    WB 仓同处也是 localStorage（LS_KEY），这里对齐。
    注意副作用：面板若经公网隧道访问，这串密钥会长期留在本机浏览器里——「登出」负责清干净。 */
 const LS_KEY = 'tw2a_key', LS_THEME = 'tw2a_theme';
-let key = '';
+/* 密钥的唯一事实源 = localStorage（照 WB 仓：不设模块级缓存，用到就现读）。
+   两个存取器保留 try/catch：浏览器禁用存储时 getItem/setItem 会抛 SecurityError，
+   不能让它把每次请求带崩（原来散在各处的 try/catch 集中到这里）。
+   ponytail: 存储介质必须是 localStorage 不是 sessionStorage，见 LS_KEY 处注释。 */
+function storedKey() {
+  try { return localStorage.getItem(LS_KEY) || ''; } catch (e) { return ''; }
+}
+function saveKey(v) {
+  try { localStorage.setItem(LS_KEY, v); } catch (e) {}
+}
+function clearKey() {
+  // 两个 store 都清：修复前写进 sessionStorage 的那份遗留值也要带走，登出不留痕。
+  try { localStorage.removeItem(LS_KEY); } catch (e) {}
+  try { sessionStorage.removeItem(LS_KEY); } catch (e) {}
+}
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let cfgLoaded = null;
@@ -55,13 +69,13 @@ addEventListener('keydown', e => { if (e.key === 'Escape') navSet(false); });
 /* ── 请求 ─────────────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
-  const sent = key;                       // 本次实际发出的密钥
-  if (key) h['Authorization'] = 'Bearer ' + key;
+  const sent = storedKey();               // 本次实际发出的密钥（快照）
+  if (sent) h['Authorization'] = 'Bearer ' + sent;
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
   if (r.status === 401) {
     // 后台轮询发出时还没密钥，这次 401 回来时密钥已填好——不能把弹窗再盖上去。
-    if (sent === key) openKey();
+    if (sent === storedKey()) openKey();
     throw new Error('密钥无效或未填写');
   }
   const d = await r.json().catch(() => ({}));
@@ -101,8 +115,7 @@ function openKey() {
 async function submitKey() {
   const v = $('keyInput').value.trim();
   if (!v) return;
-  key = v;
-  try { localStorage.setItem(LS_KEY, key); } catch (e) {}
+  saveKey(v);
   try {
     await api('overview');                // 认证探测成功才关弹窗
     $('keyErr').hidden = true;
@@ -1189,7 +1202,6 @@ function start() {
 }
 
 function boot() {
-  try { key = localStorage.getItem(LS_KEY) || ''; } catch (e) {}
   applyTheme();
 
   $('btnTheme').onclick = () => {
@@ -1210,10 +1222,7 @@ function boot() {
   // 所以「登出」就是本浏览器不再保留密钥——清掉 + 重载（重载同时清掉 5s 轮询与已渲染的行）。
   $('btnLogout').onclick = () => {
     if (!confirm('登出将清除本浏览器保存的密钥；持有密钥的人仍可调用接口。确认登出？')) return;
-    // 两个 store 都清：修复前写进 sessionStorage 的那份遗留值也要带走，登出不留痕。
-    try { localStorage.removeItem(LS_KEY); } catch (e) {}
-    try { sessionStorage.removeItem(LS_KEY); } catch (e) {}
-    key = '';
+    clearKey();
     location.reload();
   };
   $('addRealm').addEventListener('click', ev => {
@@ -1394,10 +1403,7 @@ function checkinMsg(rs, accounts) {
       const d = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
       // 密钥改了：本页立刻换上新的，否则下一次轮询就 401 把钥匙门弹出来。
       const nk = cfgLoaded.api_key || '';
-      if (nk !== key) {
-        key = nk;
-        try { localStorage.setItem(LS_KEY, key); } catch (e) {}
-      }
+      if (nk !== storedKey()) saveKey(nk);
       const f = d.restart_required || [];
       $('cfgNote').textContent = f.length ? ('已保存。重启后生效：' + f.join('、')) : '已保存，全部字段已热生效。';
       toast('配置已保存', 'ok');
