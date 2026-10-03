@@ -1,8 +1,10 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-/* ponytail: 密钥放 sessionStorage（WB 用 localStorage）。面板可经公网隧道访问，
-   密钥不该跨标签页长期驻留；换票落盘后重新输入一次即可。 */
-const SS_KEY = 'tw2a_key', LS_THEME = 'tw2a_theme';
+/* 密钥放 localStorage，**不是** sessionStorage：sessionStorage 是「每标签页一份、关掉就没」，
+   于是每次重开面板都要重输一次——这正是「前端无法本地存储 api_key」的根因。
+   WB 仓同处也是 localStorage（LS_KEY），这里对齐。
+   注意副作用：面板若经公网隧道访问，这串密钥会长期留在本机浏览器里——「登出」负责清干净。 */
+const LS_KEY = 'tw2a_key', LS_THEME = 'tw2a_theme';
 let key = '';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
@@ -100,7 +102,7 @@ async function submitKey() {
   const v = $('keyInput').value.trim();
   if (!v) return;
   key = v;
-  try { sessionStorage.setItem(SS_KEY, key); } catch (e) {}
+  try { localStorage.setItem(LS_KEY, key); } catch (e) {}
   try {
     await api('overview');                // 认证探测成功才关弹窗
     $('keyErr').hidden = true;
@@ -1187,7 +1189,7 @@ function start() {
 }
 
 function boot() {
-  try { key = sessionStorage.getItem(SS_KEY) || ''; } catch (e) {}
+  try { key = localStorage.getItem(LS_KEY) || ''; } catch (e) {}
   applyTheme();
 
   $('btnTheme').onclick = () => {
@@ -1208,7 +1210,9 @@ function boot() {
   // 所以「登出」就是本浏览器不再保留密钥——清掉 + 重载（重载同时清掉 5s 轮询与已渲染的行）。
   $('btnLogout').onclick = () => {
     if (!confirm('登出将清除本浏览器保存的密钥；持有密钥的人仍可调用接口。确认登出？')) return;
-    try { sessionStorage.removeItem(SS_KEY); } catch (e) {}
+    // 两个 store 都清：修复前写进 sessionStorage 的那份遗留值也要带走，登出不留痕。
+    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    try { sessionStorage.removeItem(LS_KEY); } catch (e) {}
     key = '';
     location.reload();
   };
@@ -1392,7 +1396,7 @@ function checkinMsg(rs, accounts) {
       const nk = cfgLoaded.api_key || '';
       if (nk !== key) {
         key = nk;
-        try { sessionStorage.setItem(SS_KEY, key); } catch (e) {}
+        try { localStorage.setItem(LS_KEY, key); } catch (e) {}
       }
       const f = d.restart_required || [];
       $('cfgNote').textContent = f.length ? ('已保存。重启后生效：' + f.join('、')) : '已保存，全部字段已热生效。';
