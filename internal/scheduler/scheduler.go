@@ -248,9 +248,8 @@ func (s *Scheduler) byUrgency() []string {
 			continue
 		}
 		// 国际号没有签到接口（EpCheckin* 在国际域全 404），本就不该进签到队列。
-		// 不排除它的代价是三样：每小时一条「国际版没有签到/积分接口」的假报错日志、
-		// 每小时后端白发一次 404、以及面板「签到全部」把国际号算进失败列表后
-		// **整个操作回报错误**（哪怕国内号全都签成了）。积分刷新有自己的周期任务，不受影响。
+		// 这也是为了避免白发一次探询、并把它排除在「待签」计数之外——真正的兜底在
+		// CheckinUID（所有入口都汇到那里），这里挡不住面板单号按钮那条直调路径。
 		if a.Realm() == auth.RealmIntl {
 			continue
 		}
@@ -303,6 +302,19 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	a := s.cfg.Pool.AuthByUID(uid)
 	if a == nil || a.RefreshTokenValue() == "" {
 		return res, fmt.Errorf("no refresh token")
+	}
+	// 国际号：没有签到接口（国际域 EpCheckin* 全 404，2026-10-02 实测），按「上游未开」跳过，
+	// **不当失败**。守卫放这一处而不是各调用方：签到入口有三个（面板单号按钮直接调、
+	// 批量/补签扫描经 byUrgency、启动补跑），放调用方只会漏掉下一个——原先只在 byUrgency
+	// 跳过，面板单号按钮就仍回 502「国际版没有签到/积分接口」。
+	if a.Realm() == auth.RealmIntl {
+		res.Status = "skipped"
+		res.Reason = "国际版没有签到接口"
+		// 顺手刷一次余额与到期时间（国际版有 v1 积分接口），这一轮不白跑。
+		if remain, total, expire, err := s.cfg.Upstream.UserEntUsage(a); err == nil {
+			s.cfg.Pool.SetCreditsExpire(uid, remain, total, expire)
+		}
+		return res, nil
 	}
 	checkedIn, reward, enable, serr := s.cfg.Upstream.CheckinStatus(a)
 	var checkinErr error
