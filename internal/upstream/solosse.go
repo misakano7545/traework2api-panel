@@ -93,6 +93,13 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	// Work 通道立刻照常出正文。罚整个账号会让另一条通道的模型跟着躺 60 秒，所以不罚号。
 	case e.Code == 4011:
 		return ErrNone
+	// 4026 = 上下文超长（实测：dev 窗口 232768 的模型发 ~250K token 回
+	// {"code":4026,"message":"We're sorry, your context length has exceeded the maximum limit."}）。
+	// 这是**调用方**的问题，不是账号的：老口径靠下面那条 "exceeded" 子串把它归成 ErrSoftRate，
+	// 于是一个客户端发超长 prompt 就给好号上软冷却（60s 起、指数到 2h）；它一重试，
+	// 轮转过的每个号都跟着躺下，几次就能把整池冻住。放在 4008/quota 之前，别被 "exceeded" 抢走。
+	case e.Code == 4026 || strings.Contains(lower, "context length"):
+		return ErrNone
 	case e.Code == 4008 || strings.Contains(lower, "quota") ||
 		strings.Contains(lower, "exceeded") || strings.Contains(lower, "rate"):
 		return ErrSoftRate

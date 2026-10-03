@@ -21,6 +21,10 @@ func TestSOLOStreamErrorKind(t *testing.T) {
 		{4003, "model config is empty", ErrNone}, // 模型问题 → 不罚号
 		{4008, "", ErrSoftRate},
 		{4011, "your requests have exceeded the rate limit", ErrNone}, // 通道级限流：不罚号（同一账号另一条通道还能用）
+		// 上下文超长是调用方的问题：实测原文见 Kind() 里的注释。它带 "exceeded"，
+		// 必须排在 quota/exceeded 那条之前，否则会给好号上软冷却。
+		{4026, "We're sorry, your context length has exceeded the maximum limit.", ErrNone},
+		{4026, "", ErrNone},
 		{4000, "quota exceeded", ErrSoftRate},
 		{0, "rate limited", ErrSoftRate},
 		{401, "", ErrSessionDead},
