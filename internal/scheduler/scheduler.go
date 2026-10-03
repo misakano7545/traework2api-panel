@@ -247,6 +247,13 @@ func (s *Scheduler) byUrgency() []string {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 国际号没有签到接口（EpCheckin* 在国际域全 404），本就不该进签到队列。
+		// 不排除它的代价是三样：每小时一条「国际版没有签到/积分接口」的假报错日志、
+		// 每小时后端白发一次 404、以及面板「签到全部」把国际号算进失败列表后
+		// **整个操作回报错误**（哪怕国内号全都签成了）。积分刷新有自己的周期任务，不受影响。
+		if a.Realm() == auth.RealmIntl {
+			continue
+		}
 		expire := int64(0)
 		if remain, total, exp, err := s.cfg.Upstream.UserEntUsage(a); err == nil {
 			expire = exp

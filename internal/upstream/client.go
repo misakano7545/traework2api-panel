@@ -520,6 +520,14 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 	return nil
 }
 
+// entUsageBody 积分接口请求体。用**客户端自己的形状**，不是空体：
+// 客户端自带 SDK（`GetIdeUserEntUsageV2`）发的是 {require_usage, req_source, full_data, Request}，
+// 调用点默认 {require_usage:true, full_data:true}（NextAgentX/trae-workbuddy-switch 从客户端
+// 缓存里翻出的原文）。实测本机账号上 `{}` 与这个体返回的 pack 列表完全一致，所以这是去掉
+// 一个潜在失败模式（服务端若哪天把 full_data 默认成 false，`{}` 会拿不到完整 pack 列表）
+// 而非修 bug —— 值不值得改就看这一点。
+const entUsageBody = `{"require_usage":true,"full_data":true}`
+
 // entUsagePath 积分接口路径：国际版只提供 v1（v2 在 api-sg-central 上恒 404）。
 func entUsagePath(a *auth.Auth) string {
 	if a != nil && a.Realm() == auth.RealmIntl {
@@ -584,7 +592,7 @@ func packExpiry(p entUsagePack) int64 {
 //
 // 国际版走 v1 路径 + 计费网关（见 entUsagePath / ugBaseFor）。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+entUsagePath(a), bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+entUsagePath(a), bytes.NewReader([]byte(entUsageBody)))
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -660,7 +668,7 @@ type CreditPackage struct {
 // `Free plan`（credits_limit=0）→ 返回空列表 + 0/0，面板据此显示「无积分套餐」，
 // 而不是把国际号整条当成接口不可用。
 func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+entUsagePath(a), bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+entUsagePath(a), bytes.NewReader([]byte(entUsageBody)))
 	if err != nil {
 		return nil, 0, 0, err
 	}

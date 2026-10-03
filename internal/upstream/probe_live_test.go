@@ -596,3 +596,58 @@ func TestProbeLiveVersionCode(t *testing.T) {
 	}
 	fmt.Printf("  HTTP %d，流开头: %s\n", status, truncate(strings.Join(strings.Fields(string(head)), " "), 200))
 }
+
+// TestProbeLiveDeviceHeader 只读探针：status 接口到底校不校 X-Device-Id？
+//
+// 起因：技能里记着「缺 X-Device-Id → status 直接 9004」（源自 Coding2API 的观测），
+// 而「9074 换设备号重试」这条对策正建立在此之上。2026-10-03 实测（两个国内号都已签到，
+// 只查 status、不 claim、不花积分）：**派生号与完全不带该头都是 200 checked_in=true**
+// ——即 status 侧根本不校验设备号。所以「9004 缺设备号」至少对 status 不成立，别照它排查；
+// claim 侧没验（已签账号的 claim 幂等回 0，探不出设备号是否有别）。
+//
+// 手动跑：TW2A_PROBE_DEVICE_HDR=1 go test ./internal/upstream -run TestProbeLiveDeviceHeader -v
+func TestProbeLiveDeviceHeader(t *testing.T) {
+	if os.Getenv("TW2A_PROBE_DEVICE_HDR") == "" {
+		t.Skip("置 TW2A_PROBE_DEVICE_HDR=1 才跑（需要真实凭据与网络）")
+	}
+	as, err := auth.LoadDir("../../auths")
+	if err != nil || len(as) == 0 {
+		t.Fatalf("加载账号失败: %v", err)
+	}
+	var a *auth.Auth
+	for _, cand := range as {
+		if cand.Realm() == auth.RealmCN {
+			a = cand
+			break
+		}
+	}
+	if a == nil {
+		t.Fatal("没有国内版账号")
+	}
+	c := New()
+	for _, tc := range []struct {
+		label string
+		strip bool
+	}{
+		{"派生号（现状）", false},
+		{"不带 X-Device-Id（对照组）", true},
+	} {
+		req, rerr := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		UgHeaders(req, a)
+		if tc.strip {
+			req.Header.Del("X-Device-Id")
+		}
+		data, derr := c.doJSON(req)
+		if derr != nil {
+			fmt.Printf("  %-26s -> 错误 %v\n", tc.label, derr)
+			continue
+		}
+		var m map[string]any
+		_ = json.Unmarshal(data, &m)
+		fmt.Printf("  %-26s -> 200 checked_in=%v enable=%v code=%v\n",
+			tc.label, m["checked_in"], m["enable"], m["code"])
+	}
+}
