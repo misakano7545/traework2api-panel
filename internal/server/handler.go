@@ -540,9 +540,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		tried[acct.UID] = true
 		if tr := traceFrom(r); tr != nil && tr.Account == "" {
-			tr.Account = acct.UID
+			tr.Account = accountLabel(acct.UID, acct.Nickname)
 		}
-		done, err := h.attempt(w, acct, body, peek, sessKey)
+		done, err := h.attempt(w, acct, body, peek, sessKey, traceFrom(r))
 		release()
 		if done {
 			return
@@ -598,7 +598,7 @@ func (h *Handler) acquireAccount(tried map[string]bool, sessKey, realm string) (
 //
 // done=true 表示响应已写给客户端，调用方必须停止轮转；err 非 nil 表示这次尝试失败、
 // 可以换下一个号（错误只用于最终 503 的说明文案）。
-func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, peek chatRequest, sessKey string) (bool, error) {
+func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, peek chatRequest, sessKey string, tr *reqTrace) (bool, error) {
 	refreshed, err := h.cfg.Upstream.RefreshTokenIfNeeded(acct, h.cfg.RefreshSkew)
 	if err != nil {
 		var ue *upstream.Error
@@ -621,13 +621,13 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 	attemptStart := time.Now()
 	rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
 	if terr != nil {
-		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 		h.cfg.Pool.NoteError(acct.UID)
 		return false, terr
 	}
 	if status >= 400 {
 		kind := upstream.Classify(status, string(respBody))
-		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 		h.noteFailure(acct.UID, kind)
 		return false, &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 	}
@@ -648,13 +648,13 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 		// 换号重试比把空回复当成功更合适（照 Trae2api-cn 的「首事件前空响应可重试」）。
 		// 注意不能算 NoteError：空转不是账号故障，罚它会白白把好号熔断掉。
 		if errors.Is(serr, upstream.ErrEmptyStream) {
-			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 			return false, serr
 		}
 		// 流内 error 事件走 onErr 回调后本函数仍返回 nil，所以「有 token_usage」才是这次
 		// 尝试真的产出了回复的判据；只看返回 err 会把 1005 记成成功。
 		ok := serr == nil && len(usg) > 0
-		h.noteUsage(acct.UID, peek.Model, attemptStart, ok, usg)
+		h.noteUsage(acct.UID, peek.Model, attemptStart, ok, usg, tr)
 		if ok {
 			h.bindSession(sessKey, acct.UID)
 		} else if sessKey != "" && h.cfg.Session != nil {
@@ -669,21 +669,21 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 		var se *upstream.SOLOStreamError
 		if errors.As(err, &se) {
 			// 流内错误与 HTTP 级错误走同一张分类表（noteFailure），避免两处口径漂移。
-			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 			h.noteFailure(acct.UID, se.Kind())
 			return false, err
 		}
 		if errors.Is(err, upstream.ErrEmptyStream) {
 			// 同上：空转可换号重试，但不算账号故障（不 NoteError）。
-			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 			return false, err
 		}
-		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 		return true, err
 	}
 	h.cfg.Pool.NoteSuccess(acct.UID)
-	h.noteUsage(acct.UID, peek.Model, attemptStart, true, usageOf(resp))
+	h.noteUsage(acct.UID, peek.Model, attemptStart, true, usageOf(resp), tr)
 	h.bindSession(sessKey, acct.UID)
 	writeJSON(w, http.StatusOK, resp)
 	return true, nil
@@ -734,7 +734,7 @@ func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
 // 但「刷新 token 失败」不记：那不是一次对话调用，记进去只会让用量虚高。
 // ok 以「上游是否给了 usage」为准：流内 error 事件（如 1005）响应体正常写完、
 // 函数返回 nil，只有 token_usage 才证明这次真的产出了回复。
-func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstreamUsage map[string]any) {
+func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstreamUsage map[string]any, tr *reqTrace) {
 	if h.cfg.Usage == nil {
 		return
 	}
@@ -762,6 +762,10 @@ func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstr
 		d.CacheHitTokens, d.HasCacheHit = ch, true
 	}
 	h.cfg.Usage.Add(time.Now(), uid, model, d, ok)
+	// 请求记录（面板「运行日志」页的请求表）与用量台账吃同一个 Delta：token/积分/缓存命中
+	// 在这里一次性带上，避免两处各算一遍再对不上。失败尝试同样带 token（上游有时在错误
+	// 响应里也回了 usage），积分则由单价估算——和台账的「积分≈」是同一套口径。
+	tr.addUsage(model, d)
 }
 
 // usageOf 取聚合响应里的 usage（上游没给时为 nil，不伪造）。

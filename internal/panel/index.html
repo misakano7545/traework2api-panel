@@ -889,6 +889,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+        <div class="box">
+          <header><h3>日志</h3></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
+              <input type="checkbox" name="request_client_info"></div>
+            <div class="hint">开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；
+              关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。</div>
+            <div class="hint" style="margin-top:8px">归档开关、保留天数与容量上限（<code>logging.request_archive_*</code>）需手工编辑配置文件。</div>
+          </div>
+        </div>
+
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>
@@ -993,6 +1004,46 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
+<div class="box">
+        <header>
+          <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="reqNote">—</span>
+        </header>
+        <!-- reqStats：指标行容器（renderRequestMetrics 写入）。合并 #87 时新排版丢了它，
+             而 loadLogs 里的 renderRequestMetrics 仍写这个 id —— 元素缺失时抛错被
+             loadLogs 的 try/catch 吞掉，整块运行日志渲染不出来（只有它这一个 id 悬空）。 -->
+        <div class="stats" id="reqStats"></div>
+        <div class="fbar" id="reqFilter">
+          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
+          <select id="reqOutcome" aria-label="按结果筛选">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="http_error">HTTP 错误</option>
+            <option value="stream_error">流错误</option>
+            <option value="interrupted">中断</option>
+          </select>
+          <span class="trange" id="reqRange"></span>
+          <select id="reqLimit" aria-label="读取条数">
+            <option value="100" selected>最近 100 条</option>
+            <option value="300">最近 300 条</option>
+            <option value="1000">最近 1000 条</option>
+          </select>
+          <span class="grow"></span>
+          <span class="note" id="reqCount">—</span>
+          <button class="xs" id="btnReqReload">重新读取</button>
+        </div>
+        <div class="tbl-wrap req-wrap">
+          <table class="acc req">
+            <thead><tr>
+              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
+              <th>来源 IP</th><th>User-Agent</th>
+              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
+            </tr></thead>
+            <tbody id="reqBody"></tbody>
+          </table>
+        </div>
+      </div>
       <div class="box">
         <header>
           <h3>运行日志</h3>

@@ -582,6 +582,11 @@ func readFile(path string, filter Filter) ([]Event, error) {
 	return out, scanner.Err()
 }
 
+// Match 报告一条事件是否命中筛选条件。归档读盘内部用 match；面板在「归档关闭、
+// 回落到进程内最近事件」那条路径上要用同一套判据，否则同一组筛选条件在开/关归档时
+// 会给出不同结果。
+func (f Filter) Match(e Event) bool { return f.match(e) }
+
 func (f Filter) match(e Event) bool {
 	if f.Outcome != "" && e.Outcome != f.Outcome {
 		return false

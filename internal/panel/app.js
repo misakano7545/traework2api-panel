@@ -383,22 +383,343 @@ async function loadModels() {
   }
 }
 
+/* ── 时间范围控件 + 请求记录（抄自 WorkBuddy 面板，逐字对齐）───────────────────
+   搬的是整块：请求记录卡（指标行 + 筛选栏 + 10 列表）+ 时间范围控件。两仓的 CSS 同源
+   （WB 那 344 条选择器本仓全有），所以 HTML/类名可以原样用，不需要配样式。
+   数据侧本仓已就绪：/panel/api/request_logs 返回 metrics+entries，筛选参数与归档读盘
+   共用 reqlog.Filter（见 internal/panel/panel.go）。 */
+/* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────────
+   预设项：今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义。
+
+   为什么区间一律由前端算好再发：
+     - 「今天」必须是**浏览器本地时区**的 00:00 起。服务端时区未必与浏览器一致
+       （容器常挂 TZ=Asia/Shanghai，而浏览器可能在任何时区），让服务端算"今天"
+       会在跨时区时切错日子。
+     - 「自定义」本来就是用户挑的具体时刻，没有任何服务端推导空间。
+
+   滚动预设（近 N 小时/天）则保留 hours 参数：服务端按整点对齐的滚动窗口与旧
+   行为逐位一致，前端自己减 N 小时会多算/少算一个边界桶。 */
+const TRANGE_PRESETS = [
+  ['today', '今天'],
+  ['24', '近 24 小时'],
+  ['72', '近 3 天'],
+  ['168', '近 7 天'],
+  ['720', '近 30 天'],
+  ['0', '全部历史'],
+  ['custom', '自定义…'],
+];
+const TRANGE_DEFAULT = '72';
+const trangeStates = new Map(); // hostId → { preset, from: Date|null, to: Date|null }
+
+// dtLocalValue / dtLocalParse 与 <input type=datetime-local> 的取值格式互转
+// （YYYY-MM-DDTHH:mm，本地时区；ES 里"带时间的日期串"按本地解析，正是我们要的）。
+function dtLocalValue(d) {
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function dtLocalParse(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// trangeMidnight 今天 00:00（本地时区）。
+function trangeMidnight() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function trangeState(id) {
+  if (!trangeStates.has(id)) {
+    // 「自定义」的初始值给一段有意义的默认：今天 00:00 → 现在。
+    trangeStates.set(id, { preset: TRANGE_DEFAULT, from: trangeMidnight(), to: new Date() });
+  }
+  return trangeStates.get(id);
+}
+
+// trangeRender 画出控件骨架（幂等：重复调用会保留当前状态）。
+function trangeRender(id) {
+  const host = $(id);
+  if (!host) return;
+  const st = trangeState(id);
+  const custom = st.preset === 'custom';
+  host.innerHTML =
+    '<select class="tr-preset" aria-label="时间范围">' +
+    TRANGE_PRESETS.map(([v, label]) =>
+      '<option value="' + v + '"' + (v === st.preset ? ' selected' : '') + '>' + esc(label) + '</option>').join('') +
+    '</select>' +
+    '<span class="tr-custom"' + (custom ? '' : ' hidden') + '>' +
+    '<input type="datetime-local" class="tr-from" value="' + esc(st.from ? dtLocalValue(st.from) : '') + '" aria-label="起始时间">' +
+    '<span class="tr-sep">→</span>' +
+    '<input type="datetime-local" class="tr-to" value="' + esc(st.to ? dtLocalValue(st.to) : '') + '" aria-label="结束时间">' +
+    '</span>';
+  const preset = host.querySelector('.tr-preset');
+  if (preset) preset.onchange = () => {
+    st.preset = preset.value;
+    // 从别的预设切到自定义时，把区间重置为"今天 00:00 → 现在"，
+    // 免得用户上次留下的半年区间被无声沿用。
+    if (st.preset === 'custom' && (!st.from || !st.to)) { st.from = trangeMidnight(); st.to = new Date(); }
+    trangeRender(id);
+    trangeEmit(id);
+  };
+  const fromEl = host.querySelector('.tr-from');
+  const toEl = host.querySelector('.tr-to');
+  const readCustom = () => {
+    st.from = dtLocalParse(fromEl.value);
+    st.to = dtLocalParse(toEl.value);
+    // 起止颠倒就地标红（不静默纠正：用户可能正输到一半）。
+    const bad = st.from && st.to && st.from > st.to;
+    fromEl.classList.toggle('tr-bad', !!bad);
+    toEl.classList.toggle('tr-bad', !!bad);
+    if (bad) return;
+    trangeEmit(id);
+  };
+  if (fromEl) fromEl.onchange = readCustom;
+  if (toEl) toEl.onchange = readCustom;
+}
+
+const trangeHandlers = new Map();
+// trangeBind 渲染控件并登记变化回调。**不**在绑定时触发回调：各视图的首次加载
+// 由 go() 统一驱动，这里再触发一次会让打开页面时打两遍接口。
+function trangeBind(id, onChange, preset) {
+  trangeHandlers.set(id, onChange);
+  if (preset) trangeState(id).preset = preset;
+  trangeRender(id);
+}
+function trangeEmit(id) {
+  const fn = trangeHandlers.get(id);
+  if (fn) fn();
+}
+
+// trangeQuery 把当前选择翻译成查询参数。
+//   rolling=true  → 滚动预设发 hours（服务端整点对齐），今天/自定义发 from/to
+//   rolling=false → 一律发 from/to（归档是线性日志，前端算区间更直观）
+// 「全部历史」两者都不发。
+function trangeQuery(id, rolling) {
+  const st = trangeState(id);
+  const q = new URLSearchParams();
+  const sec = d => Math.floor(d.getTime() / 1000);
+  if (st.preset === 'custom') {
+    if (st.from) q.set('from', sec(st.from));
+    if (st.to) q.set('to', sec(st.to));
+    return q;
+  }
+  if (st.preset === 'today') {
+    q.set('from', sec(trangeMidnight()));
+    return q;
+  }
+  if (st.preset === '0') return q;
+  if (rolling) { q.set('hours', st.preset); return q; }
+  q.set('from', sec(new Date(Date.now() - Number(st.preset) * 3600 * 1000)));
+  return q;
+}
+
+// trangeLabel 人读口径，用于「用量总览」右上角这类需要回显区间的位置。
+function trangeLabel(id) {
+  const st = trangeState(id);
+  const found = TRANGE_PRESETS.find(p => p[0] === st.preset);
+  if (st.preset !== 'custom') return found ? found[1] : '';
+  if (!st.from && !st.to) return '自定义';
+  const f = d => d ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') : '…';
+  return f(st.from) + ' → ' + f(st.to);
+}
+
+function fmtMs(ms) {
+  ms = Number(ms || 0);
+  if (!ms) return '—';
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + 's';
+  return Math.round(ms) + 'ms';
+}
+
+function fmtBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function trimFixed(s) {
+  if (!String(s).includes('.')) return String(s);
+  return String(s).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function cacheRateText(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '—';
+  return String(Math.round(h / total * 1000) / 10) + '%';
+}
+
+function usStat(v, k, cls) {
+  return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
+         '</div><div class="k">' + esc(k) + '</div></div>';
+}
+
+function renderRequestMetrics(m, entries) {
+  m = m || {};
+  const a = m.archive || {};
+  $('reqStats').innerHTML =
+    usStat(fmtTok(m.completed), '已完成') +
+    usStat(m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%', '完成成功率') +
+    usStat(m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%', 'HTTP 成功率') +
+    usStat(fmtMs(m.avg_duration_ms), '平均耗时') +
+    usStat(String(m.in_flight || 0), '进行中') +
+    usStat(fmtTok(a.files), '归档文件');
+  $('reqNote').textContent = a.enabled
+    ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
+      (a.last_error ? ' · 错误：' + a.last_error : '')
+    : '仅内存指标，JSONL 归档已关闭';
+
+  reqEntries = entries || [];
+  renderRequestTable();
+}
+
+function reqMatch(e, f) {
+  f = f || reqFilter;
+  if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
+  if (f.q) {
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+      .filter(Boolean).join(' ').toLowerCase();
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  return true;
+}
+
+function reqOutcomeTag(e) {
+  const outcome = String(e && e.outcome || '');
+  const label = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' }[outcome] || outcome || '—';
+  const cls = outcome === 'success' ? 'ok'
+    : outcome === 'interrupted' ? 'warn'
+    : outcome ? 'bad' : 'mute';
+  return '<span class="tag ' + cls + '">' + esc(String(e && e.status || '—') + ' ' + label) + '</span>';
+}
+
+function reqTokenCell(e) {
+  const total = Number(e && e.total_tokens || 0) ||
+    (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+  return total ? fmtTok(total) : '—';
+}
+
+function reqCreditCell(e) {
+  if (!e || !e.credit_known) return '<span class="muted">—</span>';
+  const v = Number(e.credit);
+  return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
+}
+
+function renderRequestTable() {
+  const list = reqEntries.filter(e => reqMatch(e));
+  const tb = $('reqBody');
+  if (!tb) return;
+  tb.innerHTML = list.map(e => {
+    const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+    const ip = e && e.client_ip ? e.client_ip : '';
+    const ua = e && e.user_agent ? e.user_agent : '';
+    const rid = e && e.request_id ? e.request_id : '';
+    return '<tr title="' + esc(requestLogText(e)) + '">' +
+      '<td class="num">' + esc(when) + '</td>' +
+      '<td>' + reqOutcomeTag(e) + '</td>' +
+      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
+      '<td class="num">' + reqTokenCell(e) + '</td>' +
+      '<td class="num">' + reqCreditCell(e) + '</td>' +
+      '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="10" class="empty">' +
+      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
+
+  const filtered = list.length !== reqEntries.length;
+  // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
+  // 而不是让人以为筛选坏了。
+  const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
+  $('reqCount').textContent = !reqEntries.length ? ''
+    : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
+      (hasSource ? '' : ' · 来源未记录');
+  $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+}
+
+function requestLogText(e) {
+  const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
+  const token = Number(e && e.total_tokens || 0) ||
+    (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+  let credit = 'credit —';
+  if (e && e.credit_known) {
+    const value = Number(e.credit);
+    if (Number.isFinite(value)) credit = String(Number(value.toFixed(2))) + ' credit';
+  }
+  return [
+    when,
+    String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
+    e && e.model || '—',
+    e && e.account || '—',
+    e && e.client_ip || '—',
+    e && e.user_agent || '—',
+    fmtMs(e && e.duration_ms),
+    fmtTok(token) + ' tok',
+    credit,
+    cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
+    e && e.request_id || '—',
+  ].filter(Boolean).join(' | ');
+}
+
+/* 请求记录筛选控件（与 WB 同款：搜索防抖 150ms——最多 1000 行重渲染，不必每键一次）。 */
+let reqQTimer = null;
+let reqFilter = { q: '', outcome: '' };
+let reqEntries = [];
+function bindRequestLogControls() {
+  if ($('reqQ')) $('reqQ').oninput = () => {
+    clearTimeout(reqQTimer);
+    reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); renderRequestTable(); }, 150);
+  };
+  if ($('reqOutcome')) $('reqOutcome').onchange = () => {
+    reqFilter.outcome = $('reqOutcome').value;
+    renderRequestTable();
+  };
+  if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
+  if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
+  // 时间范围默认「全部历史」：请求记录的历史行为就是"取最近 N 条"，默认收窄会让
+  // 打开页面时看到的条数凭空变少。
+  if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
+}
+
 /* ── 日志（频道：全部/任务/对话/系统）─────────────────────────────── */
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  const limit = ($('reqLimit') && $('reqLimit').value) || 100;
+  // 时间范围由归档侧过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
+  // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
+  const rq = trangeQuery('reqRange', false);
+  rq.set('limit', limit);
   try {
-    const d = await api('logs');
+    const [d, requestRows] = await Promise.all([
+      api('logs'),
+      api('request_logs?' + rq.toString()).catch(() => ({ metrics: {}, entries: [] })),
+    ]);
+    // 条目一律用服务端这一次返回的 entries：本仓 /panel/api/request_logs 在归档关闭时
+    // 会**自己**回落到进程内最近事件并按同一套条件筛选（见 internal/panel/panel.go）。
+    // 与 WB 面板唯一的差别就在这里——WB 的后端在归档关闭时不回落（回空），所以它必须
+    // 自己改读 metrics.recent；本仓读了就会把筛选条件之外的请求显示出来。
+    const metrics = requestRows.metrics || {};
+    const recent = requestRows.entries || [];
+    renderRequestMetrics(metrics, recent);
     const all = d.entries || [];
     const entries = all.filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
       ? entries.map(e => {
         const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
-        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+        const ts = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
         const ch = logCh === 'all'
           ? '<i class="lch c-' + esc(e.ch) + '">' + esc({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>'
           : '';
-        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+        return '<span class="ln' + lvl + '">' + ch + esc(ts + ' ' + e.text) + '</span>';
       }).join('')
       : '<span style="color:var(--ink-3)">暂无日志</span>';
     if (logPin && atEnd) box.scrollTop = box.scrollHeight;
@@ -745,6 +1066,8 @@ const CFG_MAP = {
   // 选号
   max_in_flight: ['pool', 'max_in_flight'], idle_weight_per_hour: ['pool', 'idle_weight_per_hour'],
   idle_weight_max: ['pool', 'idle_weight_max'], expiring_soon: ['pool', 'expiring_soon'],
+  // 日志
+  request_client_info: ['logging', 'request_client_info'],
   // 会话粘性 / 提示词 / 上游
   session_sticky_enabled: ['session_sticky', 'enabled'], session_sticky_ttl: ['session_sticky', 'ttl'],
   session_sticky_gc_interval: ['session_sticky', 'gc_interval'],
@@ -797,7 +1120,8 @@ async function loadConfig() {
       const el = f.elements[name];
       if (!el) continue;
       const v = dig(cfgLoaded, path);
-      if (Array.isArray(v)) el.value = v.join(', ');
+      if (el.type === 'checkbox') el.checked = !!v;
+      else if (Array.isArray(v)) el.value = v.join(', ');
       else if (BOOL_FIELDS.includes(name)) el.value = v ? 'true' : 'false';
       else el.value = v == null ? '' : v;
     }
@@ -810,6 +1134,10 @@ function collectConfig() {
   for (const [name, path] of Object.entries(CFG_MAP)) {
     const el = f.elements[name];
     if (!el) continue;
+    // 复选框必须按 checked 提交（照 WB 面板）：el.value 恒为 "on"，用值判断会把「勾上」
+    // 也写成 false；而且不勾时 value 非空，会绕过下面「空 = 沿用现值」的判断，
+    // 于是开关永远存成 false —— 这正是 TRAE 原先没有 checkbox 分支时的坑。
+    if (el.type === 'checkbox') { put(cfgLoaded, path, !!el.checked); continue; }
     const raw = el.value.trim();
     // api_key 例外：空也要提交（清空 = 关鉴权）；其他字段留空表示"沿用现值"。
     if (name === 'api_key') { put(cfgLoaded, path, raw); continue; }
@@ -1386,6 +1714,7 @@ function checkinMsg(rs, accounts) {
     logPin = !logPin;
     $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
   };
+  bindRequestLogControls();
 
   $('cfgForm').addEventListener('input', ev => {
     if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();

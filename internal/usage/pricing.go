@@ -66,10 +66,22 @@ var measuredOverride = map[string][3]float64{
 	"doubao-seed-2.1-pro": {24.87, 124.4, 4.93},
 }
 
+// modelKey 把网关的模型标识归一成价目表的键：去空白、转小写，并剥掉 CN 域前缀。
+//
+// 为什么要剥 "cn:"：同一条请求在网关里有两种入账形态——resolveModel 之后是裸名
+// （glm-5.2），而按入站原样记录时带域前缀（cn:glm-5.2）。不归一就会出现「同一个模型
+// 一半请求有积分估算、一半没有」的错觉。**intl: 不剥**：国际版与 CN 的计费口径不同，
+// 价目表里只有人民币价，拿 CN 价去估国际版等于编数（宁可不估）。
+func modelKey(model string) string {
+	key := strings.ToLower(strings.TrimSpace(model))
+	key = strings.TrimPrefix(key, "cn:")
+	return key
+}
+
 // EffectivePrices 模型 → 积分单价 (输入, 输出, 缓存命中) / 百万 token；未收录返回 false。
 // 优先级：实测覆盖 > 刊例 × 40 × 折扣 > 刊例 × 40。
 func EffectivePrices(model string) ([3]float64, bool) {
-	key := strings.ToLower(strings.TrimSpace(model))
+	key := modelKey(model)
 	if v, ok := measuredOverride[key]; ok {
 		return v, true
 	}

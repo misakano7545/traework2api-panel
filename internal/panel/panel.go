@@ -298,16 +298,37 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	if limit > 1000 {
 		limit = 1000
 	}
+	// 筛选在服务端做（不是前端筛已拉取的条目）：时间区间落在更早的时段时，
+	// 「最近 N 条」里根本没有那些记录，只能让归档按区间取。判据与归档读盘共用
+	// reqlog.Filter，开/关归档两条路径口径一致。
+	q := r.URL.Query()
+	flt := reqlog.Filter{
+		Outcome:   q.Get("outcome"),
+		Account:   q.Get("account"),
+		Model:     q.Get("model"),
+		ClientIP:  q.Get("client_ip"),
+		UserAgent: q.Get("user_agent"),
+		From:      parseTimeParam(q.Get("from")),
+		To:        parseTimeParam(q.Get("to")),
+	}
 	snap := p.cfg.RequestLog.Snapshot()
-	entries, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{})
+	entries, err := p.cfg.RequestLog.ReadArchive(limit, flt)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	archived := len(entries) > 0
+	// archived 报的是「归档是不是这次取数的来源」（=归档开着），不是「这次取到了几条」：
+	// 带筛选条件时「区间内没有记录」是一个真实结果，按条数判断会把它错误地回落成
+	// 内存里的最近 N 条，把筛选条件之外的请求显示出来。
+	archived := snap.Archive.Enabled
 	if !archived {
-		// 归档未开（或尚无归档）：回落到进程内最近事件，倒序保持与归档一致。
-		entries = append([]reqlog.Event(nil), snap.Recent...)
+		// 归档未开：回落到进程内最近事件，同一套筛选条件照过（倒序与归档一致）。
+		entries = entries[:0]
+		for _, e := range snap.Recent {
+			if flt.Match(e) {
+				entries = append(entries, e)
+			}
+		}
 		if len(entries) > limit {
 			entries = entries[:limit]
 		}
@@ -321,6 +342,32 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		"limit":    limit,
 		"archived": archived,
 	})
+}
+
+// parseTimeParam 解析时间区间参数：unix 秒 / unix 毫秒 / RFC3339 / 本地
+// "2006-01-02T15:04"（datetime-local 的原始值）。空串或不可解析都返回零值，
+// 零值在 reqlog.Filter 里表示「不过滤这一端」。
+func parseTimeParam(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 {
+			return time.Time{}
+		}
+		if n > 1e12 {
+			return time.UnixMilli(n)
+		}
+		return time.Unix(n, 0)
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04", v, time.Local); err == nil {
+		return t
+	}
+	return time.Time{}
 }
 
 // usage 返回逐请求用量聚合。hours 查询参数控制统计窗口（默认 72，上限 1440=60 天，

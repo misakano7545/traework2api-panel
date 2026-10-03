@@ -32,6 +32,14 @@ func TestEstimateCredit(t *testing.T) {
 	if a, _ := EstimateCredit("GLM-5.2 ", 1000, 10, 0); a == 0 {
 		t.Fatal("大小写/空白应被归一化")
 	}
+	// 域前缀 cn: 要剥掉：同一条请求在网关里有裸名与带前缀两种入账形态，不归一就会出现
+	// 「同一模型一半请求有估算、一半没有」。intl: 不剥——国际版计费口径不同，宁可估不出。
+	if v, ok := EstimateCredit("cn:glm-5.2", 1_000_000, 0, 0); !ok || math.Abs(v-216) > 1e-9 {
+		t.Fatalf("cn: 前缀应与裸名同价 → %v (ok=%v)，期望 216", v, ok)
+	}
+	if _, ok := EstimateCredit("intl:glm-5.2", 1_000_000, 0, 0); ok {
+		t.Fatal("intl: 前缀不该套用人民币价目表")
+	}
 	// 未收录模型必须返回 false：宁可不显示，也不拿错单价误导。
 	if _, ok := EstimateCredit("some-unknown-model", 1e6, 0, 0); ok {
 		t.Fatal("未收录模型不该给出估算")
