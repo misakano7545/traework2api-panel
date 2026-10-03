@@ -35,7 +35,13 @@ const (
 	EpUserInfo      = "/cloudide/api/v3/trae/GetUserInfo"
 	EpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
 	EpCheckinClaim  = "/trae/api/v2/ug/checkin_credits/claim"
-	EpEntUsage      = "/trae/api/v2/pay/ide_user_ent_usage"
+	// EpEntUsage 国内版积分/套餐构成（v2）。
+	EpEntUsage = "/trae/api/v2/pay/ide_user_ent_usage"
+	// EpEntUsageIntl 国际版同一个接口的 **v1** 路径（实测 2026-10-03）：
+	//   国际域只提供 v1（`/trae/api/v2/...` 在 api-sg-central 上恒 404），
+	//   响应体与国内版同形（user_entitlement_pack_list + quota.credits_limit），
+	//   但**没有** is_credits_billing / usage_summary（那两项是 v2 独有）。
+	EpEntUsageIntl = "/trae/api/v1/pay/ide_user_ent_usage"
 )
 
 // 国际版（realm=intl，实测 2026-09-28，见 README「国际版」）：
@@ -44,9 +50,15 @@ const (
 //     `host` 参数会给（本次实测是 api-sg-central.trae.ai），落在 auth.ApiHost 上。
 //   - ClientID / AppID 与国内版相同（回调里的 userJwt 与我手上常量逐字一致）。
 //   - X-App-Version-Code 必须非空：缺了上游直接 4001 "missing required parameter"（实测）。
-//   - 签到/积分（EpCheckin*/EpEntUsage）在国际两个域上都是 404，没有对应接口。
+//   - 签到（EpCheckin*）在国际两个域上都是 404，没有对应接口。
+//   - 积分/套餐 **有** 接口，只是走 v1 路径且落在计费网关上（见 EpEntUsageIntl / UgHostIntl，
+//     实测 2026-10-03）：国际版免费号返回单条 Free plan（credits_limit=0，按美元计费），
+//     付费国际号则带 credits_limit。
 const (
 	AgentHostIntl = "https://a0ai-api-sg.byteintlapi.com"
+	// UgHostIntl 国际版的 UG/计费网关（api.trae.cn 的国际对应物）。账号的 ApiHost
+	// （登录回调 host）优先；老账号没有这个字段时回落到这里。
+	UgHostIntl = "https://api-sg-central.trae.ai"
 	// DefaultConfigNameIntl 国际版的旗舰/默认模型（别名与空 model 都落到它）。
 	DefaultConfigNameIntl = "gpt-5.2"
 	IdeVersionIntl        = "1.0.2"

@@ -26,12 +26,31 @@ package upstream
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
+
+// ErrEmptyStream 上游 200 但整条流没产出任何模型事件（无 output、无 token_usage、无 error）。
+// 这不是「模型回了空话」，而是上游空转了一次——调用方据此换号重试，而不是把空回复
+// 当成成功写回客户端（照 autumnsentiment/Trae2api-cn 的「首个模型事件前空响应可重试一次」）。
+var ErrEmptyStream = errors.New("upstream returned an empty stream")
+
+// keepaliveInterval 下游保活间隔：上游长时间只思考不出字（或大模型首字极慢）时，
+// 定期往下游写一个 SSE 注释帧，防中间盒（Cloudflare 空闲 ~100s）、客户端 idle 计时器把连接掐掉。
+//
+//	注释帧只对 chat 直通类客户端有效；codex 系按事件判活（stream_idle_timeout_ms），
+//	那种情况要靠 reasoning 事件，注释帧救不了——这里也不是为它加的。
+//
+// 15s 是「远小于任何空闲阈值、又几乎不产生流量」的取值；0 = 关闭。变量而非常量只为测试能调小。
+var keepaliveInterval = 15 * time.Second
+
+// keepaliveLine SSE 注释帧（以 ':' 开头，客户端解析器一律忽略，不占事件通道）。
+const keepaliveLine = ": keepalive\n\n"
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
 type SOLOEvent struct {
@@ -218,6 +237,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if upstreamErr != nil {
 		return nil, upstreamErr
 	}
+	// 空流：一个模型事件都没有（无 output/usage/error）→ 上游空转，交给调用方换号重试。
+	if content.Len() == 0 && reasoning.Len() == 0 && len(toolOrder) == 0 && usage == nil {
+		return nil, ErrEmptyStream
+	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	}
@@ -351,18 +374,54 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamE
 
 // streamOpts Stream 的可选参数版本。
 func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) (map[string]any, error) {
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
+	// 写出与保活分属两个 goroutine，所以所有写入（含头）走这一把锁串行化；
+	// net/http 的 ResponseWriter 不是并发安全的。
+	var (
+		wmu         sync.Mutex
+		lastWrite   = time.Now()
+		committed   bool // 已往下游写过任何字节（含注释帧）——决定空流还能不能换号重试
+		headersDone bool
+		stopped     bool // 收尾已开始：保活线程不许再写（否则注释帧会插到调用方的错误体前面）
+	)
 	fl, _ := w.(http.Flusher)
+	// 头不能在这里就地设：空流要走重试，此时一个字节都不该写给客户端，
+	// 否则 Content-Type 已经是 event-stream，调用方再写 JSON 错误就自相矛盾了。
+	ensureHeaders := func() {
+		if headersDone {
+			return
+		}
+		headersDone = true
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		h.Set("X-Accel-Buffering", "no")
+	}
+	// writeLocked 写一帧，调用方必须已持 wmu。
+	writeLocked := func(s string) error {
+		ensureHeaders()
+		if _, err := io.WriteString(w, s); err != nil {
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		lastWrite = time.Now()
+		committed = true
+		return nil
+	}
+	writeRaw := func(s string) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		return writeLocked(s)
+	}
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	var pendingUsage map[string]any
 	var lastUsage map[string]any // 已收到的最后一份 token_usage（pendingUsage 会被 writeChunk 消费掉）
 	sawDone := false
+	sawModel := false // 见过 output 事件（正文/思考/工具任一）
 	st := &sseState{}
 	writeChunk := func(delta map[string]any, finish string) error {
 		chunk := map[string]any{
@@ -386,22 +445,54 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			pendingUsage = nil
 		}
 		raw, _ := json.Marshal(chunk)
-		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
-			return err
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return writeRaw("data: " + string(raw) + "\n\n")
 	}
 	writeDONE := func() error {
-		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-			return err
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return writeRaw("data: [DONE]\n\n")
+	}
+
+	// 保活：静默满一个间隔就往下游发一个注释帧——**首字节之前也发**。
+	// 取舍明写在注释里：发了注释帧 = 已提交响应，那条流就不能再走「空流换号重试」
+	// （见 ErrEmptyStream）。而「上游只思考不吐字」恰恰是首字节前的那段静默，
+	// 也正是最容易被中间盒掐掉的一段；真正空转的上游是**立刻**结束的，根本等不到一个间隔。
+	// 所以冲突实际不会同时命中：快速空流留给重试，长静默留给保活。
+	// 间隔在主线程读一次就定死：goroutine 里再读包级变量会与测试/热改并发（-race 可复现）。
+	kaInterval := keepaliveInterval
+	var kaStop chan struct{}
+	if kaInterval > 0 {
+		kaStop = make(chan struct{})
+		// 退出前先置 stopped 再关线程：否则最后一次 tick 可能在 streamOpts 返回之后
+		// 才落到 ResponseWriter 上（调用方接手写错误体时就成了脏帧）。
+		// 取锁保证了「要么这次写完整结束、要么根本没开始」。
+		defer func() {
+			wmu.Lock()
+			stopped = true
+			wmu.Unlock()
+			close(kaStop)
+		}()
+		go func() {
+			t := time.NewTicker(kaInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-kaStop:
+					return
+				case <-t.C:
+					// 整段持锁：与「空流判定 + 收尾」互斥，否则注释帧可能插在
+					// 调用方即将写出的 JSON 错误体前面（响应已提交，错误体就成了脏数据）。
+					wmu.Lock()
+					if stopped {
+						wmu.Unlock()
+						return
+					}
+					if time.Since(lastWrite) >= kaInterval {
+						// 写失败（客户端已断）不必上报：主循环下一次写/读会拿到同一个错误。
+						_ = writeLocked(keepaliveLine)
+					}
+					wmu.Unlock()
+				}
+			}
+		}()
 	}
 
 	for {
@@ -438,6 +529,7 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 					}
 				}
 				if len(delta) > 0 {
+					sawModel = true
 					if err := writeChunk(delta, ""); err != nil {
 						return lastUsage, err
 					}
@@ -459,7 +551,7 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 					onErr(se)
 				}
 				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
+				if err := writeRaw("event: error\n" + "data: " + jsonEscape(msg) + "\n\n"); err != nil {
 					return lastUsage, err
 				}
 				if err := writeDONE(); err != nil {
@@ -473,6 +565,17 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		}
 	}
 	if !sawDone {
+		// 空流：上游 200 但一个模型事件都没有，且我们一个字节都没写给客户端
+		// → 交给调用方换号重试（见 ErrEmptyStream）。已写过（保活注释帧也算）就只能按
+		// 现状收尾：补 [DONE]，客户端看到一次空回复。
+		// 判定与「保活线程可否再写」必须在同一把锁里定案，否则注释帧会插到错误体前面。
+		wmu.Lock()
+		empty := !sawModel && !committed && lastUsage == nil
+		stopped = true
+		wmu.Unlock()
+		if empty {
+			return nil, ErrEmptyStream
+		}
 		// 幂等兜底：上游中断（无 done）仍写 [DONE]。
 		if err := writeDONE(); err != nil {
 			return lastUsage, err

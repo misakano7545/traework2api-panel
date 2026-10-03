@@ -1,9 +1,11 @@
 // Package pool 账号池：内存索引 + 冷却/禁用/在途状态机 + state.json 持久化。
 //
-// 挑选策略（PickExcluding）：在 healthy 且未达在途上限的账号里按权重取最大者——
-//   - 权重基数 = 剩余积分（优先花掉大额余额，SPEC §4.7）；
-//   - 闲置补偿：每闲置 1 小时给 idle_weight_per_hour% 的加成，封顶 idle_weight_max%；
-//   - 快过期优先：若存在"到期时间在 expiring_soon 窗口内"的账号，只在它们之间选。
+// 挑选策略（PickExcluding）：在 healthy 且未达在途上限的账号里**加权随机抽签**——
+//   - 权重 = 1.0 基线 + 积分/最高分×10 + 闲置加成（后者封顶 idle_weight_max）；
+//   - 快过期优先：若存在"到期时间在 expiring_soon 窗口内"的账号，只在它们之间选；
+//   - 防撞号：minPickGap 内刚被选中的号不进抽签池，全被选过则退到 LRU（usedSeq 最小）。
+//
+// 抽签而不是取最大：取最大是确定性的，积分最高的号会独占全部流量（见 drawLocked 注释）。
 //
 // 两个入口，差别只在"是否占用在途名额"：PickExcluding 占（对话路径，调用方负责 Release），
 // PeekExcluding 不占（只读探询）。
@@ -16,6 +18,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,6 +99,9 @@ type entry struct {
 	inFlight int
 	// lastUsed 上次被选中时间，用于闲置补偿（不持久化：重启后视为全部闲置）。
 	lastUsed time.Time
+	// usedSeq 上次被选中时的池内单调序号（不持久化）。LRU 兜底用它而非墙钟：
+	// 同毫秒内连续选号时 lastUsed 完全相同，墙钟比较退化成恒取第一个候选。
+	usedSeq uint64
 }
 
 // Limits 池的运行期参数（面板热改，见 ApplyLimits）。
@@ -169,6 +175,18 @@ type Pool struct {
 	byUID   map[string]*entry
 	stateFp string
 	lim     Limits
+	// pickSeq 选中序号自增计数器（持锁内自增），为 entry.usedSeq 提供严格全序。
+	pickSeq uint64
+	// randInt64N 抽签随机源（nil = math/rand/v2）。见 SetRandInt64N。
+	randInt64N func(int64) int64
+}
+
+// SetRandInt64N 注入抽签随机源：返回 0 即「权重最高者中签」（改造前的取最大语义），
+// 供需要确定性选号结果的测试使用（跨包测试用得上）。传 nil 还原默认随机源。
+func (p *Pool) SetRandInt64N(f func(int64) int64) {
+	p.mu.Lock()
+	p.randInt64N = f
+	p.mu.Unlock()
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态。
@@ -283,8 +301,16 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 		return nil
 	}
 	e.inFlight++
-	e.lastUsed = time.Now()
+	p.markPickedLocked(e)
 	return e.a
+}
+
+// markPickedLocked 记一次选中（调用方持写锁）：时间戳 + 单调序号。
+// 两条都要有：lastUsed 供 minPickGap 与闲置加成，usedSeq 供同毫秒下的 LRU 兜底排序。
+func (p *Pool) markPickedLocked(e *entry) {
+	e.lastUsed = time.Now()
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 }
 
 // Peek / PeekExcluding 与 Pick 同策略，但**不占在途名额**：给只读探询用。
@@ -304,7 +330,7 @@ func (p *Pool) PickRealmExcluding(realm string, tried map[string]bool) *auth.Aut
 		return nil
 	}
 	e.inFlight++
-	e.lastUsed = time.Now()
+	p.markPickedLocked(e)
 	return e.a
 }
 
@@ -317,7 +343,7 @@ func (p *Pool) PeekExcluding(tried map[string]bool) *auth.Auth {
 	return nil
 }
 
-// pickLocked 选号策略本体（调用方持锁）：healthy + 未达在途上限 → 快过期优先 → 权重最大。
+// pickLocked 选号策略本体（调用方持锁）：healthy + 未达在途上限 → 快过期优先 → 权重加权随机。
 // pickLocked 选号。realm 非空时只在该地区的账号里挑：国际版模型国内号做不了、
 // 国内版模型国际号做不了，混着挑等于随机把请求打到一个必然 4001 的号上。
 func (p *Pool) pickLocked(tried map[string]bool, realm string) *entry {
@@ -355,37 +381,118 @@ func (p *Pool) pickLocked(tried map[string]bool, realm string) *entry {
 			cands = expiring
 		}
 	}
-
-	best := cands[0]
-	bestScore := p.score(best, now)
-	for _, e := range cands[1:] {
-		if s := p.score(e, now); s > bestScore {
-			best, bestScore = e, s
-		}
-	}
-	return best
+	return p.drawLocked(cands, now)
 }
 
-// score 选号权重：积分基数 + 闲置加成（百分比，按积分比例算，避免被积分量级淹没）。
+// minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非候选全部刚被用过）。
+// 没有它，同一瞬间涌入的并发请求会各自独立抽签、全部落到权重最高的那个号上——
+// 面板上就表现为「只调用一个账号」。持锁串行进入使每个进入者都把 lastUsed 置为 now，
+// 于是第 2..N 个进入者看到前面那个号距今 0 < minPickGap，被自然挤向其它号。
+var minPickGap = 100 * time.Millisecond
+
+// drawLocked 在候选集内加权随机抽签（调用方持锁）。
 //
-// 闲置加成 = 积分 × min(闲置小时数 × idle_weight_per_hour, idle_weight_max) / 100。
-// 用比例而不是绝对分：trae 的积分是几百到几千的量级，绝对分值（wb 的 0.5 分）在这里
-// 小到看不出效果，等于这个开关没用。
-func (p *Pool) score(e *entry, now time.Time) float64 {
-	base := float64(e.credits)
-	if p.lim.IdleWeightPerHour <= 0 || e.lastUsed.IsZero() {
-		// 从未用过（含刚重启）视为全新闲置，但没历史就不加分——否则重启会把选号顺序打乱。
-		return base
+// 为什么不是「取权重最大」（原实现）：权重最大是确定性的，只要有一个号的积分最高，
+// 其它号**永远**不会被选中（实测 4417/4600 两个号，4600 那个吃掉全部流量）；
+// 国际版免费号 credits 恒 0，在乘性权重下权重恒 0，更是永久饿死。
+// 加权随机把「积分高的号分到更多流量」变成概率而非独占。
+func (p *Pool) drawLocked(cands []*entry, now time.Time) *entry {
+	var maxCredits int64
+	for _, e := range cands {
+		if e.credits > maxCredits {
+			maxCredits = e.credits
+		}
 	}
-	hours := now.Sub(e.lastUsed).Hours()
-	if hours <= 0 {
-		return base
+	type weighted struct {
+		e *entry
+		w float64
 	}
-	bonusPct := hours * p.lim.IdleWeightPerHour
-	if bonusPct > p.lim.IdleWeightMax {
-		bonusPct = p.lim.IdleWeightMax
+	ws := make([]weighted, 0, len(cands))
+	for _, e := range cands {
+		ws = append(ws, weighted{e: e, w: p.weight(e, maxCredits, now)})
 	}
-	return base * (1 + bonusPct/100)
+	// 权重降序 + uid 兜底：抽签按前缀和取，顺序决定「r=0 时谁中签」，
+	// 排序使注入定值随机源的测试得到确定的 argmax 语义（见 pickRandInt64N）。
+	sort.SliceStable(ws, func(i, j int) bool {
+		if ws[i].w != ws[j].w {
+			return ws[i].w > ws[j].w
+		}
+		return ws[i].e.a.UID < ws[j].e.a.UID
+	})
+
+	// 防撞号：优先在「距上次选中超过 minPickGap」的号里抽。
+	eligible := make([]weighted, 0, len(ws))
+	for _, c := range ws {
+		if now.Sub(c.e.lastUsed) >= minPickGap {
+			eligible = append(eligible, c)
+		}
+	}
+	// 全部刚被用过 → LRU 兜底：取 usedSeq 最小（最久未被选中）的那个。
+	// 用单调序号而非墙钟比较：同毫秒内连续选号时 lastUsed 完全相同，墙钟比较会恒取 ws[0]。
+	if len(eligible) == 0 {
+		oldest := ws[0].e
+		for _, c := range ws[1:] {
+			if c.e.usedSeq < oldest.usedSeq {
+				oldest = c.e
+			}
+		}
+		return oldest
+	}
+
+	const scale = 1_000_000 // 定点放大，整数抽签
+	weights := make([]int64, len(eligible))
+	var total int64
+	for i, c := range eligible {
+		weights[i] = int64(c.w * scale)
+		total += weights[i]
+	}
+	rnd := rand.Int64N
+	if p.randInt64N != nil {
+		rnd = p.randInt64N
+	}
+	if total <= 0 {
+		return eligible[rnd(int64(len(eligible)))].e
+	}
+	r := rnd(total)
+	var acc int64
+	for i, c := range eligible {
+		acc += weights[i]
+		if r < acc {
+			return c.e
+		}
+	}
+	return eligible[len(eligible)-1].e
+}
+
+// weight 选号权重（照 workbuddy2api-panel 的 weightOf 形状：**加性**，基线 1.0）。
+//
+//	1.0        基线——任何 healthy 号都有非零权重。乘性权重（旧实现 credits×(1+闲置%)）
+//	           在 credits=0 时恒为 0：国际版免费号没有积分，会被永久饿死。
+//	积分/最高分×10  按比例偏好积分多的号；用比例而非绝对值（积分是几百到几千的量级，
+//	           绝对值会被量级淹没），除以最高分使积分项落在 [0,10]。
+//	闲置加成    久未使用的号抬权，封顶 idle_weight_max；从未用过（含刚重启）给满分——
+//	           随机抽签下不存在「重启打乱固定顺序」的问题。
+//
+// 权重只影响抽中概率，不影响正确性：真正没额度的号会在 1005 时被硬冷却踢出候选。
+func (p *Pool) weight(e *entry, maxCredits int64, now time.Time) float64 {
+	w := 1.0
+	if maxCredits > 0 {
+		w += float64(e.credits) / float64(maxCredits) * 10
+	}
+	if p.lim.IdleWeightPerHour <= 0 {
+		return w
+	}
+	if e.lastUsed.IsZero() {
+		return w + p.lim.IdleWeightMax
+	}
+	bonus := now.Sub(e.lastUsed).Hours() * p.lim.IdleWeightPerHour
+	if bonus > p.lim.IdleWeightMax {
+		bonus = p.lim.IdleWeightMax
+	}
+	if bonus < 0 {
+		bonus = 0 // lastUsed 在未来（时钟回拨）时钳 0
+	}
+	return w + bonus
 }
 
 // Acquire 显式占用在途名额（不经 PickExcluding 的场景，如手工指定账号）；

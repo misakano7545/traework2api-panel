@@ -706,6 +706,12 @@ func (w *messagesWriter) emitJSONError() error {
 }
 
 func (w *messagesWriter) handleFrame(frame string) error {
+	// SSE 注释帧（保活）：原样透传，别在网关这一层吞掉（同 responsesWriter 的理由）。
+	if strings.HasPrefix(frame, ":") {
+		_, err := io.WriteString(w.ResponseWriter, frame+"\n\n")
+		w.Flush()
+		return err
+	}
 	if w.x.failed || w.x.done {
 		return nil
 	}

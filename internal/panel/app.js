@@ -112,7 +112,7 @@ async function submitKey() {
 }
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', models: '模型', usage: '用量', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', models: '模型', usage: '用量', packages: '积分构成', config: '配置', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -123,11 +123,20 @@ function go(v) {
   if (v === 'accounts') loadOverview(true);
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'usage') loadUsage(true);
+  if (v === 'packages') loadPackages();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
 }
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+// credTitle 积分列提示：解释「0」是什么。
+// 国际版免费号（Free plan，credits_limit=0、按美元计费）恒显示 0——不说明清楚会被当成
+// 「接口坏了/没查到」，而这其实是上游的真实状态（付费国际号会带面额）。
+function credTitle(a) {
+  if (a.credits_total) return '剩余 / 总额（上游积分包）';
+  if (a.realm === 'intl') return '国际版该账号无积分套餐（Free plan，按量计费）：0 是上游返回的真实值，不是未查询';
+  return '剩余 / 总额（上游积分包）';
+}
 // 到期列：0 = 上游没给到期信息，不猜。临近/已过期才上标签，正常不动声色。
 function expCell(unix) {
   if (!unix) return '<span style="color:var(--ink-3)">—</span>';
@@ -190,10 +199,12 @@ function renderAccounts(list) {
     if (!a.disabled && a.checkin_cooling) {
       st.push(tag('warn', '签到冷却', a.checkin_reason || '签到失败，已暂停自动签到'));
     }
-    // 国际版（trae.ai）没有签到/积分接口（实测两域全 404）：按钮置灰 + 提示，点了只会得到同一句解释。
+    // 国际版**没有签到**（EpCheckin* 在国际域全 404）：签到按钮置灰 + 提示。
+    // 「刷新」不再置灰：积分/套餐在国际版走 v1 路径（EpEntUsageIntl），能取到到期时间；
+    // 免费号返回的 0 积分是真实状态，不是接口不可用。
     const intlOff = a.realm === 'intl' ? ' disabled title="国际版无签到"' : '';
     const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '"' + intlOff + '>签到</button>',
-      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '"' + intlOff + '>刷新</button>'];
+      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>'];
     if (a.cooling) acts.push('<button class="xs" data-a="clear-cooldown" data-u="' + esc(a.uid) + '">解除冷却</button>');
     if (a.disabled) acts.push('<button class="xs" data-a="enable" data-u="' + esc(a.uid) + '">启用</button>');
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
@@ -201,7 +212,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '"><td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (a.realm === 'intl' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + esc(a.uid) + '</div></td>' +
       '<td>' + st.join(' ') + '</td>' +
-      '<td class="cred" title="剩余 / 总额（上游积分包）"><div class="n">' + (a.credits || 0) +
+      '<td class="cred" title="' + esc(credTitle(a)) + '"><div class="n">' + (a.credits || 0) +
         (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div></td>' +
       '<td>' + expCell(a.expire) + '</td>' +
       '<td class="num">' + (a.err_count || 0) + '</td>' +
@@ -265,27 +276,94 @@ function switchLabel(cfg) {
   const rest = cfg.replace(/"support_thinking"\s*:\s*(?:true|false)\s*,?/, '').replace(/^\{\s*|\s*\}$/g, '').trim();
   return rest ? label + ' ' + cfg : label;
 }
+
+/* ── 模型筛选/排序/搜索（抄自 WorkBuddy 面板，字段按 TRAE 载荷裁到实有项）─────
+   模型目录一次拉全（十几条），筛选与排序全部在前端完成：改条件零延迟，也不会
+   因为调一次筛选就打一次上游——/panel/api/models 是直连上游的实时查询，很贵。
+   条件之间是 AND；每个条件为空即不参与判定。 */
+let mdAll = [];
+let mdFilter = { q: '', realm: '', fn: '', sort: 'default' };
+// 通道（function）展示名：solo_work_lite = Work、solo_coder = Coder。
+const FN_LABEL = { solo_work_lite: 'Work', solo_coder: 'Coder' };
+function fnLabel(fn) { return FN_LABEL[fn] || fn || '—'; }
+// mdSearchText 参与关键字搜索的字段（ID / 展示名 / 能力）。
+function mdSearchText(m) {
+  return [m.id, m.name, m.capability].filter(Boolean).join(' ').toLowerCase();
+}
+// mdMatch 单个模型是否满足全部筛选条件。
+function mdMatch(m, f) {
+  f = f || mdFilter;
+  if (f.q) {
+    const text = mdSearchText(m);
+    // 空格分词后逐个匹配：多关键词是 AND，便于「cn work」这类组合查询。
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.fn && m.function !== f.fn) return false;
+  return true;
+}
+// mdSortList 按当前排序条件返回新数组（不改动入参，保持上游原始顺序可回溯）。
+function mdSortList(list, f) {
+  f = f || mdFilter;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
+  else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
+  else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+  return out;
+}
+// mdRowHtml 单个模型行（纯渲染，便于独立测试）。
+function mdRowHtml(m) {
+  const tip = m.name ? ' title="' + esc(m.name) + '"' : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div>' +
+    (m.name ? '<div class="id">' + esc(m.name) + '</div>' : '') + '</td>' +
+    '<td>' + (m.capability ? tag('mute', m.capability) : '—') + '</td>' +
+    '<td>' + thinkCell(m) + '</td>' +
+    '<td>' + tag('mute', fnLabel(m.function)) + '</td>' +
+    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    '<td class="num">' + (m.max_output_tokens ? Math.round(m.max_output_tokens / 1000) + 'K' : '—') + '</td></tr>';
+}
+function renderModels() {
+  const tb = $('mdBody');
+  const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' +
+      (mdAll.length ? '没有符合当前筛选条件的模型' : '上游未返回模型') + '</div></td></tr>';
+  } else {
+    tb.innerHTML = list.map(m => mdRowHtml(m)).join('');
+  }
+  const filtered = list.length !== mdAll.length;
+  $('mdCount').textContent = !mdAll.length ? ''
+    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
+      : mdAll.length + ' 个模型';
+  $('mdCount').className = filtered ? 'note src-off' : 'note';
+}
+function resetModelFilter() {
+  mdFilter = { q: '', realm: '', fn: '', sort: 'default' };
+  $('mdQ').value = ''; $('mdRealm').value = ''; $('mdFn').value = ''; $('mdSort').value = 'default';
+  renderModels();
+}
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="6"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     const d = await api('models');
-    const list = d.data || [];
-    if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="6"><div class="empty">上游未返回模型</div></td></tr>';
+    mdAll = d.data || [];
+    if (!mdAll.length) {
+      $('mdCount').textContent = '';
+      $('mdNote').textContent = '上游未返回模型';
+      renderModels();
       return;
     }
-    tb.innerHTML = list.map(m =>
-      '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + esc(m.id) + '</div></td>' +
-      '<td>' + (m.capability ? tag('mute', m.capability) : '—') + '</td>' +
-      '<td>' + thinkCell(m) + '</td>' +
-      '<td>' + tag('mute', m.owned_by || '—') + '</td>' +
-      '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td></tr>'
-    ).join('');
-    $('mdNote').textContent = list.length + ' 个模型 · 路由层缓存 1 小时';
+    $('mdNote').textContent = '实时查询上游 · 路由层缓存 1 小时';
+    renderModels();
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="6"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    mdAll = [];
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    $('mdCount').textContent = '';
     $('mdNote').textContent = '查询失败';
   }
 }
@@ -327,20 +405,103 @@ function fmtNum(n) { return Number(n || 0).toLocaleString('en-US'); }
 function fmtLat(v) { return v > 0 ? Math.round(v) + ' ms' : '—'; }
 function fmtRate(v) { return v > 0 ? (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' tok/s' : '—'; }
 
-/* aggCells 请求/失败/输入/输出/合计五列，三个表共用（列头顺序一致）。 */
-function aggCells(a) {
-  const err = a.errors ? '<span style="color:var(--bad)">' + fmtNum(a.errors) + '</span>' : '0';
-  return '<td class="num">' + fmtNum(a.requests) + '</td>' +
-    '<td class="num">' + err + '</td>' +
+/* usPct 占比文案（0 值不显示 "0.0%"，直接 —，避免一行全是零）。 */
+function usPct(part, total) {
+  const t = Number(total || 0);
+  if (!t) return '—';
+  return (Number(part || 0) / t * 100).toFixed(1) + '%';
+}
+
+/* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
+   放「占比 / 均速率」这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。 */
+function usKpi(v, k, cls, sub, bar) {
+  return '<div class="kpi ' + (cls || '') + '">' +
+    '<div class="k">' + esc(k) + '</div>' +
+    '<div class="v">' + esc(v) + '</div>' +
+    (bar || '') +
+    (sub ? '<div class="s">' + esc(sub) + '</div>' : '') +
+    '</div>';
+}
+
+/* usMixBar prompt/completion 占比条。宽度按百分比而不是固定像素：表列宽随窗口变化。 */
+function usMixBar(prompt, completion, total) {
+  const t = Number(total || 0);
+  if (!t) return '';
+  const pp = Math.max(0, Math.min(100, Number(prompt || 0) / t * 100));
+  const pc = Math.max(0, Math.min(100, Number(completion || 0) / t * 100));
+  return '<span class="us-mix" title="prompt ' + pp.toFixed(1) + '% · completion ' + pc.toFixed(1) + '%">' +
+    '<i class="p" style="width:' + pp.toFixed(2) + '%"></i>' +
+    '<i class="c" style="width:' + pc.toFixed(2) + '%"></i>' +
+    '</span>';
+}
+
+/* fmtHit 缓存命中率单元格。口径与图表一致：hit / prompt，且**只在有样本的桶上算**。
+   上游没报（cache_samples=0）时显示 —，不拿 0 当 0%——「没观测到」不是「全未命中」。 */
+function fmtHit(a) {
+  const s = Number((a && a.cache_samples) || 0);
+  const pt = Number((a && a.prompt_tokens) || 0);
+  if (!s || !pt) return '<span style="color:var(--ink-3)" title="上游没报缓存字段（无样本）">—</span>';
+  const hit = Number((a && a.cache_hit_tokens) || 0);
+  const r = Math.max(0, Math.min(1, hit / pt)) * 100;
+  return '<span title="命中 ' + fmtNum(hit) + ' / prompt ' + fmtNum(pt) + '（' + s + ' 个样本）">' +
+    r.toFixed(1) + '%</span>';
+}
+
+/* 用量明细：账号 / 模型两个维度共用一张表 + 页内切换（TRAE 只有这两维，没有 WB 的「按域」）。 */
+const US_DIMS = {
+  account: { key: 'by_account', title: '账号', withPerf: true },
+  model: { key: 'by_model', title: '模型', withPerf: false },
+};
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型']];
+
+// usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
+function usSortRows(rows, sort) {
+  const out = rows.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  const val = a => sort === 'requests' ? num(a.requests)
+    : sort === 'errors' ? num(a.errors)
+      : sort === 'latency' ? num(a.avg_latency_ms)
+        : num(a.total_tokens);
+  out.sort((a, b) => val(b) - val(a));
+  return out;
+}
+
+function usDimHead(dim) {
+  const m = US_DIMS[dim] || US_DIMS.account;
+  return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
+    '<th class="num">请求</th><th class="num">失败</th>' +
+    '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
+    '<th class="num">缓存命中率</th>' +
+    (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
+    '</tr>';
+}
+
+/* usTabsHtml 维度切换按钮（带条数徽标）。整段 innerHTML 重写而不是逐个改 class：
+   容器的 click 监听是委托式的，换掉子节点不会丢事件。 */
+function usTabsHtml(dims, active, counts) {
+  return dims.map(([k, label]) => {
+    const n = counts ? counts[k] : null;
+    return '<button data-dim="' + k + '"' + (k === active ? ' class="on"' : '') + '>' +
+      esc(label) + (n == null ? '' : '<span class="cnt">' + n + '</span>') + '</button>';
+  }).join('');
+}
+
+/* usRow 一行。withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
+function usRow(name, sub, a, withPerf) {
+  return '<tr><td class="mark" aria-hidden="true"></td>' +
+    '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+    '<td class="num">' + fmtNum(a.requests) + '</td>' +
+    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtNum(a.errors) + '</span>' : '—') + '</td>' +
     '<td class="num">' + fmtNum(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtNum(a.completion_tokens) + '</td>' +
-    '<td class="num">' + fmtNum(a.total_tokens) + '</td>';
-}
-function usRow(name, sub, a, extra) {
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
-    '<td class="who"><div class="nm">' + esc(name) + '</div>' +
-    (sub ? '<div class="id">' + esc(sub) + '</div>' : '') + '</td>' +
-    aggCells(a) + (extra || '') + '</tr>';
+    '<td class="num">' + fmtNum(a.total_tokens) +
+    usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
+    '<td class="num">' + fmtHit(a) + '</td>' +
+    (withPerf
+      ? '<td class="num">' + fmtLat(a.avg_latency_ms) + '</td>' +
+        '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
+      : '') +
+    '</tr>';
 }
 function usEmpty(tb, cols, msg) {
   tb.innerHTML = '<tr><td colspan="' + cols + '"><div class="empty">' + esc(msg) + '</div></td></tr>';
@@ -460,37 +621,68 @@ function renderUsageChart(series) {
     ? '堆叠柱：输入 + 输出，共 ' + series.length + ' 个时间片' : '';
 }
 
+/* renderUsageDim 用量明细（账号/模型维度切换 + 排序），数据一次拉全，切换零请求。 */
+let usDim = 'account', usSort = 'total', usageData = null;
+function renderUsageDim() {
+  const d = usageData || {};
+  const m = US_DIMS[usDim] || US_DIMS.account;
+  const rows = usSortRows(d[m.key] || [], usSort);
+  $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
+    account: (d.by_account || []).length,
+    model: (d.by_model || []).length,
+  });
+  $('usDimHead').innerHTML = usDimHead(usDim);
+  $('usDimBody').innerHTML = rows.map(x =>
+    usRow(usDim === 'account' ? (x.extra || String(x.key || '').slice(0, 8)) : x.key,
+      usDim === 'account' ? String(x.key || '').slice(0, 8) : '',
+      x, m.withPerf)
+  ).join('') || '<tr><td colspan="' + (m.withPerf ? 10 : 8) + '"><div class="empty">这个窗口内还没有调用</div></td></tr>';
+  $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
+}
+
 function renderUsage(d) {
-  const t = d.totals || {};
-  $('usReq').textContent = fmtNum(t.requests);
-  $('usErr').textContent = fmtNum(t.errors);
-  $('usPt').textContent = fmtNum(t.prompt_tokens);
-  $('usCt').textContent = fmtNum(t.completion_tokens);
-  $('usTt').textContent = fmtNum(t.total_tokens);
-  $('usLat').textContent = fmtLat(t.avg_latency_ms);
-  $('usNote').textContent = '速率 ' + fmtRate(t.avg_tokens_per_second) +
-    (d.since ? ' · 自 ' + d.since + ' 起记录' : '') +
-    ' · ' + fmtNum(d.buckets) + ' 个分片 / ' + fmtNum(d.file_bytes) + ' B';
+  usageData = d || {};
+  const t = usageData.totals || {};
+  const total = Number(t.total_tokens || 0);
+  const pt = Number(t.prompt_tokens || 0);
+  const ct = Number(t.completion_tokens || 0);
+  const reqs = Number(t.requests || 0);
+  const errs = Number(t.errors || 0);
+  const okRate = reqs ? (reqs - errs) / reqs * 100 : null;
+  // 构成条要的是合法 CSS 宽度，usPct 在无样本时返回 "—"，不能直接拼进 style。
+  const pctW = (part) => total ? Math.max(0, Math.min(100, Number(part || 0) / total * 100)).toFixed(2) + '%' : '0%';
+  // 六张卡：主指标用强调色，completion 用成功色（与图表里的绿柱呼应），
+  // 失败/延迟只在有值时上语义色——全绿全黄的仪表盘等于没有重点。
+  $('usStats').innerHTML =
+    usKpi(fmtNum(reqs), '请求数', 'c-accent', errs ? '其中失败 ' + fmtNum(errs) + ' 次' : '全部成功') +
+    usKpi(fmtNum(total), '总 token', 'c-accent',
+      'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
+      '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
+      '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
+    usKpi(fmtNum(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
+    usKpi(fmtNum(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
+    usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
+      okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
+    usKpi(fmtLat(t.avg_latency_ms), '平均延迟', 'c-soft',
+      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本');
 
-  const models = d.by_model || [];
-  if (models.length) {
-    $('usModelBody').innerHTML = models.map(m => usRow(m.key, '', m,
-      '<td class="num">' + fmtLat(m.avg_latency_ms) + '</td>' +
-      '<td class="num">' + fmtRate(m.avg_tokens_per_second) + '</td>')).join('');
-  } else usEmpty($('usModelBody'), 9, '这个窗口内还没有调用');
+  // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）。
+  const win = usHours === '0' ? '全部历史' : '近 ' + usHours + ' 小时'
+    + (usHours === '168' ? '（7 天）' : usHours === '720' ? '（30 天）' : '');
+  const note = win + ' · ' + fmtNum(usageData.buckets) + ' 个分桶' +
+    (usageData.since ? ' · 数据自 ' + String(usageData.since).replace('T', ' ') : '') +
+    (usageData.file_bytes ? ' · 文件 ' + (usageData.file_bytes / 1024).toFixed(1) + ' KB' : '');
+  $('usNote').textContent = note;
+  $('usNote').title = note; // 窄屏单行截断时靠悬停看全
 
-  const accts = d.by_account || [];
-  if (accts.length) {
-    $('usAcctBody').innerHTML = accts.map(a => usRow(a.extra || a.key, a.extra ? a.key : '', a,
-      '<td class="num">' + fmtLat(a.avg_latency_ms) + '</td>')).join('');
-  } else usEmpty($('usAcctBody'), 8, '这个窗口内还没有调用');
-  $('usAcctNote').textContent = accts.length ? accts.length + ' 个账号有调用' : '';
+  renderUsageDim();
 
-  const series = d.series || [];
+  // 按小时：同一份 series（窗口与卡片一致），列口径与 WB 的「按小时」一致（TRAE 无逐请求积分）。
+  const series = usageData.series || [];
   if (series.length) {
     $('usSeriesBody').innerHTML = series.map(p => usRow(
       p.t, p.scope === 'day' ? '日' : '小时', p)).join('');
-  } else usEmpty($('usSeriesBody'), 7, '这个窗口内还没有调用');
+  } else usEmpty($('usSeriesBody'), 8, '这个窗口内还没有调用');
   $('usSeriesNote').textContent = usHours === '0' ? '全部历史（含折叠日桶）' : '按小时分片';
   renderUsageChart(series);
 }
@@ -603,6 +795,323 @@ function collectConfig() {
   return cfgLoaded;
 }
 
+/* ── 积分构成 ─────────────────────────────────────────────────────── */
+/* 一个账号的余额是若干积分包之和。包按来源命名（老用户福利 / 每月登录赠送 / 签到奖励…），
+   面额从 100 到 4000 不等、按次发放，且各自带到期时间。所以只看聚合值看不出「余额为什么
+   差这么多」——差别只在包里。这里把逐包明细摊开，并给每个来源一个稳定配色，跨账号对比
+   时同色即同类。取数走 /panel/api/packages（逐账号实时查上游）。 */
+
+// 数字格式化：积分/token 通用紧凑写法（1.2k / 3.4M）。
+function fmtTok(n) {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
+  '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
+const PK_ACCOUNT_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6',
+  '#e2607a', '#20a4a4', '#8fbf3f', '#d4785c',
+  '#7c83db', '#c48a2f', '#b45f8c', '#5aa9e6'];
+const PK_DAY_MS = 24 * 3600 * 1000;
+
+function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
+
+// pkAccountColorMap 按 UID 稳定分配颜色：排序后分配，账号刷新/重排不会换色。
+function pkAccountColorMap(list) {
+  const uids = (list || []).filter(a => a && !a.error && a.uid).map(a => String(a.uid)).sort();
+  const colors = new Map();
+  uids.forEach((uid, i) => colors.set(uid, PK_ACCOUNT_COLORS[i % PK_ACCOUNT_COLORS.length]));
+  return colors;
+}
+
+/* pkBySource 把包按来源归并，得到「来源 → 面额/余额/个数」。这是对比的关键视图：
+   两个号的差异一定体现在某几个来源的面额上。分组键带 group，避免同名不同类被并成一类。 */
+function pkBySource(packs) {
+  const m = new Map();
+  for (const p of packs || []) {
+    const k = (p.group || '') + '|' + (p.name || '(未命名)');
+    const e = m.get(k) || {
+      key: k, name: p.name || p.group || '(未命名)', n: 0,
+      remain: 0, size: 0, used: 0, minExpire: 0, minStart: 0,
+    };
+    e.n += 1;
+    e.remain += Number(p.remain || 0);
+    e.size += Number(p.size || 0);
+    e.used += Number(p.used || 0);
+    const ex = Number(p.expire || 0);
+    if (ex > 0 && (!e.minExpire || ex < e.minExpire)) e.minExpire = ex;
+    const st = Number(p.start || 0);
+    if (st > 0 && (!e.minStart || st < e.minStart)) e.minStart = st;
+    m.set(k, e);
+  }
+  return [...m.values()].sort((a, b) => b.size - a.size);
+}
+
+// pkExpiryMs 包到期毫秒时间戳：到期分布与明细排序共用这一份。0 = 上游没给到期，返回 null（不猜）。
+function pkExpiryMs(p) {
+  const s = Number(p && p.expire);
+  return Number.isFinite(s) && s > 0 ? s * 1000 : null;
+}
+
+// pkCreditOpacity 越临近到期越不透明（urgency 可视化）。
+function pkCreditOpacity(days) {
+  if (days == null || !Number.isFinite(Number(days))) return 1;
+  return 0.25 + 0.75 * Math.max(0, Math.min(29, Number(days) - 1)) / 29;
+}
+
+function pkExpiryText(expiresAt) {
+  if (!expiresAt) return '无到期时间';
+  const diff = expiresAt - Date.now();
+  if (diff <= 0) return '已到期';
+  const minutes = Math.max(1, Math.ceil(diff / 60000));
+  if (minutes < 60) return '剩余 ' + minutes + ' 分钟';
+  const hours = Math.ceil(diff / 3600000);
+  if (hours < 24) return '剩余 ' + hours + ' 小时';
+  return '剩余 ' + Math.ceil(diff / PK_DAY_MS) + ' 天';
+}
+
+function pkExpiryDateTime(expiresAt) {
+  if (!expiresAt) return '—';
+  return new Date(expiresAt).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// pkAccountSegments 账号内先按总余额约束逐包金额（上游可能重复记录），再按到期时间排序。
+function pkAccountSegments(a, now) {
+  let balance = Math.max(0, Number(a.remain || 0));
+  const out = [];
+  for (const p of a.packages || []) {
+    const remain = Number(p.remain || 0);
+    if (!Number.isFinite(remain) || remain <= 0 || balance <= 0) continue;
+    const amount = Math.min(balance, remain);
+    const expiresAt = pkExpiryMs(p);
+    out.push({
+      amount,
+      expiresAt,
+      days: expiresAt == null ? null : Math.max(0, Math.ceil((expiresAt - now) / PK_DAY_MS)),
+      source: p.name || '积分',
+      uid: String(a.uid || ''),
+      accountName: a.nickname || String(a.uid || '').slice(0, 8) || '未命名账号',
+    });
+    balance -= amount;
+  }
+  return out.sort((x, y) => {
+    if (x.expiresAt == null && y.expiresAt != null) return 1;
+    if (x.expiresAt != null && y.expiresAt == null) return -1;
+    return (x.expiresAt || 0) - (y.expiresAt || 0);
+  });
+}
+
+// summarizeCreditDays 按精确剩余天数逐行聚合；无有效到期时间的余额不进图，也不猜到期日。
+function summarizeCreditDays(list, now) {
+  const buckets = new Map();
+  let unavailable = 0;
+  for (const a of list || []) {
+    if (a.error || !Number.isFinite(Number(a.remain))) { unavailable++; continue; }
+    for (const segment of pkAccountSegments(a, now)) {
+      if (segment.days == null) continue;
+      let row = buckets.get(segment.days);
+      if (!row) { row = { days: segment.days, credits: 0, segments: [] }; buckets.set(segment.days, row); }
+      row.credits += segment.amount;
+      row.segments.push(segment);
+    }
+  }
+  const rows = [...buckets.values()].sort((a, b) => a.days - b.days);
+  for (const row of rows) {
+    row.segments.sort((a, b) =>
+      (a.expiresAt || Infinity) - (b.expiresAt || Infinity) ||
+      a.accountName.localeCompare(b.accountName) ||
+      a.source.localeCompare(b.source));
+  }
+  return { rows, accountCount: (list || []).length, unavailable };
+}
+
+function renderExpiryDistribution(list, now) {
+  const summary = summarizeCreditDays(list, now);
+  const colors = pkAccountColorMap(list);
+  const rows = summary.rows.map(row => {
+    const total = row.credits || 1;
+    const nodes = row.segments.map(segment => {
+      const color = colors.get(segment.uid) || 'var(--accent)';
+      const title = segment.source + '\n' + fmtTok(segment.amount) + ' 积分\n到期时间 ' +
+        pkExpiryDateTime(segment.expiresAt) + '（' + pkExpiryText(segment.expiresAt) + '）\n' +
+        segment.accountName;
+      return '<span class="pk-expiry-seg" style="--seg-color:' + color +
+        ';opacity:' + pkCreditOpacity(segment.days).toFixed(5) +
+        ';flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
+        ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
+    }).join('');
+    return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') +
+      '</span><div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) +
+      '</b></div>';
+  }).join('');
+  const foot = summary.accountCount + ' 个账号' +
+    (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
+  const legend = (list || []).filter(a =>
+    a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
+  ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
+    '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
+  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
+  $('pkExpiry').innerHTML = (rows
+    ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
+    : '<div class="pk-expiry-empty">暂无可汇总积分</div>') +
+    (legend ? '<div class="pk-expiry-legend">' + legend + '</div>' : '') +
+    '<div class="pk-expiry-foot">' + esc(foot) + '</div>';
+}
+
+// pkDetailCompare 单账号逐包明细排序：到期时间升序，同一到期按面额降序。
+function pkDetailCompare(a, b) {
+  const sizeOf = p => { const n = Number(p && p.size); return Number.isFinite(n) ? n : 0; };
+  const ea = pkExpiryMs(a), eb = pkExpiryMs(b);
+  if (ea == null && eb != null) return 1;
+  if (ea != null && eb == null) return -1;
+  if (ea != null && eb != null && ea !== eb) return ea - eb;
+  return sizeOf(b) - sizeOf(a);
+}
+
+// pkDetailGroups 正余额包先按到期时间挑默认展示项，其余正余额包与已用完包分别折叠。
+const PK_DEFAULT_DETAIL_LIMIT = 5;
+function pkDetailGroups(packs, limit) {
+  const active = [], used = [];
+  let usedSize = 0, restSize = 0, restRemain = 0;
+  for (const p of packs || []) {
+    if (Number(p && p.remain) > 0) { active.push(p); continue; }
+    used.push(p);
+    const size = Number(p && p.size);
+    if (Number.isFinite(size)) usedSize += size;
+  }
+  active.sort(pkDetailCompare);
+  used.sort(pkDetailCompare);
+  const n = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : PK_DEFAULT_DETAIL_LIMIT;
+  const visible = active.slice(0, n);
+  const rest = active.slice(visible.length);
+  for (const p of rest) {
+    restSize += Number(p.size || 0);
+    restRemain += Number(p.remain || 0);
+  }
+  return { visible, rest, used, restSize, restRemain, usedSize };
+}
+
+function renderPackages(d) {
+  const list = (d.accounts || []);
+  const now = Date.now();
+  renderExpiryDistribution(list, now);
+  if (!list.length) {
+    $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
+    $('pkDetail').innerHTML = '';
+    $('pkNote').textContent = '—';
+    return;
+  }
+
+  // 包名 → 稳定色号（跨账号一致，方便肉眼对齐）
+  const names = [];
+  for (const a of list) for (const s of pkBySource(a.packages || [])) {
+    if (!names.includes(s.key)) names.push(s.key);
+  }
+  const sizeOf = n => Math.max(0, ...list.map(a => {
+    const f = pkBySource(a.packages || []).find(s => s.key === n);
+    return f ? f.size : 0;
+  }));
+  names.sort((x, y) => sizeOf(y) - sizeOf(x));
+  const colorOf = n => pkColor(names.indexOf(n));
+
+  const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
+
+  $('pkSummary').innerHTML = list.map(a => {
+    if (a.error) {
+      return '<div class="pk-card"><div class="who"><span class="nm">' +
+        esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</span>' +
+        '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
+        '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
+    }
+    const srcs = pkBySource(a.packages || []);
+    const total = Math.max(1, Number(a.size || 0));
+    const bar = srcs.map(s =>
+      '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
+      colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>').join('');
+    const legend = srcs.map(s =>
+      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+      esc(s.name) + ' x' + s.n + ' · ' + fmtTok(s.size) + '</span>').join('');
+    return '<div class="pk-card">' +
+      '<div class="who"><span class="nm">' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</span>' +
+      '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
+      '<div class="big">' + fmtTok(a.remain) + '</div>' +
+      '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
+      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%</div>' +
+      '<div class="mixbar">' + bar + '</div>' +
+      '<div class="pk-legend">' + legend + '</div>' +
+      '</div>';
+  }).join('');
+
+  $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
+
+  // 逐包明细：每个账号一个表，包的**面额**列是重点
+  $('pkDetail').innerHTML = list.map(a => {
+    if (a.error) return '';
+    const groups = pkDetailGroups(a.packages || [], PK_DEFAULT_DETAIL_LIMIT);
+    const rowOf = (p, rowGroup) => {
+      const k = (p.group || '') + '|' + (p.name || '(未命名)');
+      const sub = p.group && p.group !== p.name ? p.group : '';
+      return '<tr' + (rowGroup ? ' class="pk-hidden-row" data-pk-row="' + rowGroup + '" hidden' : '') +
+        '><td class="mark" aria-hidden="true"><i style="background:' + colorOf(k) + '"></i></td>' +
+        '<td>' + esc(p.name || p.group || '(未命名)') +
+        (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+        '<td class="num">' + fmtTok(p.size) + '</td>' +
+        '<td class="num">' + fmtTok(p.remain) + '</td>' +
+        '<td class="num">' + fmtTok(p.used) + '</td>' +
+        '<td class="num">' + (p.start ? esc(pkExpiryDateTime(Number(p.start) * 1000).slice(0, 10)) : '—') + '</td>' +
+        '<td class="num">' + (p.expire ? esc(pkExpiryDateTime(Number(p.expire) * 1000).slice(0, 10)) : '—') + '</td>' +
+        '</tr>';
+    };
+    const groupSummary = (group, label, count, size, remain) =>
+      '<tr class="pk-group-summary"><td colspan="7"><button type="button" class="pk-group-toggle"' +
+      ' data-pk-group="' + group + '" data-count="' + count + '" data-size="' + size +
+      '" data-remain="' + remain + '" aria-expanded="false">' + label + '，展开</button></td></tr>';
+    const rows = groups.visible.map(p => rowOf(p, '')).join('');
+    const restSummary = groups.rest.length
+      ? groupSummary('rest', '其余未用完 ' + groups.rest.length + ' 个包（面额合计 ' +
+        fmtTok(groups.restSize) + ' · 剩余 ' + fmtTok(groups.restRemain) + '）',
+        groups.rest.length, groups.restSize, groups.restRemain) +
+      groups.rest.map(p => rowOf(p, 'rest')).join('')
+      : '';
+    const usedSummary = groups.used.length
+      ? groupSummary('used', '已用完 ' + groups.used.length + ' 个包（面额合计 ' +
+        fmtTok(groups.usedSize) + '）', groups.used.length, groups.usedSize, 0) +
+      groups.used.map(p => rowOf(p, 'used')).join('')
+      : '';
+    return '<div class="box"><header><h3>' +
+      esc(a.nickname || String(a.uid || '').slice(0, 8)) + ' · ' + esc(a.realm || '') +
+      '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
+      ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
+      (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
+      ' · 默认展示最早到期 ' + PK_DEFAULT_DETAIL_LIMIT + ' 条</span>' +
+      '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
+      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
+      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
+      '<th class="num">发放</th><th class="num">到期</th>' +
+      '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
+  }).join('');
+}
+
+async function loadPackages() {
+  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  $('pkDetail').innerHTML = '';
+  $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
+  try {
+    const d = await api('packages');
+    renderPackages(d);
+  } catch (e) {
+    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
 /* ── 添加账号（不轮询：贴回调地址换票）────────────────────────────── */
 // 地区：链接按地区切域（国内 www.trae.cn / 国际 www.trae.ai）。回调自带 OAuth host，
 // 所以换票那步不用再选一次——面板按 host 自动落 domain/apiHost。
@@ -675,10 +1184,19 @@ function boot() {
     if (view === 'accounts') loadOverview();
     if (view === 'models') loadModels();
     if (view === 'usage') loadUsage();
+    if (view === 'packages') loadPackages();
     if (view === 'config') loadConfig();
     if (view === 'logs') loadLogs();
   };
   $('btnAdd').onclick = openAdd;
+  // 登出：API-key 门没有服务端半边（withAuth 只是 Bearer 比对，无会话/无 cookie），
+  // 所以「登出」就是本浏览器不再保留密钥——清掉 + 重载（重载同时清掉 5s 轮询与已渲染的行）。
+  $('btnLogout').onclick = () => {
+    if (!confirm('登出将清除本浏览器保存的密钥；持有密钥的人仍可调用接口。确认登出？')) return;
+    try { sessionStorage.removeItem(SS_KEY); } catch (e) {}
+    key = '';
+    location.reload();
+  };
   $('addRealm').addEventListener('click', ev => {
     const b = ev.target.closest('button[data-realm]');
     if (!b || b.classList.contains('on')) return;
@@ -774,8 +1292,53 @@ function checkinMsg(rs, accounts) {
   });
 
   $('btnModels').onclick = loadModels;
+  // 模型筛选控件：输入框防抖 120ms（长列表不必逐字符重排），下拉即时。
+  let mdQTimer = null;
+  $('mdQ').addEventListener('input', () => {
+    clearTimeout(mdQTimer);
+    mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
+  });
+  for (const [id, key] of [['mdRealm', 'realm'], ['mdFn', 'fn'], ['mdSort', 'sort']]) {
+    const el = $(id);
+    if (!el) continue;
+    el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
+  }
+  $('mdReset').onclick = resetModelFilter;
+
+  $('btnPk').onclick = loadPackages;
+  // 逐包明细的「其余未用完 / 已用完」折叠：委托式，行是渲染时生成的也不丢事件。
+  $('pkDetail').addEventListener('click', ev => {
+    const btn = ev.target.closest('button[data-pk-group]');
+    if (!btn) return;
+    const body = btn.closest('tbody');
+    if (!body) return;
+    const group = btn.dataset.pkGroup;
+    const expanded = btn.getAttribute('aria-expanded') === 'true';
+    body.querySelectorAll('tr[data-pk-row="' + group + '"]').forEach(row => { row.hidden = expanded; });
+    const count = btn.dataset.count || '0';
+    const size = btn.dataset.size || '0';
+    const remain = btn.dataset.remain || '0';
+    btn.setAttribute('aria-expanded', String(!expanded));
+    if (group === 'rest') {
+      btn.textContent = expanded
+        ? '其余未用完 ' + count + ' 个包（面额合计 ' + fmtTok(size) + ' · 剩余 ' +
+          fmtTok(remain) + '），展开'
+        : '收起其余未用完 ' + count + ' 个包';
+    } else {
+      btn.textContent = expanded
+        ? '已用完 ' + count + ' 个包（面额合计 ' + fmtTok(size) + '），展开'
+        : '收起已用完 ' + count + ' 个包';
+    }
+  });
 
   $('btnUsageReload').onclick = () => loadUsage();
+  $('usDimTabs').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-dim]');
+    if (!b) return;
+    usDim = b.dataset.dim;
+    renderUsageDim();
+  });
+  $('usSort').onchange = () => { usSort = $('usSort').value; renderUsageDim(); };
   $('usChips').addEventListener('click', ev => {
     const b = ev.target.closest('button[data-h]');
     if (!b) return;

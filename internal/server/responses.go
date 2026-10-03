@@ -478,6 +478,13 @@ func (w *responsesWriter) emitJSONErrorAsFailed() error {
 }
 
 func (w *responsesWriter) handleFrame(frame string) error {
+	// SSE 注释帧（保活，`: keepalive`）：原样透传。吞掉它等于把网关的空闲保活一起吃掉，
+	// 长思考期下游重新变静默，白加。客户端按 SSE 规范忽略注释，转发没有副作用。
+	if strings.HasPrefix(frame, ":") {
+		_, err := io.WriteString(w.ResponseWriter, frame+"\n\n")
+		w.Flush()
+		return err
+	}
 	if w.x.failed || w.x.completed {
 		return nil
 	}

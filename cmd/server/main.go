@@ -19,6 +19,7 @@ import (
 	"traework2api/internal/auth"
 	"traework2api/internal/panel"
 	"traework2api/internal/pool"
+	"traework2api/internal/reqlog"
 	"traework2api/internal/scheduler"
 	"traework2api/internal/server"
 	"traework2api/internal/session"
@@ -62,6 +63,14 @@ func applyUpstream(up *upstream.Client, c *Config) {
 // usagePathFor 由 state 文件路径推出用量台账路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不用多加一个配置项。
 func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
+
+// requestArchiveDir 请求归档目录：显式配置优先，否则 state 文件同级的 requests/。
+func requestArchiveDir(cfg *Config) string {
+	if d := cfg.Logging.RequestArchiveDir; d != "" {
+		return d
+	}
+	return stateSibling(cfg.StateFile, "requests")
+}
 
 // stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
 func stateSibling(stateFile, name string) string {
@@ -118,6 +127,22 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 用量台账 %s（%s）", usagePath, rec.Describe())
 
+	// 请求记录：内存指标 + 可选 JSONL 归档（面板「运行日志」页的请求记录）。
+	// 归档目录缺省为 state 文件同级的 requests/（改 state_file 即跟着搬）。
+	rlog := reqlog.New(reqlog.Config{
+		Dir:           requestArchiveDir(cfg),
+		Enabled:       cfg.Logging.RequestArchiveEnabled,
+		RetentionDays: cfg.Logging.RequestArchiveRetentionDays,
+		MaxBytes:      int64(cfg.Logging.RequestArchiveMaxMB) << 20,
+	})
+	defer rlog.Close()
+	if cfg.Logging.RequestArchiveEnabled {
+		log.Printf("[reqlog] 请求归档 %s（保留 %d 天 / 上限 %d MB）", requestArchiveDir(cfg),
+			cfg.Logging.RequestArchiveRetentionDays, cfg.Logging.RequestArchiveMaxMB)
+	} else {
+		log.Printf("[reqlog] 请求记录仅存内存（最近 100 条）；开启 logging.request_archive_enabled 可跨重启保留")
+	}
+
 	up := upstream.New()
 	applyUpstream(up, cfg)
 
@@ -140,14 +165,16 @@ func main() {
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		DefaultModel: cfg.DefaultModel,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
-		Session:      sess,
-		Usage:        rec,
+		Pool:              p,
+		Upstream:          up,
+		APIKey:            cfg.APIKey,
+		DefaultModel:      cfg.DefaultModel,
+		PromptMode:        cfg.Prompt.Mode,
+		PromptText:        cfg.PromptText,
+		Session:           sess,
+		Usage:             rec,
+		RequestLog:        rlog,
+		RequestClientInfo: cfg.Logging.RequestClientInfo,
 	})
 	var pn *panel.Panel // 先声明：SaveConfig 闭包里要调 pn.ApplyAPIKey，赋值在这之后
 	pn = panel.New(panel.Config{
@@ -160,6 +187,7 @@ func main() {
 		Logs:       logs,
 		Models:     h.Models,
 		Usage:      rec,
+		RequestLog: rlog,
 		ConfigPath: *cfgPath,
 		LoadConfig: func() (any, error) {
 			cfgMu.Lock()
@@ -194,6 +222,8 @@ func main() {
 			pn.ApplyAPIKey(next.APIKey) // 面板自己也认新密钥，否则保存完就把自己挡在门外
 			applyUpstream(up, next)
 			sess.Apply(session.Config{Enabled: next.SessionSticky.Enabled, TTL: next.SessionTTL})
+			// 来源记录开关是热项（每次请求现读）；归档段需重启，由 RestartFields 如实报出。
+			h.SetRequestClientInfo(next.Logging.RequestClientInfo)
 			return RestartFields(bound, next), nil
 		},
 	})

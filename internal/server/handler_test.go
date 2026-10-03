@@ -130,6 +130,9 @@ func TestChatRotatesOnPlanLimit(t *testing.T) {
 	)
 	p.SetCredits("bad", 2000)
 	p.SetCredits("good", 1000)
+	// 选号是加权随机的，这条要验的是「1005 之后换号」而不是抽签分布：
+	// 钉死抽签源（恒返回 0 = 权重最高的 bad 先上），让轮转过程可复现。
+	p.SetRandInt64N(func(int64) int64 { return 0 })
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()

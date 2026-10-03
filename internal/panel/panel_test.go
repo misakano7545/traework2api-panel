@@ -3,6 +3,7 @@ package panel
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -527,6 +528,72 @@ func TestLoginLinkUsesTraeCallback(t *testing.T) {
 		t.Fatalf("登录链接没带 TRAE 认的那条回调: %s", start.URL)
 	}
 }
+
+// TestPackagesEndpoint 积分构成取数：逐账号结果 + 单号失败不拖累整页 + 无密钥 401。
+// 用假上游（固定响应体）而不是真网络：这条要验的是面板的组装与错误隔离，不是上游连通性。
+func TestPackagesEndpoint(t *testing.T) {
+	up := upstream.New()
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"user_entitlement_pack_list":[
+			  {"display_desc":"老用户福利","group_name":"用户福利","expire_time":1792968453,
+			   "entitlement_base_info":{"start_time":1790290053,"quota":{"credits_limit":4000}},
+			   "usage":{"credits_amount":183.75}}
+			]}`)),
+		}, nil
+	})}
+	pl := pool.New("")
+	pl.Add(&auth.Auth{UID: "u1", Nickname: "甲"})
+	p := New(Config{Pool: pl, Upstream: up, APIKey: "k"})
+
+	req := httptest.NewRequest("GET", "/panel/api/packages", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body)
+	}
+	var got struct {
+		Accounts []struct {
+			UID      string `json:"uid"`
+			Remain   int64  `json:"remain"`
+			Size     int64  `json:"size"`
+			Packages []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			} `json:"packages"`
+			Error string `json:"error"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("不是 JSON: %v body=%s", err, w.Body)
+	}
+	if len(got.Accounts) != 1 || got.Accounts[0].UID != "u1" {
+		t.Fatalf("accounts=%+v", got.Accounts)
+	}
+	if got.Accounts[0].Error != "" {
+		t.Fatalf("这次不该有逐账号错误: %q", got.Accounts[0].Error)
+	}
+	if len(got.Accounts[0].Packages) != 1 || got.Accounts[0].Packages[0].Size != 4000 {
+		t.Fatalf("逐包明细不对: %+v", got.Accounts[0])
+	}
+	if got.Accounts[0].Remain != 3817 || got.Accounts[0].Size != 4000 {
+		t.Fatalf("聚合 remain=%d size=%d，期望 3817/4000（used 先截断为 183，再相减）", got.Accounts[0].Remain, got.Accounts[0].Size)
+	}
+
+	noKey := httptest.NewRecorder()
+	p.ServeHTTP(noKey, httptest.NewRequest("GET", "/panel/api/packages", nil))
+	if noKey.Code != http.StatusUnauthorized {
+		t.Fatalf("未鉴权 code=%d", noKey.Code)
+	}
+}
+
+// roundTripFunc 让单测把上游钉成固定响应（不碰真网络）。
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // 面板改密钥后自己也要认新密钥，否则保存完立刻把自己挡在门外。
 func TestApplyAPIKeyHotSwap(t *testing.T) {

@@ -96,9 +96,20 @@ type Config struct {
 		File string `json:"file"` // 空 = 内置默认提示词
 	} `json:"prompt"`
 
+	// Logging 请求记录（运行日志页的「请求记录」）。
+	// request_client_info 是否在记录里带调用来源（IP/UA）——热改，无需重启。
+	// 归档（request_archive_*）跨重启保留请求记录；目录为空时默认为 state_file 同级的
+	// requests/（改 state_file 目录即跟着搬，与用量台账同口径）。归档段需重启生效。
+	Logging struct {
+		RequestClientInfo           bool   `json:"request_client_info"`
+		RequestArchiveEnabled       bool   `json:"request_archive_enabled"`
+		RequestArchiveDir           string `json:"request_archive_dir"`
+		RequestArchiveRetentionDays int    `json:"request_archive_retention_days"`
+		RequestArchiveMaxMB         int    `json:"request_archive_max_mb"`
+	} `json:"logging"`
+
 	// PromptText 解析后的提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
-
 
 	// 解析后
 	PlanCreditDur       time.Duration `json:"-"`
@@ -148,6 +159,10 @@ func Default() *Config {
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
 	c.Prompt.Mode = "passthrough"
+	// 请求归档保留/上限：写在这里（而不是只在 normalize 里补），否则 Default() 与
+	// ParseBody 的结果不一致，RestartFields 每次保存都误报一条「需重启」。
+	c.Logging.RequestArchiveRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 64
 	return c
 }
 
@@ -361,6 +376,12 @@ func (c *Config) normalize() error {
 	if c.DefaultModel == "" {
 		c.DefaultModel = "glm-5.2"
 	}
+	if c.Logging.RequestArchiveRetentionDays <= 0 {
+		c.Logging.RequestArchiveRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 64
+	}
 	if c.Listen == "" {
 		c.Listen = ":7864"
 	}
@@ -492,6 +513,13 @@ func RestartFields(bound, next *Config) []string {
 	}
 	if next.SessionSticky.GCInterval != bound.SessionSticky.GCInterval {
 		out = append(out, "session_sticky.gc_interval")
+	}
+	// 请求归档整段是启动时建的（reqlog.New 之后不再重配）；request_client_info 是热项，不在此列。
+	if next.Logging.RequestArchiveEnabled != bound.Logging.RequestArchiveEnabled ||
+		next.Logging.RequestArchiveDir != bound.Logging.RequestArchiveDir ||
+		next.Logging.RequestArchiveRetentionDays != bound.Logging.RequestArchiveRetentionDays ||
+		next.Logging.RequestArchiveMaxMB != bound.Logging.RequestArchiveMaxMB {
+		out = append(out, "logging.request_archive")
 	}
 	return out
 }

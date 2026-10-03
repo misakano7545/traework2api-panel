@@ -10,6 +10,7 @@ import (
 
 func TestPickHighestCredits(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.Add(&auth.Auth{UID: "u3"})
@@ -37,6 +38,7 @@ func TestPickSkipsCooling(t *testing.T) {
 
 func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetCredits("u1", 100)
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
@@ -58,6 +60,7 @@ func TestPickNilWhenAllCooling(t *testing.T) {
 
 func TestPickExcluding(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
 	p.SetCredits("u1", 100)
@@ -143,6 +146,7 @@ func TestSessionDeadNeedsThreeStrikesAndPersists(t *testing.T) {
 
 func TestEnableRevivesDisabled(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Disable("u1", "session dead")
 	if p.Pick() != nil {
@@ -161,6 +165,7 @@ func TestEnableRevivesDisabled(t *testing.T) {
 
 func TestReenableIfCredits(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Cooldown("u1", CoolPlan, time.Hour, "plan limit")
 	p.ReenableIfCredits("u1", 500)

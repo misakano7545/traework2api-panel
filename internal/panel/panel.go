@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"traework2api/internal/pool"
+	"traework2api/internal/reqlog"
 	"traework2api/internal/scheduler"
 	"traework2api/internal/upstream"
 	"traework2api/internal/usage"
@@ -26,15 +27,17 @@ import (
 
 // Config 面板依赖。AuthDir 用进程启动时的目录，改配置里的路径要重启才生效。
 type Config struct {
-	Pool       *pool.Pool
-	Upstream   *upstream.Client
-	Scheduler  *scheduler.Scheduler
-	AuthDir    string
-	APIKey     string
-	Version    string
-	Logs       *Ring
-	Models     func() []map[string]any
-	Usage      *usage.Recorder // 可选，用量台账
+	Pool      *pool.Pool
+	Upstream  *upstream.Client
+	Scheduler *scheduler.Scheduler
+	AuthDir   string
+	APIKey    string
+	Version   string
+	Logs      *Ring
+	Models    func() []map[string]any
+	Usage     *usage.Recorder // 可选，用量台账
+	// RequestLog 可选，请求级指标/归档（运行日志页的「请求记录」）。nil = 该接口 501。
+	RequestLog *reqlog.Recorder
 	ConfigPath string
 	LoadConfig func() (any, error)
 	SaveConfig func(raw []byte) ([]string, error)
@@ -73,7 +76,9 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
@@ -236,6 +241,86 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": p.cfg.Models()})
+}
+
+// packages 返回全部账号的积分包构成，供「积分构成」视图对比。
+// 逐账号**实时**查上游（同 balanceAll 的口径），失败的单列出来不拖累其余账号——
+// 一个号凭证过期不该让整页空白。国际版免费号没有积分套餐（只有一条 credits_limit=0 的
+// Free plan），返回空列表 + 0/0，由前端显示「无积分套餐」。
+func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	type item struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname,omitempty"`
+		Realm    string                   `json:"realm,omitempty"`
+		Remain   int64                    `json:"remain"`
+		Size     int64                    `json:"size"`
+		Packages []upstream.CreditPackage `json:"packages"`
+		Error    string                   `json:"error,omitempty"`
+	}
+	list := p.cfg.Pool.List()
+	out := make([]item, 0, len(list))
+	for _, st := range list {
+		it := item{UID: st.UID, Nickname: st.Nickname, Realm: st.Realm, Packages: []upstream.CreditPackage{}}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			it.Error = "凭证不可用"
+			out = append(out, it)
+			continue
+		}
+		packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+		if err != nil {
+			it.Error = err.Error()
+			out = append(out, it)
+			continue
+		}
+		it.Packages = packs
+		it.Remain = remain
+		it.Size = size
+		out = append(out, it)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
+
+// requestLogs 请求记录取数：优先读 JSONL 归档（可跨重启）；归档未开时回落到进程内最近 100 条
+// metrics.recent——否则「归档默认关」会让这一页永远空白，看起来像功能没做。
+// 筛选（关键字/结果）在前端做（一页最多 1000 条，零延迟）。
+func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RequestLog == nil {
+		writeErr(w, http.StatusNotImplemented, "request logger not available")
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	snap := p.cfg.RequestLog.Snapshot()
+	entries, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	archived := len(entries) > 0
+	if !archived {
+		// 归档未开（或尚无归档）：回落到进程内最近事件，倒序保持与归档一致。
+		entries = append([]reqlog.Event(nil), snap.Recent...)
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+	}
+	if entries == nil {
+		entries = []reqlog.Event{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"metrics":  snap,
+		"entries":  entries,
+		"limit":    limit,
+		"archived": archived,
+	})
 }
 
 // usage 返回逐请求用量聚合。hours 查询参数控制统计窗口（默认 72，上限 1440=60 天，

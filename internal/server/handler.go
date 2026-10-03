@@ -15,6 +15,7 @@ import (
 	"traework2api/internal/auth"
 	"traework2api/internal/pool"
 	"traework2api/internal/prompt"
+	"traework2api/internal/reqlog"
 	"traework2api/internal/session"
 	"traework2api/internal/upstream"
 	"traework2api/internal/usage"
@@ -33,6 +34,10 @@ type Config struct {
 	Session      *session.Router // 可选，会话粘性（同一会话粘同一账号）
 	Panel        http.Handler    // 可选，/panel/
 	Usage        *usage.Recorder // 可选，逐请求用量台账（按 账号×模型×时间片 分桶）
+	// RequestLog 可选，请求级指标/归档（nil = 不记录）。RequestClientInfo 决定事件里
+	// 是否填调用来源（IP/UA）——比 token 计数敏感，运营可自行决定是否落盘。
+	RequestLog        *reqlog.Recorder
+	RequestClientInfo bool
 	// 冷却/熔断/在途等池参数不在这里：它们在 pool.Limits（pool.ApplyLimits 热改），
 	// 由 pool 自己持有，避免"参数在 handler、执行在 pool"的两处漂移。
 }
@@ -130,10 +135,6 @@ func (h *Handler) applyPrompt(body []byte) []byte {
 		return prompt.Append(body, rt.PromptText)
 	}
 	return body
-}
-
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
 }
 
 // authOK 校验 Bearer 密钥；未设密钥（want 空）= 放行（仅本机）。
@@ -319,6 +320,16 @@ func (h *Handler) modelList() []map[string]any {
 			if mi.Effort != "" {
 				entry["reasoning_effort_config"] = mi.Effort
 			}
+			// 面板模型页要用的字段：展示名 / 最大输出 / 所属通道（仅面板消费，网关客户端忽略）。
+			if mi.Name != "" {
+				entry["name"] = mi.Name
+			}
+			if mi.MaxTokens > 0 {
+				entry["max_output_tokens"] = mi.MaxTokens
+			}
+			if mi.Function != "" {
+				entry["function"] = mi.Function
+			}
 			out = append(out, entry)
 		}
 		return out
@@ -480,6 +491,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 地区前缀（[realm:]model）在这里剥掉：后面 mapModel / 出站 body / 台账都用裸名。
 	realm, bareModel := resolveModel(peek.Model)
+	if tr := traceFrom(r); tr != nil {
+		tr.Model = bareModel
+	}
 	prefixed := bareModel != peek.Model
 	if !prefixed {
 		// 裸名：按模型表里该名字的归属地区兜底（表里没有 = 国内版，老客户端零回归）。
@@ -525,6 +539,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[acct.UID] = true
+		if tr := traceFrom(r); tr != nil && tr.Account == "" {
+			tr.Account = acct.UID
+		}
 		done, err := h.attempt(w, acct, body, peek, sessKey)
 		release()
 		if done {
@@ -627,6 +644,13 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 		})
 		cont.Close()
 		rc.Close()
+		// 空流（上游 200 但零模型事件）：这次尝试一个字节都没写给客户端，
+		// 换号重试比把空回复当成功更合适（照 Trae2api-cn 的「首事件前空响应可重试」）。
+		// 注意不能算 NoteError：空转不是账号故障，罚它会白白把好号熔断掉。
+		if errors.Is(serr, upstream.ErrEmptyStream) {
+			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
+			return false, serr
+		}
 		// 流内 error 事件走 onErr 回调后本函数仍返回 nil，所以「有 token_usage」才是这次
 		// 尝试真的产出了回复的判据；只看返回 err 会把 1005 记成成功。
 		ok := serr == nil && len(usg) > 0
@@ -647,6 +671,11 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 			// 流内错误与 HTTP 级错误走同一张分类表（noteFailure），避免两处口径漂移。
 			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
 			h.noteFailure(acct.UID, se.Kind())
+			return false, err
+		}
+		if errors.Is(err, upstream.ErrEmptyStream) {
+			// 同上：空转可换号重试，但不算账号故障（不 NoteError）。
+			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)
 			return false, err
 		}
 		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil)

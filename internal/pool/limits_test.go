@@ -10,6 +10,7 @@ import (
 // 快过期优先：窗口内有到期的号，就只在它们里选（哪怕积分更低）。
 func TestExpiringSoonPriority(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "big"})
 	p.Add(&auth.Auth{UID: "soon"})
 	p.SetCredits("big", 9000)
@@ -48,6 +49,7 @@ func TestMaxInFlight(t *testing.T) {
 // 闲置补偿：久未使用的号在权重上被抬到前面（积分相同时）。
 func TestIdleWeightPrefersColdAccount(t *testing.T) {
 	p := New("")
+	fixedPick(t, p)
 	p.Add(&auth.Auth{UID: "hot"})
 	p.Add(&auth.Auth{UID: "cold"})
 	p.SetCredits("hot", 1000)

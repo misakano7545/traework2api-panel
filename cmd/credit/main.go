@@ -69,7 +69,7 @@ func fetchEntUsage(af *authFile) (remain int64, limit int64, packs int, err erro
 		return 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	var env struct {
-		IsCreditsBilling bool `json:"is_credits_billing"`
+		IsCreditsBilling        bool `json:"is_credits_billing"`
 		UserEntitlementPackList []struct {
 			EntitlementBaseInfo struct {
 				Quota struct {

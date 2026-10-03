@@ -29,7 +29,8 @@ const (
 	ErrClient                     // 其他 4xx
 )
 
-// ErrNoIntlUG 国际版没有签到/积分接口（实测两个国际域上 EpCheckin*/EpEntUsage 全 404）。
+// ErrNoIntlUG 国际版没有**签到**接口（实测两个国际域上 EpCheckin* 全 404）。
+// 积分/套餐有接口，走 v1 路径（见 EpEntUsageIntl），不要拿这个错误去挡它。
 // 返回值语义：签到布尔 false、额度 0，调用方据此跳过即可，不要当失败重试。
 var ErrNoIntlUG = errors.New("国际版没有签到/积分接口")
 
@@ -519,15 +520,71 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 	return nil
 }
 
+// entUsagePath 积分接口路径：国际版只提供 v1（v2 在 api-sg-central 上恒 404）。
+func entUsagePath(a *auth.Auth) string {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		return EpEntUsageIntl
+	}
+	return EpEntUsage
+}
+
+// ugBaseFor 计费/UG 网关：国际版用账号自己的 ApiHost（登录回调 host），
+// 没有则回落 UgHostIntl。国内版恒为 UgHost。
+func (c *Client) ugBaseFor(a *auth.Auth) string {
+	if a != nil && a.Realm() == auth.RealmIntl {
+		if a.ApiHost != "" {
+			return a.ApiHost
+		}
+		return UgHostIntl
+	}
+	return c.ugBase()
+}
+
+// entUsagePack 一个套餐包的原始字段（国内 v2 与国际 v1 同形）。
+type entUsagePack struct {
+	DisplayDesc         string `json:"display_desc"`
+	GroupName           string `json:"group_name"`
+	GroupType           int    `json:"group_type"`
+	ExpireTime          int64  `json:"expire_time"`
+	YearlyExpireTime    int64  `json:"yearly_expire_time"`
+	SourceID            string `json:"source_id"`
+	EntitlementBaseInfo struct {
+		StartTime     int64  `json:"start_time"`
+		EndTime       int64  `json:"end_time"`
+		EntitlementID string `json:"entitlement_id"`
+		Quota         struct {
+			CreditsLimit int64 `json:"credits_limit"`
+		} `json:"quota"`
+	} `json:"entitlement_base_info"`
+	Usage struct {
+		CreditsAmount float64 `json:"credits_amount"`
+	} `json:"usage"`
+}
+
+// packExpiry 包的到期时刻：expire_time → entitlement_base_info.end_time → yearly_expire_time。
+// 国际版把 expire_time 恒填 0，真正的周期截止在 end_time（实测 Free plan：
+// expire_time=0、end_time=1793491199）；只读 expire_time 会让国际号永远没有到期日。
+func packExpiry(p entUsagePack) int64 {
+	for _, v := range []int64{p.ExpireTime, p.EntitlementBaseInfo.EndTime, p.YearlyExpireTime} {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
 // UserEntUsage 返回剩余积分、积分总额与最早的积分到期时间。
 // 每个 credits_limit>0 的包：remain += limit - used，
 // used 为 usage.credits_amount（与 cmd/credit 同一口径，截断为整数）。
-// expire 只在 expire_time > now 的包里取最小值（已过期的包不影响紧迫度排序），无则 0。
+//
+// 到期时间取两档（见下 packExpiry 注释）：
+//  1. 有积分面额的包里最早的一个未到期时刻——这是「积分到期」，也是选号「快过期优先」的依据；
+//  2. 一个积分包都没有时（国际版免费号只有 Free plan，credits_limit=0），回落到所有包的
+//     周期截止 end_time——否则国际号的「到期日期」恒为空，面板看着像功能坏了。
+//
+// 国际版走 v1 路径 + 计费网关（见 entUsagePath / ugBaseFor）。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err error) {
-	if a != nil && a.Realm() == auth.RealmIntl {
-		return 0, 0, 0, ErrNoIntlUG
-	}
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+entUsagePath(a), bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -537,35 +594,118 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err er
 		return 0, 0, 0, err
 	}
 	var resp struct {
-		IsCreditsBilling        bool `json:"is_credits_billing"`
-		UserEntitlementPackList []struct {
-			ExpireTime          int64 `json:"expire_time"`
-			EntitlementBaseInfo struct {
-				Quota struct {
-					CreditsLimit int64 `json:"credits_limit"`
-				} `json:"quota"`
-			} `json:"entitlement_base_info"`
-			Usage struct {
-				CreditsAmount float64 `json:"credits_amount"`
-			} `json:"usage"`
-		} `json:"user_entitlement_pack_list"`
+		IsCreditsBilling bool `json:"is_credits_billing"`
+		// UserEntitlementPackList 套餐列表（两地区同形，见 entUsagePack）。
+		UserEntitlementPackList []entUsagePack `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, 0, fmt.Errorf("ent usage parse: %w", err)
 	}
 	now := time.Now().Unix()
+	var expireCredit, expireAny int64
 	for _, p := range resp.UserEntitlementPackList {
+		e := packExpiry(p)
+		if e > now {
+			expireAny = earlier(expireAny, e)
+		}
 		limit := p.EntitlementBaseInfo.Quota.CreditsLimit
 		if limit <= 0 {
 			continue
 		}
 		remain += limit - int64(p.Usage.CreditsAmount)
 		total += limit // 面板「积分」列显示 剩余/总额
-		if p.ExpireTime > now && (expire == 0 || p.ExpireTime < expire) {
-			expire = p.ExpireTime
+		if e > now {
+			expireCredit = earlier(expireCredit, e)
 		}
 	}
-	return remain, total, expire, nil
+	if expireCredit > 0 {
+		return remain, total, expireCredit, nil
+	}
+	return remain, total, expireAny, nil
+}
+
+// earlier 取两个时刻里更早的非零值（0 = 未知）。
+func earlier(cur, v int64) int64 {
+	if v <= 0 {
+		return cur
+	}
+	if cur == 0 || v < cur {
+		return v
+	}
+	return cur
+}
+
+// CreditPackage 单个积分包的构成明细（面板「积分构成」用）。
+//
+// 上游 ide_user_ent_usage 的 user_entitlement_pack_list 每条即一个包（实测 5 条：
+// 老用户福利 / 免费 / 每月登录赠送 / 每日签到…）。只看聚合值看不出「余额为什么差
+// 这么多」，差别藏在包的面额（credits_limit）与到期时间（expire_time）里。
+type CreditPackage struct {
+	Name string `json:"name"` // display_desc（老用户福利 / 每月登录赠送 / 签到奖励）
+	// Group 分组名（用户福利 / 每月登录积分 / 每日签到），display_desc 缺失时的兜底展示名。
+	Group     string  `json:"group,omitempty"`
+	GroupType int     `json:"group_type,omitempty"`
+	Remain    int64   `json:"remain"` // credits_limit - credits_amount
+	Used      int64   `json:"used"`
+	Size      int64   `json:"size"`             // credits_limit
+	Expire    int64   `json:"expire,omitempty"` // 到期时间（Unix 秒）；0 = 上游没给
+	Start     int64   `json:"start,omitempty"`  // 发放时间（Unix 秒）
+	EntID     string  `json:"ent_id,omitempty"` // entitlement_id 或 source_id，供面板去重/对齐
+	Ratio     float64 `json:"-"`                // 占位：上游的用量比例已在 usage 里，暂不用
+}
+
+// CreditPackages 拉账号当前的逐包构成，并返回各包 remain / size 之和。
+// 只有 credits_limit > 0 的包算积分包（国内「免费」那条是订阅权益、没有面额，跳过）。
+// 国际版走 v1 路径（见 entUsagePath）：付费国际号有面额、免费号只有一条
+// `Free plan`（credits_limit=0）→ 返回空列表 + 0/0，面板据此显示「无积分套餐」，
+// 而不是把国际号整条当成接口不可用。
+func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, error) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBaseFor(a)+entUsagePath(a), bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	var resp struct {
+		UserEntitlementPackList []entUsagePack `json:"user_entitlement_pack_list"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, 0, 0, fmt.Errorf("packages parse: %w", err)
+	}
+	out := make([]CreditPackage, 0, len(resp.UserEntitlementPackList))
+	var sumRemain, sumSize int64
+	for _, p := range resp.UserEntitlementPackList {
+		limit := p.EntitlementBaseInfo.Quota.CreditsLimit
+		if limit <= 0 {
+			continue
+		}
+		used := int64(p.Usage.CreditsAmount)
+		remain := limit - used
+		if remain < 0 {
+			remain = 0
+		}
+		id := p.EntitlementBaseInfo.EntitlementID
+		if id == "" {
+			id = p.SourceID
+		}
+		out = append(out, CreditPackage{
+			Name:      p.DisplayDesc,
+			Group:     p.GroupName,
+			GroupType: p.GroupType,
+			Remain:    remain,
+			Used:      used,
+			Size:      limit,
+			Expire:    packExpiry(p),
+			Start:     p.EntitlementBaseInfo.StartTime,
+			EntID:     id,
+		})
+		sumRemain += remain
+		sumSize += limit
+	}
+	return out, sumRemain, sumSize, nil
 }
 
 // SetTimeouts 更新超时三元组：短 RPC 总时长 / 聊天首字节 / 聊天流内空闲。
