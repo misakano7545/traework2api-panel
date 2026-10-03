@@ -170,17 +170,18 @@ function usageCell(u) {
   const none = '<td class="num usage-cell" title="近 ' + usageHours + ' 小时没有调用记录">' +
     '<span style="color:var(--ink-3)">—</span></td>';
   if (!u || !u.requests) return none;
-  const tok = u.total_tokens ? fmtNum(u.total_tokens) : '—';
+  // token 一律走 fmtTok 换算单位（5.3m/84.3M）：裸千分位数字在窄列里读不出量级。
+  const tok = u.total_tokens ? fmtTok(u.total_tokens) : '—';
   const title = '近 ' + usageHours + ' 小时：' + fmtNum(u.requests) + ' 次调用' +
     (u.errors ? '（失败 ' + fmtNum(u.errors) + '）' : '') +
-    ' / ' + tok + ' tok / 平均延迟 ' + fmtLat(u.avg_latency_ms) +
+    ' / ' + tok + ' tok / 平均延迟 ' + fmtMs(u.avg_latency_ms) +
     ' / ' + fmtRate(u.avg_tokens_per_second);
   const t = esc(title);
   return '<td class="num usage-cell" title="' + t + '">' +
     '<span class="usage-line" aria-label="' + t + '">' +
     '<span class="usage-item usage-count"><b>' + fmtNum(u.requests) + '</b><em>次</em></span>' +
     '<span class="usage-item usage-total"><b>' + tok + '</b><em>tok</em></span>' +
-    '<span class="usage-item usage-latency"><b>' + fmtLat(u.avg_latency_ms) + '</b></span>' +
+    '<span class="usage-item usage-latency"><b>' + fmtMs(u.avg_latency_ms) + '</b></span>' +
     '<span class="usage-item usage-rate"><b>' + fmtRate(u.avg_tokens_per_second) + '</b></span>' +
     '</span></td>';
 }
@@ -738,7 +739,8 @@ async function loadLogs() {
 let usHours = '72';
 
 function fmtNum(n) { return Number(n || 0).toLocaleString('en-US'); }
-function fmtLat(v) { return v > 0 ? Math.round(v) + ' ms' : '—'; }
+/* 延迟一律走 fmtMs（≥1000ms 换算成秒）：fmtLat 曾经只给裸毫秒——「74700 ms」
+   这种数在表里读不出量级，与 token 列同一个毛病。 */
 function fmtRate(v) { return v > 0 ? (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' tok/s' : '—'; }
 
 /* usPct 占比文案（0 值不显示 "0.0%"，直接 —，避免一行全是零）。 */
@@ -838,16 +840,16 @@ function usTabsHtml(dims, active, counts) {
 function usRow(name, sub, a, withPerf) {
   return '<tr><td class="mark" aria-hidden="true"></td>' +
     '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
-    '<td class="num">' + fmtNum(a.requests) + '</td>' +
-    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtNum(a.errors) + '</span>' : '—') + '</td>' +
-    '<td class="num">' + fmtNum(a.prompt_tokens) + '</td>' +
-    '<td class="num">' + fmtNum(a.completion_tokens) + '</td>' +
-    '<td class="num">' + fmtNum(a.total_tokens) +
+    '<td class="num">' + fmtTok(a.requests) + '</td>' +
+    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.total_tokens) +
     usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
     '<td class="num">' + fmtHit(a) + '</td>' +
     '<td class="num">' + fmtCredits(a.credits) + '</td>' +
     (withPerf
-      ? '<td class="num">' + fmtLat(a.avg_latency_ms) + '</td>' +
+      ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
       : '') +
     '</tr>';
@@ -1003,16 +1005,16 @@ function renderUsage(d) {
   // 六张卡：主指标用强调色，completion 用成功色（与图表里的绿柱呼应），
   // 失败/延迟只在有值时上语义色——全绿全黄的仪表盘等于没有重点。
   $('usStats').innerHTML =
-    usKpi(fmtNum(reqs), '请求数', 'c-accent', errs ? '其中失败 ' + fmtNum(errs) + ' 次' : '全部成功') +
-    usKpi(fmtNum(total), '总 token', 'c-accent',
+    usKpi(fmtTok(reqs), '请求数', 'c-accent', errs ? '其中失败 ' + fmtNum(errs) + ' 次' : '全部成功') +
+    usKpi(fmtTok(total), '总 token', 'c-accent',
       'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
       '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
       '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
-    usKpi(fmtNum(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
-    usKpi(fmtNum(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
+    usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
+    usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
-    usKpi(fmtLat(t.avg_latency_ms), '平均延迟', 'c-soft',
+    usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft',
       t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本') +
     usKpi(fmtCredits(t.credits).replace(/<[^>]+>/g, ''), '估算积分', 'c-warn',
       '按官方单价推算，不是上游回报值');
@@ -1031,8 +1033,9 @@ function renderUsage(d) {
   // 按小时：同一份 series（窗口与卡片一致），列口径与 WB 的「按小时」一致（TRAE 无逐请求积分）。
   const series = usageData.series || [];
   if (series.length) {
+    // 时段标签走 usagePointTime（图表同一套）：直接塞分桶键会显示成 "2026-10-03T14"。
     $('usSeriesBody').innerHTML = series.map(p => usRow(
-      p.t, p.scope === 'day' ? '日' : '小时', p)).join('');
+      (usagePointTime(p.t) || {}).label || p.t, p.scope === 'day' ? '日' : '小时', p)).join('');
   } else usEmpty($('usSeriesBody'), 9, '这个窗口内还没有调用');
   $('usSeriesNote').textContent = usHours === '0' ? '全部历史（含折叠日桶）' : '按小时分片';
   renderUsageChart(series);
