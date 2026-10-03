@@ -404,7 +404,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
      这一页一屏要放下「两组 KPI + 图表 + 三张表」，所以视觉语言比账号池更轻：
      卡片用左侧色轨区分语义，数字用等宽体对齐，分隔靠留白而不是更多边框。 */
   /* KPI 卡：左侧 3px 色轨是唯一的重色，数值大、标签小，扫一眼就能读出量级。 */
-  .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  .kpis { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 10px; padding: 14px 17px 2px; }
   .kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   @media (max-width: 1180px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
@@ -960,7 +960,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc us">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>时段</th><th>请求</th><th>失败</th><th>Prompt</th><th>Completion</th><th>合计</th><th>缓存命中率</th>
+            <th>时段</th><th>请求</th><th>失败</th><th>Prompt</th><th>Completion</th><th>合计</th><th>缓存命中率</th><th title="按官方计费公式推算，不是上游回报值；未收录单价的模型不计入">积分≈</th>
           </tr></thead>
           <tbody id="usSeriesBody"></tbody>
         </table>

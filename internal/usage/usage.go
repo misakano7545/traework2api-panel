@@ -340,6 +340,10 @@ type Agg struct {
 	// 缺失的片把线断开——0% 命中与「上游没报」是两件事。omitempty 让老桶不带这两个键。
 	CacheHitTokens int64 `json:"cache_hit_tokens,omitempty"`
 	CacheSamples   int64 `json:"cache_samples,omitempty"`
+	// Credits 按官方计费公式**推算**的积分消耗（见 pricing.go）。不是上游回报值：
+	// 上游 token_usage 帧里没有积分字段。模型未收录时这份估算不含它，展示层要带「≈」。
+	// 口径 = 本聚合里所有能算出价的桶之和（未收录模型的桶不参与，不拿错单价凑数）。
+	Credits float64 `json:"credits,omitempty"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -360,6 +364,11 @@ func (g *aggAcc) add(b *bucket) {
 	g.TotalTokens += b.TT
 	g.CacheHitTokens += b.CH
 	g.CacheSamples += b.CHN
+	// 积分按**桶**推算再累加：桶知道 model，聚合行（按账号/按小时/总计）不知道。
+	// 放在这个唯一入口上，所有维度一次性都有值，也不用在展示层重算。
+	if c, ok := EstimateCredit(b.Model, b.PT, b.CT, b.CH); ok {
+		g.Credits += c
+	}
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS

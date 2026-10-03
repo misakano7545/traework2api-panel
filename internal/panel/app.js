@@ -406,6 +406,15 @@ function fmtLat(v) { return v > 0 ? Math.round(v) + ' ms' : '—'; }
 function fmtRate(v) { return v > 0 ? (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' tok/s' : '—'; }
 
 /* usPct 占比文案（0 值不显示 "0.0%"，直接 —，避免一行全是零）。 */
+/* fmtCredits 估算积分：小值（一次小请求）保留到 4 位才看得见，大值砍到 2 位。
+   0 / 缺值显示 —：0 积分与「这个模型没收录单价」在界面上不该混淆，后者带 title。 */
+function fmtCredits(v) {
+  const n = Number(v || 0);
+  if (!Number.isFinite(n) || n === 0) return '<span style="color:var(--ink-3)" title="没有可计价的调用，或该模型未收录单价">—</span>';
+  const s = n >= 10 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : n.toFixed(4);
+  return s.replace(/\.?0+$/, '');
+}
+
 function usPct(part, total) {
   const t = Number(total || 0);
   if (!t) return '—';
@@ -472,6 +481,9 @@ function usDimHead(dim) {
     '<th class="num">请求</th><th class="num">失败</th>' +
     '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
     '<th class="num">缓存命中率</th>' +
+    '<th class="num" title="按官方计费公式推算：输入/输出/缓存命中 token × 各自单价（积分/百万）。' +
+    '上游 token_usage 帧里没有积分字段，所以这是估算，不是回报值；未收录单价的模型不计入。">' +
+    '积分≈</th>' +
     (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
     '</tr>';
 }
@@ -497,6 +509,7 @@ function usRow(name, sub, a, withPerf) {
     '<td class="num">' + fmtNum(a.total_tokens) +
     usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
     '<td class="num">' + fmtHit(a) + '</td>' +
+    '<td class="num">' + fmtCredits(a.credits) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtLat(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -636,7 +649,7 @@ function renderUsageDim() {
     usRow(usDim === 'account' ? (x.extra || String(x.key || '').slice(0, 8)) : x.key,
       usDim === 'account' ? String(x.key || '').slice(0, 8) : '',
       x, m.withPerf)
-  ).join('') || '<tr><td colspan="' + (m.withPerf ? 10 : 8) + '"><div class="empty">这个窗口内还没有调用</div></td></tr>';
+  ).join('') || '<tr><td colspan="' + (m.withPerf ? 11 : 9) + '"><div class="empty">这个窗口内还没有调用</div></td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
@@ -664,7 +677,9 @@ function renderUsage(d) {
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
     usKpi(fmtLat(t.avg_latency_ms), '平均延迟', 'c-soft',
-      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本');
+      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本') +
+    usKpi(fmtCredits(t.credits).replace(/<[^>]+>/g, ''), '估算积分', 'c-warn',
+      '按官方单价推算，不是上游回报值');
 
   // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）。
   const win = usHours === '0' ? '全部历史' : '近 ' + usHours + ' 小时'
@@ -682,7 +697,7 @@ function renderUsage(d) {
   if (series.length) {
     $('usSeriesBody').innerHTML = series.map(p => usRow(
       p.t, p.scope === 'day' ? '日' : '小时', p)).join('');
-  } else usEmpty($('usSeriesBody'), 8, '这个窗口内还没有调用');
+  } else usEmpty($('usSeriesBody'), 9, '这个窗口内还没有调用');
   $('usSeriesNote').textContent = usHours === '0' ? '全部历史（含折叠日桶）' : '按小时分片';
   renderUsageChart(series);
 }
