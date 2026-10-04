@@ -34,6 +34,22 @@ const (
 // 返回值语义：签到布尔 false、额度 0，调用方据此跳过即可，不要当失败重试。
 var ErrNoIntlUG = errors.New("国际版没有签到/积分接口")
 
+// ErrCheckinAlready 上游 claim 回 9095（今日已签到）：这是一次幂等竞态，不是失败。
+// 与 status 的 checked_in 同义，调用方当「已签」处理——当成失败会让面板显示
+// 「签到失败：今日已签到」这种自相矛盾的结果（照 wild-work 的 DailyCheckin）。
+var ErrCheckinAlready = errors.New("今日已签到")
+
+// checkinAlreadyCode 签到 claim 的「今日已签到」业务码。
+const checkinAlreadyCode = 9095
+
+// checkinMsg 取 message/msg 两个键里先出现的那个（上游两个键都出现过）。
+func checkinMsg(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
+}
+
 func (k ErrKind) String() string {
 	switch k {
 	case ErrPlanLimit:
@@ -482,13 +498,26 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 		return false, 0, false, err
 	}
 	var resp struct {
-		CheckedIn    bool  `json:"checked_in"`
-		Credits      int64 `json:"credits"`
-		ExtraCredits int64 `json:"extra_credits"`
-		Enable       bool  `json:"enable"`
+		CheckedIn    bool   `json:"checked_in"`
+		Credits      int64  `json:"credits"`
+		ExtraCredits int64  `json:"extra_credits"`
+		Enable       bool   `json:"enable"`
+		Code         int    `json:"code"`
+		Message      string `json:"message"`
+		Msg          string `json:"msg"`
+		Success      *bool  `json:"success"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return false, 0, false, fmt.Errorf("checkin status parse: %w", err)
+	}
+	// 上游的错误信封（典型是限流 9074）**不带** checked_in/enable：不校验就一律读成
+	// enable=false，调度器会把限流当成「上游把这个号的签到关了」跳过（skipped，不冷却、
+	// 不报警），日志还写着 upstream disabled——限流被伪装成正常状态。校验后才能如实报出来。
+	if resp.Code != 0 {
+		return false, 0, false, &BusinessError{Code: resp.Code, Message: "签到状态：" + checkinMsg(resp.Message, resp.Msg)}
+	}
+	if resp.Success != nil && !*resp.Success {
+		return false, 0, false, &BusinessError{Code: resp.Code, Message: "签到状态：" + checkinMsg(resp.Message, resp.Msg)}
 	}
 	return resp.CheckedIn, resp.Credits + resp.ExtraCredits, resp.Enable, nil
 }
@@ -510,14 +539,24 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 	var resp struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
+		Msg     string `json:"msg"`
+		Success *bool  `json:"success"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return fmt.Errorf("checkin claim parse: %w", err)
 	}
-	if resp.Code != 0 {
-		return &BusinessError{Code: resp.Code, Message: "签到失败：" + resp.Message}
+	if resp.Code == 0 {
+		if resp.Success != nil && !*resp.Success {
+			return &BusinessError{Code: resp.Code, Message: "签到失败：" + checkinMsg(resp.Message, resp.Msg)}
+		}
+		return nil
 	}
-	return nil
+	// 9095「今日已签到」是幂等回执：与 status 的竞态（status 说没签、claim 说已签）会走到
+	// 这里，报成失败会让面板把「已经签上了」显示成红字失败。
+	if resp.Code == checkinAlreadyCode {
+		return ErrCheckinAlready
+	}
+	return &BusinessError{Code: resp.Code, Message: "签到失败：" + checkinMsg(resp.Message, resp.Msg)}
 }
 
 // entUsageBody 积分接口请求体。用**客户端自己的形状**，不是空体：

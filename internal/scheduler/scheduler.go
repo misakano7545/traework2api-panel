@@ -131,6 +131,15 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
+// checkinRefreshSkew 签到前预刷新窗口：access token 剩不到这么久就先换一张。
+const checkinRefreshSkew = 2 * time.Hour
+
+// isSessionDead 上游判定的「凭证失效」（401/1001 家族）：签到路径据此换票重试一次。
+func isSessionDead(err error) bool {
+	var ue *upstream.Error
+	return errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+}
+
 // checkinRetryInterval 补签扫描间隔。
 //
 // 上游 claim 的 9074（「当前参与用户太多」）此前误判为纯时段性拥塞；2026-10-02 实测：
@@ -316,7 +325,22 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		}
 		return res, nil
 	}
+	// 签到前把 access token 换新的：9 点签到离上一次保活（凌晨 3 点）有段距离，拿一张
+	// 已过期的票只会白跑一轮（照 wild-work：2h 内到期就先刷）。刷失败不在这里报错——真有
+	// 问题会让下面的 status 调用如实暴露，那条错误信息比「刷新失败」更贴题。
+	if _, err := s.cfg.Upstream.RefreshTokenIfNeeded(a, checkinRefreshSkew); err != nil {
+		log.Printf("checkin refresh %s: %v", uid, err)
+	}
 	checkedIn, reward, enable, serr := s.cfg.Upstream.CheckinStatus(a)
+	// token 被别处轮换/提前吊销 → status 报 session 失效：换一张新票再查一次，别把
+	// 「票过期」记成签到失败（这条只重试一次，重试前必须真的换到了新票）。
+	if isSessionDead(serr) {
+		if rerr := s.cfg.Upstream.RefreshToken(a); rerr != nil {
+			log.Printf("checkin token refresh %s: %v", uid, rerr)
+		} else if checkedIn, reward, enable, serr = s.cfg.Upstream.CheckinStatus(a); serr == nil {
+			log.Printf("checkin %s: status ok after token refresh", uid)
+		}
+	}
 	var checkinErr error
 	switch {
 	case serr != nil:
@@ -331,8 +355,15 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
 	default:
 		if err := s.claimWithRetry(a); err != nil {
-			checkinErr = err
-			log.Printf("checkin claim %s: %v", uid, err)
+			if errors.Is(err, upstream.ErrCheckinAlready) {
+				// 与 status 的竞态：status 说没签、claim 回 9095「今日已签到」。
+				// 这不是失败，按已签处理（照 wild-work 的 DailyCheckin）。
+				res.Status = "already"
+				log.Printf("checkin %s: already checked in (claim 9095)", uid)
+			} else {
+				checkinErr = err
+				log.Printf("checkin claim %s: %v", uid, err)
+			}
 		} else {
 			res.Status, res.Credits = "ok", reward
 			log.Printf("checkin %s: ok +%d", uid, reward)
