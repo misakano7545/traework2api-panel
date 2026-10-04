@@ -183,6 +183,23 @@ type Pool struct {
 
 // SetRandInt64N 注入抽签随机源：返回 0 即「权重最高者中签」（改造前的取最大语义），
 // 供需要确定性选号结果的测试使用（跨包测试用得上）。传 nil 还原默认随机源。
+// BumpDeviceSeed 给账号换一套 ug 族设备指纹（种子 +1）并落盘，返回新种子。
+//
+// 9074（设备维度限流）与 9095（设备已替别的账号签过）都是**设备维度**信号：换一套设备身份
+// 就能脱开旧标记；不能靠秒级重试（上游会延长限流窗口）。面板「换指纹」与调度器的自动轮换
+// 都走这一处，避免两边各写一遍落盘逻辑。
+func (p *Pool) BumpDeviceSeed(uid string) (seed int64, ok bool, err error) {
+	a := p.AuthByUID(uid)
+	if a == nil {
+		return 0, false, nil
+	}
+	a.SetDeviceSeed(a.DeviceSeedValue() + 1)
+	if err := a.SaveAtomic(); err != nil {
+		return a.DeviceSeedValue(), true, err
+	}
+	return a.DeviceSeedValue(), true, nil
+}
+
 func (p *Pool) SetRandInt64N(f func(int64) int64) {
 	p.mu.Lock()
 	p.randInt64N = f

@@ -41,7 +41,21 @@ var ErrNoIntlUG = errors.New("国际版没有签到/积分接口")
 var ErrCheckinAlready = errors.New("今日已签到")
 
 // checkinAlreadyCode 签到 claim 的「今日已签到」业务码。
+// ⚠️ 它**不能**当作「本账号已签」：上游的信息是**设备维度**的——同一台设备可能已经替
+// 另一个账号签过（Trae2api-cn src/trae_client.py 原注释：only the account status
+// endpoint can establish whether this account is checked in）。调用方据此换设备指纹，
+// 再由 status 复核定论。
 const checkinAlreadyCode = 9095
+
+// checkinRateLimitCode 签到 claim 的「当前参与用户太多」：与 9095 一样是设备维度信号，
+// 换设备指纹即可脱开；**不要**秒级内重试——上游原注释说第二次 claim 会延长限流窗口。
+const checkinRateLimitCode = 9074
+
+// IsCheckinRateLimited 报告错误是不是签到限流（9074）。
+func IsCheckinRateLimited(err error) bool {
+	var be *BusinessError
+	return errors.As(err, &be) && be.Code == checkinRateLimitCode
+}
 
 // checkinMsg 取 message/msg 两个键里先出现的那个（上游两个键都出现过）。
 func checkinMsg(a, b string) string {

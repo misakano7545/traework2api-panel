@@ -100,6 +100,11 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	// 轮转过的每个号都跟着躺下，几次就能把整池冻住。放在 4008/quota 之前，别被 "exceeded" 抢走。
 	case e.Code == 4026 || strings.Contains(lower, "context length"):
 		return ErrNone
+	case e.Code == 4001:
+		// 4001「模型配置不匹配」是**调用方问题**（模型名不在该账号配置里 / 走了错的 function
+		// 通道），罚号只会把好号降权。照 240xu/trae2api-more 的 IsModelConfigMismatch：
+		// 不冷却账号、如实回报。
+		return ErrNone
 	case e.Code == 4008 || strings.Contains(lower, "quota") ||
 		strings.Contains(lower, "exceeded") || strings.Contains(lower, "rate"):
 		return ErrSoftRate

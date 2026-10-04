@@ -153,6 +153,20 @@ func checkinPace() time.Duration {
 	return d
 }
 
+// bumpCheckinDevice 换一套 ug 族设备指纹（9074 限流 / 9095 设备维度已签时用）。
+// 失败只记日志：换指纹是补救动作，它失败不该把这次签到的结论改掉。
+func (s *Scheduler) bumpCheckinDevice(uid string) {
+	seed, ok, err := s.cfg.Pool.BumpDeviceSeed(uid)
+	switch {
+	case !ok:
+		log.Printf("checkin device bump %s: 账号不在池里", uid)
+	case err != nil:
+		log.Printf("checkin device bump %s: seed=%d 落盘失败: %v", uid, seed, err)
+	default:
+		log.Printf("checkin device bump %s: 已换设备指纹 seed=%d", uid, seed)
+	}
+}
+
 // isSessionDead 上游判定的「凭证失效」（401/1001 家族）：签到路径据此换票重试一次。
 func isSessionDead(err error) bool {
 	var ue *upstream.Error
@@ -376,25 +390,33 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		res.Status = "skipped"
 		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
 	default:
-		if err := s.claimWithRetry(a); err != nil {
-			if errors.Is(err, upstream.ErrCheckinAlready) {
-				// 与 status 的竞态：status 说没签、claim 回 9095「今日已签到」。
-				// 这不是失败，按已签处理（照 wild-work 的 DailyCheckin）。
-				res.Status = "already"
-				log.Printf("checkin %s: already checked in (claim 9095)", uid)
-			} else {
-				checkinErr = err
-				log.Printf("checkin claim %s: %v", uid, err)
+		claimErr := s.claimWithRetry(a)
+		switch {
+		case claimErr == nil:
+			// 交给下面的复核判定
+		case errors.Is(claimErr, upstream.ErrCheckinAlready):
+			// 9095「今日已签到」**不能**当「本账号已签」：上游这条信息是**设备维度**的，
+			// 同一台设备可能已经替另一个账号签过（Trae2api-cn 原注释：只有 status 能定论）。
+			// 不换设备的话下一轮还会回 9095——所以顺手换一套指纹，再由复核给结论。
+			s.bumpCheckinDevice(uid)
+			log.Printf("checkin %s: claim 9095（设备维度已签）→ 换设备指纹，以 status 复核", uid)
+		default:
+			checkinErr = claimErr
+			log.Printf("checkin claim %s: %v", uid, claimErr)
+			// 9074「当前参与用户太多」同样是设备维度限流：换一套指纹让**下一轮**脱开旧标记。
+			// 这里刻意不立刻重试——上游原注释说秒级内第二次 claim 会延长限流窗口
+			// （Trae2api-cn trae_client.py），补签扫描/手动点击自然带新身份再试。
+			if upstream.IsCheckinRateLimited(claimErr) {
+				s.bumpCheckinDevice(uid)
 			}
-		} else {
-			// 复核：claim 回 code 0 不等于真签上（上游偶发只回执不落账），再查一次 status，
-			// 只有 checked_in=true 才算成功。wild-work 的 DailyCheckin 与 star620/TraeTools
-			// 的 status→claim→status 都是这套。
+		}
+		// 复核（claim 成功与 9095 两条路径都要走）：只有 status 说 checked_in 才算签上。
+		// claim 回 code 0 不等于真签上（上游偶发只回执不落账）；9095 更是设备维度信息。
+		if checkinErr == nil {
 			if verified, _, _, verr := s.cfg.Upstream.CheckinStatus(a); verr != nil {
 				checkinErr = fmt.Errorf("签到复核失败：%w", verr)
 				log.Printf("checkin verify %s: %v", uid, verr)
 			} else if !verified {
-				// 按业务失败同口径：复核不过说明上游状态不自洽，给签到域短冷却，别在下一轮里硬追。
 				checkinErr = &upstream.BusinessError{Message: "签到复核未通过：上游仍报未签到"}
 				log.Printf("checkin verify %s: status still checked_in=false", uid)
 			} else {

@@ -56,26 +56,58 @@ func TestCheckinRefreshesTokenOnSessionDead(t *testing.T) {
 	}
 }
 
-// TestCheckinClaimAlreadyTreatedAsCheckedIn claim 回 9095（今日已签到）时按「已签」处理：
-// 报成失败会让面板显示「签到失败：今日已签到」。
-func TestCheckinClaimAlreadyTreatedAsCheckedIn(t *testing.T) {
+// TestCheckinClaim9095IsDeviceScoped 9095「今日已签到」是**设备维度**信息：同一台设备可能
+// 已经替另一个账号签过，所以不能据此判定本账号已签（Trae2api-cn 原注释：只有 status 能定论）。
+// 这里的处置：换一套设备指纹（不换的话下一轮还会回 9095）+ 以 status 复核定论。
+func TestCheckinClaim9095IsDeviceScoped(t *testing.T) {
 	f := &fakeUpstream{claimResponse: `{"code":9095,"message":"今日已签到"}`, resourceRemain: 500}
 	srv := f.server()
 	defer srv.Close()
 
+	a := &auth.Auth{UID: "u1", Domain: "trae.cn", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", Domain: "trae.cn", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(a)
 	s := newTestScheduler(f, p, srv)
 
 	res, err := s.CheckinUID("u1")
-	if err != nil {
-		t.Fatalf("9095 不该报错：%v", err)
-	}
-	if res.Status != "already" {
-		t.Fatalf("status=%q 期望 already（不是 failed）", res.Status)
+	// 假上游的 status 在 claim 成功后才会回 checked_in=true；9095 没落账 → 复核必须判失败，
+	// 绝不能凭 9095 就报「已签」（那正是这个测试要钉住的错误行为）。
+	if err == nil || res.Status != "failed" {
+		t.Fatalf("9095 不该当成已签：status=%q err=%v", res.Status, err)
 	}
 	if f.claimCalls.Load() != 1 {
-		t.Errorf("claim 次数=%d 期望 1", f.claimCalls.Load())
+		t.Errorf("claim 次数=%d 期望 1（不秒级重试）", f.claimCalls.Load())
+	}
+	if a.DeviceSeedValue() != 1 {
+		t.Errorf("9095 后应换一套设备指纹，实得 seed=%d", a.DeviceSeedValue())
+	}
+}
+
+// TestCheckin9074RotatesDeviceWithoutRetry 9074「当前参与用户太多」是设备维度限流：
+// 换一套设备指纹让下一轮脱开旧标记，但**不立刻重试**——上游原注释说秒级内第二次 claim
+// 会延长限流窗口（Trae2api-cn trae_client.py）。
+func TestCheckin9074RotatesDeviceWithoutRetry(t *testing.T) {
+	f := &fakeUpstream{claimResponse: `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`, resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	a := &auth.Auth{UID: "u1", Domain: "trae.cn", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	p := pool.New("")
+	p.Add(a)
+	s := newTestScheduler(f, p, srv)
+
+	res, err := s.CheckinUID("u1")
+	if err == nil || res.Status != "failed" {
+		t.Fatalf("限流应如实报失败：status=%q err=%v", res.Status, err)
+	}
+	if f.claimCalls.Load() != 1 {
+		t.Fatalf("claim 次数=%d 期望 1（不做秒级重试）", f.claimCalls.Load())
+	}
+	if a.DeviceSeedValue() != 1 {
+		t.Errorf("9074 后应换一套设备指纹，实得 seed=%d", a.DeviceSeedValue())
+	}
+	if st, _ := p.Status("u1"); !st.CheckinCooling {
+		t.Error("限流应记签到域冷却")
 	}
 }
 

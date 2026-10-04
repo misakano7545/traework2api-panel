@@ -32,6 +32,23 @@ func loginFakeUpstream(t *testing.T) (*upstream.Client, *httptest.Server) {
 	return up, srv
 }
 
+// TestParseCallbackDataParam 当前 SOLO 网页流程把 refreshToken 直接放裸 data 参数里，
+// 老回调才用 refreshToken 参数——两条都要认。
+func TestParseCallbackDataParam(t *testing.T) {
+	cb, err := parseCallback("http://127.0.0.1:18080/authorize?data=rt-from-data&host=api-sg-central.trae.ai")
+	if err != nil || cb.Refresh != "rt-from-data" {
+		t.Fatalf("data 参数没被认：refresh=%q err=%v", cb.Refresh, err)
+	}
+	if cb.Host != "api-sg-central.trae.ai" {
+		t.Errorf("host 丢了: %q", cb.Host)
+	}
+	// refreshToken 参数优先（老回调）
+	cb2, err := parseCallback("http://127.0.0.1:18080/authorize?refreshToken=rt-old&data=rt-new")
+	if err != nil || cb2.Refresh != "rt-old" {
+		t.Fatalf("refreshToken 应优先于 data：%q err=%v", cb2.Refresh, err)
+	}
+}
+
 // TestLoginRefreshTokenDirect refreshToken 直登：不开浏览器，把一条 refreshToken 换成凭证
 // 落盘进池（授权页回跳能不能落到面板与它无关，这是最稳的一条兜底）。
 func TestLoginRefreshTokenDirect(t *testing.T) {

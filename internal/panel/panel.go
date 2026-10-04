@@ -632,15 +632,14 @@ func (p *Panel) refreshBalance(uid string) error {
 // **只在用户点按钮时发生**：自动重试业务错误是钉过的红线（见 TestClaimNotRetriedOnBusinessError），
 // 这里是显式的人工动作，语义上不是重试。
 func (p *Panel) rotateDevice(uid string) error {
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+	seed, ok, err := p.cfg.Pool.BumpDeviceSeed(uid)
+	if !ok {
 		return scheduler.ErrNotFound
 	}
-	a.SetDeviceSeed(a.DeviceSeedValue() + 1)
-	if err := a.SaveAtomic(); err != nil {
+	if err != nil {
 		return err
 	}
-	log.Printf("panel: rotate device uid=%s seed=%d", uid, a.DeviceSeedValue())
+	log.Printf("panel: rotate device uid=%s seed=%d", uid, seed)
 	return nil
 }
 

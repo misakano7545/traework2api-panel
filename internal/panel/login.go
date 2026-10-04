@@ -335,6 +335,12 @@ func parseCallback(raw string) (callbackCreds, error) {
 	q := u.Query()
 	var cb callbackCreds
 	cb.Refresh = q.Get("refreshToken")
+	// 当前 SOLO 网页流程会把同一个 refreshToken 直接放在裸 `data` 参数里（不是 JSON 包一层）：
+	// refreshToken 参数优先（老回调），没有就取 data。照 240xu/trae2api-more 的
+	// ParseCallback（其 PORTING 记为 2026-08-31 生产实测）。
+	if cb.Refresh == "" {
+		cb.Refresh = q.Get("data")
+	}
 	cb.Host = q.Get("host")
 	if ui := parseJSONParam(q.Get("userInfo")); ui != nil {
 		cb.UID = asString(ui["UserID"])
