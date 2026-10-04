@@ -122,6 +122,27 @@ func TestParamConfigMetaVisibility(t *testing.T) {
 	}
 }
 
+// TestMergeCatalogMarksOldViewLeftovers 批量视图里没有的条目一律标「老视图独有」：客户端选择器
+// 不展示它们，而且老视图给的展示名不可信（实测 Dola-Seed-2.0-Code 顶着 "Seed-2.1-Turbo"）。
+// 只标记不删——删了 mapModel 会把它们判 400。
+func TestMergeCatalogMarksOldViewLeftovers(t *testing.T) {
+	list := []ModelInfo{
+		{ID: "solo_coder_search_agent", Name: "-", Function: FunctionCoder},
+		{ID: "Doubao-Seed-2.0-Code", Name: "Doubao-Seed-2.0-Code", Function: Function},
+		{ID: "glm-5.2", Name: "GLM-5.2", Function: Function},
+	}
+	cat := map[string]catalogMeta{"glm-5.2": {ID: "glm-5.2", Label: "GLM-5.2", Visible: true, Dev: 200000, Max: 1000000}}
+	out := mergeCatalog(list, cat, &auth.Auth{UID: "u1", Domain: "trae.cn"})
+	for _, i := range []int{0, 1} {
+		if !out[i].Legacy || out[i].LegacyWhy != "老视图独有（客户端选择器无此条目）" {
+			t.Errorf("批量视图没有的条目应标老视图独有：%+v", out[i])
+		}
+	}
+	if out[2].Legacy {
+		t.Errorf("批量视图可见的不该标记：%+v", out[2])
+	}
+}
+
 // TestFetchModelsMergesBatchCatalog 端到端：单 function 视图与客户端批量视图并存时，
 // FetchModels 用批量视图补齐新模型、标记上代、带上倍率与上下文双口径。
 func TestFetchModelsMergesBatchCatalog(t *testing.T) {

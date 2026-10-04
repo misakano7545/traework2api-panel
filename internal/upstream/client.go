@@ -663,7 +663,13 @@ func mergeCatalog(list []ModelInfo, cat map[string]catalogMeta, a *auth.Auth) []
 		seen[key] = true
 		m, ok := cat[key]
 		if !ok {
-			continue // 批量视图没有它（例如只在 coder 视图出现的国际模型）：不猜，保持原样
+			// 批量视图里没有它 = 客户端选择器不展示：老视图独有（solo_coder_search_agent 这类
+			// 内部子代理、gemini-3-pro-solo、Doubao-Seed-2.0-Code 等都落这里）。
+			// 只标记不删——删了 mapModel 会把它们判 400。实测这类条目的展示名还不可信
+			// （Dola-Seed-2.0-Code 顶着 "Seed-2.1-Turbo"、gemini-3-pro-solo 顶着 "GPT-5-medium"），
+			// 标记出来比猜一个名字诚实。
+			list[i].Legacy, list[i].LegacyWhy = true, "老视图独有（客户端选择器无此条目）"
+			continue
 		}
 		if m.Dev > 0 {
 			list[i].ContextWindow = m.Dev
