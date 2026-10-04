@@ -220,7 +220,11 @@ function renderAccounts(list) {
     // 免费号返回的 0 积分是真实状态，不是接口不可用。
     const intlOff = a.realm === 'intl' ? ' disabled title="国际版无签到"' : '';
     const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '"' + intlOff + '>签到</button>',
-      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>'];
+      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>',
+      // 换指纹 = 手动解 9074（设备维度风控）。设备号直接挂 tooltip：排障时要看得见当前值。
+      '<button class="xs" data-a="rotate-device" data-u="' + esc(a.uid) +
+        '" title="换一套签到/积分用的设备指纹；当前 ' + esc(a.device_id || '—') +
+        (a.device_seed ? '（已换过 ' + a.device_seed + ' 次）' : '') + '">换指纹</button>'];
     if (a.cooling) acts.push('<button class="xs" data-a="clear-cooldown" data-u="' + esc(a.uid) + '">解除冷却</button>');
     if (a.disabled) acts.push('<button class="xs" data-a="enable" data-u="' + esc(a.uid) + '">启用</button>');
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
@@ -1646,6 +1650,15 @@ function checkinMsg(rs, accounts) {
     } catch (e) { toast(e.message, 'err'); }
     loadOverview(true);
   };
+  $('btnRotateDeviceAll').onclick = async () => {
+    if (!confirm('给全部账号换一套设备指纹？签到/积分身份会变成全新的（服务端按设备重新计数）。')) return;
+    try {
+      const d = await api('accounts/rotate-device-all', { method: 'POST', body: '{}' });
+      if (d.rotated_failed) toast('已换指纹，' + d.rotated_failed + ' 个失败（看运行日志）', 'err');
+      else toast('已全部换指纹', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+    loadOverview(true);
+  };
   $('accBody').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-a]');
     if (!b) return;
@@ -1653,6 +1666,7 @@ function checkinMsg(rs, accounts) {
     if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
     if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
     if (a === 'enable' && !confirm('重新启用该账号，让它立刻参与选号？')) return;
+    if (a === 'rotate-device' && !confirm('换一套签到/积分设备指纹？服务端按设备记账，换号即重新计数（9074 风控时用它脱开旧标记）。')) return;
     b.disabled = true;
     try {
       const r = await api('accounts/' + encodeURIComponent(u) + '/' + a, { method: 'POST', body: '{}' });
@@ -1663,6 +1677,7 @@ function checkinMsg(rs, accounts) {
         toast('积分已刷新' + (r.account ? '，积分包 ' + r.account.credits +
           (r.account.credits_total ? '/' + r.account.credits_total : '') : ''), 'ok');
       } else if (a === 'clear-cooldown') toast('已解除冷却', 'ok');
+      else if (a === 'rotate-device') toast('已换设备指纹' + (r.device_id ? '：' + r.device_id : ''), 'ok');
       else if (a === 'disable') toast('已禁用', 'ok');
       else if (a === 'enable') toast('已启用', 'ok');
       else toast('已移除', 'ok');

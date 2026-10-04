@@ -96,6 +96,9 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/enable", p.withAuth(p.accountEnable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/clear-cooldown", p.withAuth(p.accountClear))
+	// 换 ug 族设备指纹（手动解 9074 风控标记）。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/rotate-device", p.withAuth(p.accountRotateDevice))
+	p.mux.HandleFunc("POST /panel/api/accounts/rotate-device-all", p.withAuth(p.rotateDeviceAll))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	return p
 }
@@ -164,6 +167,10 @@ type accountRow struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	ErrTotal     int64     `json:"err_total,omitempty"`
 	LastSuccess  time.Time `json:"last_success,omitempty"`
+	// ug 族设备指纹（签到/积分用的那套，按 uid + 种子派生）：面板展示 + 「换指纹」用。
+	// 9074 是设备维度风控，换一个设备号就能脱开旧标记（star620/TraeTools 的做法）。
+	DeviceID   string `json:"device_id,omitempty"`
+	DeviceSeed int64  `json:"device_seed,omitempty"`
 }
 
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) { p.writeOverview(w, nil) }
@@ -188,6 +195,10 @@ func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 	rows := make([]accountRow, len(list))
 	for i, st := range list {
 		rows[i] = accountRow{Status: st}
+		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil {
+			rows[i].DeviceID = upstream.UGDeviceID(a)
+			rows[i].DeviceSeed = a.DeviceSeedValue()
+		}
 	}
 	for _, a := range p.cfg.Usage.Snapshot(usagePanelHours, p.nicks()).ByAccount {
 		for i := range rows {
@@ -613,6 +624,57 @@ func (p *Panel) refreshBalance(uid string) error {
 	}
 	p.cfg.Pool.SetCreditsExpire(uid, remain, total, expire)
 	return nil
+}
+
+// rotateDevice 给账号换一套 ug 族设备指纹（种子 +1）并落盘。
+//
+// 用途：9074「当前参与用户太多」是设备维度风控，换设备号能脱开旧标记。
+// **只在用户点按钮时发生**：自动重试业务错误是钉过的红线（见 TestClaimNotRetriedOnBusinessError），
+// 这里是显式的人工动作，语义上不是重试。
+func (p *Panel) rotateDevice(uid string) error {
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return scheduler.ErrNotFound
+	}
+	a.SetDeviceSeed(a.DeviceSeedValue() + 1)
+	if err := a.SaveAtomic(); err != nil {
+		return err
+	}
+	log.Printf("panel: rotate device uid=%s seed=%d", uid, a.DeviceSeedValue())
+	return nil
+}
+
+func (p *Panel) accountRotateDevice(w http.ResponseWriter, r *http.Request) {
+	uid, ok := p.uidFrom(w, r)
+	if !ok {
+		return
+	}
+	if err := p.rotateDevice(uid); err != nil {
+		code := http.StatusBadGateway
+		if errors.Is(err, scheduler.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, publicErr(err))
+		return
+	}
+	st, _ := p.cfg.Pool.Status(uid)
+	dev := ""
+	if a := p.cfg.Pool.AuthByUID(uid); a != nil {
+		dev = upstream.UGDeviceID(a)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st, "device_id": dev})
+}
+
+// rotateDeviceAll 一键给全部账号换指纹（风控按设备维度批量标记时用）。
+func (p *Panel) rotateDeviceAll(w http.ResponseWriter, r *http.Request) {
+	failed := 0
+	for _, st := range p.cfg.Pool.List() {
+		if err := p.rotateDevice(st.UID); err != nil {
+			failed++
+			log.Printf("panel: rotate device uid=%s failed: %v", st.UID, err)
+		}
+	}
+	p.writeOverview(w, map[string]any{"rotated_failed": failed})
 }
 
 func (p *Panel) uidFrom(w http.ResponseWriter, r *http.Request) (string, bool) {

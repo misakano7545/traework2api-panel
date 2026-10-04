@@ -29,6 +29,10 @@ type Auth struct {
 	ApiHost      string // "https://api.trae.com.cn"（ExchangeToken host）
 	MachineID    string // x-machine-id
 	DeviceID     string // x-device-id
+	// DeviceSeed ug 族（签到/积分）伪设备指纹的种子：0 = 按 uid 派生的原始身份，
+	// 非 0 = 换过指纹（把种子拌进派生输入）。★ 与 DeviceID 不是一回事：DeviceID 是登录
+	// 时拿到的客户端设备号（对话路径用），ug 族用的是这里派生的那套。
+	DeviceSeed   int64
 	UID          string
 	EnterpriseID string
 	Nickname     string
@@ -78,6 +82,20 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// DeviceSeedValue 读 ug 族设备指纹种子（同 JWT/RefreshTokenValue 的读锁口径）。
+func (a *Auth) DeviceSeedValue() int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.DeviceSeed
+}
+
+// SetDeviceSeed 换一套 ug 族设备指纹（调用方负责随后 SaveAtomic 落盘）。
+func (a *Auth) SetDeviceSeed(seed int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.DeviceSeed = seed
+}
+
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	a.mu.RLock()
@@ -106,6 +124,7 @@ func parseNested(raw []byte) (*Auth, error) {
 			ApiHost      string `json:"apiHost"`
 			MachineID    string `json:"machineId"`
 			DeviceID     string `json:"deviceId"`
+			DeviceSeed   int64  `json:"deviceSeed"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -124,6 +143,7 @@ func parseNested(raw []byte) (*Auth, error) {
 		ApiHost:      n.Auth.ApiHost,
 		MachineID:    n.Auth.MachineID,
 		DeviceID:     n.Auth.DeviceID,
+		DeviceSeed:   n.Auth.DeviceSeed,
 		UID:          n.Account.UID,
 		EnterpriseID: n.Account.EnterpriseID,
 		Nickname:     n.Account.Nickname,
@@ -142,6 +162,7 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ApiHost      string `json:"apiHost"`
 		MachineID    string `json:"machineId"`
 		DeviceID     string `json:"deviceId"`
+		DeviceSeed   int64  `json:"deviceSeed"`
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
@@ -157,6 +178,7 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ApiHost:      f.ApiHost,
 		MachineID:    f.MachineID,
 		DeviceID:     f.DeviceID,
+		DeviceSeed:   f.DeviceSeed,
 		UID:          f.UID,
 		EnterpriseID: f.EnterpriseID,
 		Nickname:     f.Nickname,
@@ -215,6 +237,7 @@ func (a *Auth) saveAtomicLocked() error {
 			"apiHost":      a.ApiHost,
 			"machineId":    a.MachineID,
 			"deviceId":     a.DeviceID,
+			"deviceSeed":   a.DeviceSeed,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,

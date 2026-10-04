@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -271,7 +272,7 @@ func TestCheckinAllSurfacesUpstreamFailure(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			_, _ = w.Write([]byte(`{"code":9074,"message":"当前参与用户太多，请稍后再试"}`))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
-			_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[]}`))
+			_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":500}},"usage":{"credits_amount":100}}]}`))
 		}
 	}))
 	defer srv.Close()
@@ -291,14 +292,22 @@ func TestCheckinAllSurfacesUpstreamFailure(t *testing.T) {
 
 // 签到成功要如实回报本次到账积分——前端 toast 读的就是这个数，不能只回一句"签到完成"。
 func TestCheckinAllReportsEarnedCredits(t *testing.T) {
+	// claim 成功后 status 要报 checked_in=true：调度器现在有 claim 后复核（status→claim→status），
+	// 假上游永远回 false 会让复核永远失败——假的就得照真实上游的序说话。
+	var claimed atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
-			_, _ = w.Write([]byte(`{"checked_in":false,"credits":150,"extra_credits":50,"enable":true}`))
+			checked := "false"
+			if claimed.Load() {
+				checked = "true"
+			}
+			_, _ = w.Write([]byte(`{"checked_in":` + checked + `,"credits":150,"extra_credits":50,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
+			claimed.Store(true)
 			_, _ = w.Write([]byte(`{"code":0,"message":"success"}`))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
-			_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[]}`))
+			_, _ = w.Write([]byte(`{"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":500}},"usage":{"credits_amount":100}}]}`))
 		}
 	}))
 	defer srv.Close()
