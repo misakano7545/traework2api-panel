@@ -351,8 +351,13 @@ type ModelInfo struct {
 	Thinking   string
 	Effort     string
 
-	// Function 该模型属于哪条通道（solo_work_lite / solo_coder）：出站 function 要跟着模型走，
-	// 不然 coder 面的模型会被 Work 通道判 4001。
+	// Function 该模型属于哪条通道（solo_work_lite / solo_coder）：出站 function 跟着模型走。
+	//
+	// ⚠️ 2026-10-04 配对实测：function **不构成可调用性约束**——4 个模型（glm-5.2 /
+	// glm-5.3-flash / kimi-k2.8-preview / DeepSeek-V4-Flash）× 4 根轴
+	// （solo_work_lite / solo_agent / chat_v3 / solo_coder）16/16 全 200 且都有正文 + usage。
+	// 此前「coder 面的模型会被 Work 通道判 4001」与 240xu 待验证的「solo_agent 换轴」都
+	// 复现不出来，所以按模型分通道只是**组织方式**，不是必需；别再为它改路由。
 	Function string
 
 	// 以下来自客户端模型选择器视图（batch_get_detail_param，见 fetchBatchCatalog）：
