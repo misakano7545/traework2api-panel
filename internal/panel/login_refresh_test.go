@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,81 +69,5 @@ func TestLoginRefreshTokenDirect(t *testing.T) {
 	p.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusBadRequest {
 		t.Errorf("空 refreshToken 应 400，实得 %d", rec2.Code)
-	}
-}
-
-// TestOAuthCallbackRoute 公网回跳路由：授权页把浏览器跳回 /panel/oauth/callback/{id}/authorize
-// 时，凭证按与「粘贴回跳」完全相同的路径落盘；会话一次性（同一个 id 不能复用）。
-func TestOAuthCallbackRoute(t *testing.T) {
-	up, srv := loginFakeUpstream(t)
-	defer srv.Close()
-	dir := t.TempDir()
-	pl := pool.New("")
-	p := New(Config{Pool: pl, Upstream: up, AuthDir: dir, APIKey: "k", Logs: NewRing(20)})
-
-	// 先开一次登录会话
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/panel/api/login/start", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer k")
-	p.ServeHTTP(rec, req)
-	var start struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &start); err != nil || start.ID == "" {
-		t.Fatalf("拿不到会话 id: %s", rec.Body)
-	}
-
-	cb := "/panel/oauth/callback/" + start.ID + "/authorize?refreshToken=rt-cb&host=" + url.QueryEscape(srv.URL)
-	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest("GET", cb, nil) // 浏览器跳转：没有 Authorization 头
-	p.ServeHTTP(rec2, req2)
-	if rec2.Code != 200 {
-		t.Fatalf("回跳应 200，实得 %d %s", rec2.Code, rec2.Body)
-	}
-	if !strings.Contains(rec2.Body.String(), "已加入账号池") {
-		t.Errorf("回跳应回一个可读结果页: %s", rec2.Body)
-	}
-	if _, ok := pl.Status("user_1"); !ok {
-		t.Error("回跳后账号没有进池")
-	}
-	// 会话一次性：同一 id 再来一次必须失败（别让一条回跳被反复重放）
-	rec3 := httptest.NewRecorder()
-	p.ServeHTTP(rec3, httptest.NewRequest("GET", cb, nil))
-	if rec3.Code == 200 {
-		t.Error("同一个会话 id 不该能重放")
-	}
-}
-
-// TestLoginStartCallbackBase callback_base 只接受干净的 origin：带路径/查询串的地址会让
-// 回跳落到意料之外的路径，直接拒掉比事后排查便宜。
-func TestLoginStartCallbackBase(t *testing.T) {
-	p := New(Config{Pool: pool.New(""), APIKey: "k", Logs: NewRing(20)})
-	post := func(body string) (int, string) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/panel/api/login/start", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer k")
-		p.ServeHTTP(rec, req)
-		var out struct {
-			ID  string `json:"id"`
-			URL string `json:"url"`
-		}
-		json.Unmarshal(rec.Body.Bytes(), &out)
-		return rec.Code, out.URL
-	}
-	code, link := post(`{"callback_base":"https://panel.example.com"}`)
-	if code != 200 {
-		t.Fatalf("合法 callback_base 应 200，实得 %d", code)
-	}
-	if !strings.Contains(link, url.QueryEscape("/panel/oauth/callback/")) || !strings.Contains(link, url.QueryEscape("/authorize")) {
-		t.Errorf("回跳应指向面板自己的 /panel/oauth/callback/<id>/authorize: %s", link)
-	}
-	for _, bad := range []string{`{"callback_base":"panel.example.com"}`, `{"callback_base":"ftp://x"}`, `{"callback_base":"https://x/y"}`, `{"callback_base":"https://x?a=1"}`} {
-		if code, _ := post(bad); code != http.StatusBadRequest {
-			t.Errorf("%s 应 400，实得 %d", bad, code)
-		}
-	}
-	// 不传 callback_base → 仍是 TRAE 认的那条 127.0.0.1 回调（默认行为不变）
-	if _, link := post(`{}`); !strings.Contains(link, url.QueryEscape(traeCallback)) {
-		t.Errorf("缺省应保持 TRAE 那条回调: %s", link)
 	}
 }

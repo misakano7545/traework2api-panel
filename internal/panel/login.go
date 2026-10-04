@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"net/http"
@@ -29,11 +28,26 @@ const loginTTL = 15 * time.Minute
 //   - http://127.0.0.1:18080/panel/oauth/callback/test  ✗（端口对、路径不对也不行）
 //   - http://127.0.0.1:18080/authorize                  ✓ 只有这条进得来登录页
 //
-// 注意这四条的对照里**只有成功那条的路径以 /authorize 结尾**（c3h3-ci/ai-proxy 的抓包结论
-// 也是「授权页可向任意可达地址交付 token，与 host 无关」，它已推翻同类的「绑 127.0.0.1」判断）。
-// 所以判据可能是**路径**而不是 host，尚未验证——loginStart 因此接受一个可选的 callback_base
-// （http(s)://host[:port]），把回跳引到面板自己的 /panel/oauth/callback/<id>/authorize 上；
-// 缺省不传，维持这条实测能用的地址，粘贴回跳那条路照旧。实验一次即可定论，别急着改缺省值。
+// 判据是**整条 URL 精确匹配**，2026-10-04 用无头浏览器渲染授权页实测（同一条链接只换
+// auth_callback_url，看页面是登录页还是「登录失败 网络错误」）：
+//
+//	http://127.0.0.1:18080/authorize                                    ✓
+//	https://127.0.0.1:18080/authorize                                   ✗（只换了 scheme）
+//	http://127.0.0.1:18080/panel/oauth/callback/<id>/authorize          ✗（host+端口对，路径不对）
+//	https://trae.misakano.kdns.fr/authorize                             ✗（路径对，host 不对）
+//	https://trae.misakano.kdns.fr/panel/oauth/callback/<id>/authorize   ✗
+//
+// 另跑一次对照证明「改 URL 就拒」不成立（只动无关的 login_trace_id 仍进登录页），所以上面
+// 几条的差异确实来自回调地址本身。
+//
+// 结论：公网回跳在架构上做不到——回调必须是**浏览器那台机器**的 127.0.0.1:18080/authorize，
+// 面板在服务器上，永远不可能是那个 host。想免粘贴只有两条：① 浏览器所在机器跑个本机中继
+// （把 127.0.0.1:18080/authorize 收到的查询串转给面板）；② **refreshToken 直登**
+// （见 loginRefresh，已实现，最稳）。粘贴回跳那条路保持可用。
+//
+// 注：c3h3-ci/ai-proxy 的「授权页可向任意可达地址交付 token」来自它另一条登录入口
+// （账号密码登录把凭证 POST 到它自己的回调域 mon.zijieapi.com），**不适用于**这里的
+// IDE 授权页 auth_callback_url，别照搬。
 const traeCallback = "http://127.0.0.1:18080/authorize"
 
 var errLoginSession = errors.New("登录链接已失效，请回面板重新点「登录账号」")
@@ -74,10 +88,7 @@ func randHex(n int) (string, error) {
 
 // loginURL 按地区生成登录链接：国际版同参数换域（www.trae.ai）+ 国际版客户端版本号。
 // ponytail: 参数集与国内版逐项一致——实测国际版登录页认这套（client_id 两边相同）。
-func loginURL(machine, device, realm, callback string) (string, error) {
-	if callback == "" {
-		callback = traeCallback
-	}
+func loginURL(machine, device, realm string) (string, error) {
 	trace, err := randHex(8)
 	if err != nil {
 		return "", err
@@ -91,7 +102,7 @@ func loginURL(machine, device, realm, callback string) (string, error) {
 	q.Set("client_id", upstream.ClientID)
 	q.Set("redirect", "0")
 	q.Set("login_trace_id", trace)
-	q.Set("auth_callback_url", callback)
+	q.Set("auth_callback_url", traeCallback)
 	q.Set("machine_id", machine)
 	q.Set("device_id", device)
 	q.Set("x_device_id", device)
@@ -124,30 +135,17 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "random failed")
 		return
 	}
-	// 面板可以带 {"realm":"intl"} 要一条国际版链接（缺省国内版）；
-	// 也可以带 {"callback_base":"https://面板域名"} 要一条把回跳甩给面板自己的链接。
+	// 面板可以带 {"realm":"intl"} 要一条国际版链接（缺省国内版）。
 	realm := auth.RealmCN
-	callback := traeCallback
 	if raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<12)); len(raw) > 0 {
 		var reqBody struct {
-			Realm        string `json:"realm"`
-			CallbackBase string `json:"callback_base"`
+			Realm string `json:"realm"`
 		}
-		if json.Unmarshal(raw, &reqBody) == nil {
-			if reqBody.Realm == auth.RealmIntl {
-				realm = auth.RealmIntl
-			}
-			if b := strings.TrimSpace(reqBody.CallbackBase); b != "" {
-				u, uerr := url.Parse(b)
-				if uerr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Path != "" {
-					writeErr(w, http.StatusBadRequest, "callback_base 需形如 http(s)://host[:port]")
-					return
-				}
-				callback = strings.TrimRight(b, "/") + "/panel/oauth/callback/" + id + "/authorize"
-			}
+		if json.Unmarshal(raw, &reqBody) == nil && reqBody.Realm == auth.RealmIntl {
+			realm = auth.RealmIntl
 		}
 	}
-	link, err := loginURL(machine, device, realm, callback)
+	link, err := loginURL(machine, device, realm)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "login url failed")
 		return
@@ -273,40 +271,6 @@ func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, co
 	p.loginMu.Unlock()
 	log.Printf("panel: account added uid=%s", uid)
 	return uid, nick, http.StatusOK, nil
-}
-
-// oauthCallback 公网回跳：授权页把浏览器跳回这里（回调地址 = callback_base + 本路径）。
-//
-// 无需面板密钥——浏览器跳转不带 Authorization 头；鉴权靠路径里那个一次性随机会话 id
-// （randHex(16)，15 分钟过期，用后即删），猜不到就没法往池子里塞别人的号。
-// 凭证解析与「粘贴回跳」共用 parseCallback + completeLogin，两条路行为完全一致。
-func (p *Panel) oauthCallback(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	// 授权页可能 GET 回跳，也可能 POST 回来（表单里带参数）：一并合进 query 再解析。
-	q := r.URL.Query()
-	if r.Method == http.MethodPost {
-		_ = r.ParseForm()
-		for k, v := range r.PostForm {
-			if q.Get(k) == "" && len(v) > 0 {
-				q.Set(k, v[0])
-			}
-		}
-	}
-	cb, err := parseCallback(r.URL.Path + "?" + q.Encode())
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "回跳里没有 refreshToken")
-		return
-	}
-	uid, nick, code, err := p.completeLogin(id, cb)
-	if err != nil {
-		writeErr(w, code, err.Error())
-		return
-	}
-	log.Printf("panel: account added uid=%s via oauth callback", uid)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>登录完成</title>
-<body style="font:15px system-ui;padding:2rem">账号 <b>%s</b>（%s）已加入账号池，可以关掉本页回到面板。</body>`,
-		html.EscapeString(nick), html.EscapeString(uid))
 }
 
 // loginRefresh refreshToken 直登：不经过浏览器，把一条 refreshToken 直接换成凭证落盘。

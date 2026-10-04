@@ -1488,20 +1488,7 @@ function openAdd() {
   $('callback').value = '';
   $('addRefreshToken').value = '';
   $('addVeil').classList.add('on');
-  loadAddLink();
-}
-
-// loadAddLink 取授权链接。勾了「公网回跳」就把回跳甩给面板自己（callback_base 用当前
-// origin）；不勾就用 TRAE 认的那条 127.0.0.1:18080，回来后粘贴。
-function loadAddLink() {
-  $('addLoad').hidden = false;
-  $('addReady').hidden = true;
-  $('btnCopyUrl').hidden = true;
-  $('btnOpenUrl').hidden = true;
-  $('btnAddFinish').hidden = true;
-  const body = { realm: addRealm };
-  if ($('addPublicCb').checked) body.callback_base = location.origin;
-  api('login/start', { method: 'POST', body: JSON.stringify(body) }).then(d => {
+  api('login/start', { method: 'POST', body: JSON.stringify({ realm: addRealm }) }).then(d => {
     loginID = d.id;
     $('addUrl').textContent = d.url;
     $('addLoad').hidden = true;
@@ -1603,7 +1590,6 @@ function boot() {
   $('btnOpenUrl').onclick = () => window.open($('addUrl').textContent, '_blank', 'noopener');
   $('btnAddFinish').onclick = finishAdd;
   $('btnRefreshLogin').onclick = refreshLogin;
-  $('addPublicCb').onchange = loadAddLink;
   $('callback').addEventListener('keydown', e => { if (e.key === 'Enter') finishAdd(); });
   $('btnKey').onclick = submitKey;
   $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitKey(); });

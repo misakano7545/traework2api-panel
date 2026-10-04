@@ -1068,15 +1068,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg">
     <header>
       <h3>添加账号</h3>
-      <div class="hint">在浏览器打开链接登录。缺省回调是 TRAE 自己那条 <code>http://127.0.0.1:18080/authorize</code>（那里没人监听、页面打不开是正常的），把地址栏整段贴回下面即可换票落盘。<b>若勾上「公网回跳」</b>，回跳改指向本面板，登录完会自动完成、不用粘贴（这是实验项：授权页是否只认路径以 <code>/authorize</code> 结尾的地址，尚未验证）。<br>不想开浏览器也行：直接把一条 refreshToken 填到底部「refreshToken 直登」。</div>
+      <div class="hint">在浏览器打开链接登录。TRAE 只肯把浏览器跳回它自己的本机地址 <code>http://127.0.0.1:18080/authorize</code>（那里没人监听，页面会打不开，这是正常的），把地址栏整段贴回下面即可换票落盘。<br>已实测：公网地址（含本面板域名）会被授权页直接拒掉（「登录失败 网络错误」），所以免粘贴只能走底部那条 <b>refreshToken 直登</b>。</div>
     </header>
     <div class="body">
       <span class="chips" id="addRealm" style="margin-bottom:10px">
         <button class="chip on" data-realm="cn">国内版</button>
         <button class="chip" data-realm="intl">国际版</button>
       </span>
-      <div class="switch" style="margin-bottom:10px"><span class="lb">公网回跳（免粘贴，实验）</span>
-        <input type="checkbox" id="addPublicCb"></div>
       <div id="addLoad" class="state"><span class="dots">正在获取授权链接</span></div>
       <div id="addReady" hidden>
         <div class="state">在浏览器打开以下链接并登录：</div>
