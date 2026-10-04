@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -20,16 +21,19 @@ import (
 
 const loginTTL = 15 * time.Minute
 
-// traeCallback TRAE 授权页只认它自己 IDE 的这条回调地址，写死，不做成配置项。
+// traeCallback 缺省回调地址：TRAE 授权页认它自己 IDE 的这条。
 //
-// 实测（换任何别的地址都被拒，页面直接「登录失败 / 网络错误，请刷新页面重试」）：
+// 实测过的四条（换别的地址页面直接「登录失败 / 网络错误，请刷新页面重试」）：
 //   - https://<面板隧道域名>/panel/oauth/callback/<id>  ✗
 //   - http://127.0.0.1:7864/panel/oauth/callback/test   ✗
 //   - http://127.0.0.1:18080/panel/oauth/callback/test  ✗（端口对、路径不对也不行）
 //   - http://127.0.0.1:18080/authorize                  ✓ 只有这条进得来登录页
 //
-// 所以面板拿不到回跳，只能把浏览器地址栏粘回面板换票；做成可配置项只会再走进一次这个死胡同。
-// 想免粘贴，得在**浏览器那台机器**上跑个监听 18080 的本机中继（面板在服务器上时它够不着）。
+// 注意这四条的对照里**只有成功那条的路径以 /authorize 结尾**（c3h3-ci/ai-proxy 的抓包结论
+// 也是「授权页可向任意可达地址交付 token，与 host 无关」，它已推翻同类的「绑 127.0.0.1」判断）。
+// 所以判据可能是**路径**而不是 host，尚未验证——loginStart 因此接受一个可选的 callback_base
+// （http(s)://host[:port]），把回跳引到面板自己的 /panel/oauth/callback/<id>/authorize 上；
+// 缺省不传，维持这条实测能用的地址，粘贴回跳那条路照旧。实验一次即可定论，别急着改缺省值。
 const traeCallback = "http://127.0.0.1:18080/authorize"
 
 var errLoginSession = errors.New("登录链接已失效，请回面板重新点「登录账号」")
@@ -70,7 +74,10 @@ func randHex(n int) (string, error) {
 
 // loginURL 按地区生成登录链接：国际版同参数换域（www.trae.ai）+ 国际版客户端版本号。
 // ponytail: 参数集与国内版逐项一致——实测国际版登录页认这套（client_id 两边相同）。
-func loginURL(machine, device, realm string) (string, error) {
+func loginURL(machine, device, realm, callback string) (string, error) {
+	if callback == "" {
+		callback = traeCallback
+	}
 	trace, err := randHex(8)
 	if err != nil {
 		return "", err
@@ -84,7 +91,7 @@ func loginURL(machine, device, realm string) (string, error) {
 	q.Set("client_id", upstream.ClientID)
 	q.Set("redirect", "0")
 	q.Set("login_trace_id", trace)
-	q.Set("auth_callback_url", traeCallback)
+	q.Set("auth_callback_url", callback)
 	q.Set("machine_id", machine)
 	q.Set("device_id", device)
 	q.Set("x_device_id", device)
@@ -117,17 +124,30 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "random failed")
 		return
 	}
-	// 面板可以带 {"realm":"intl"} 要一条国际版链接（缺省国内版）。
+	// 面板可以带 {"realm":"intl"} 要一条国际版链接（缺省国内版）；
+	// 也可以带 {"callback_base":"https://面板域名"} 要一条把回跳甩给面板自己的链接。
 	realm := auth.RealmCN
+	callback := traeCallback
 	if raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<12)); len(raw) > 0 {
 		var reqBody struct {
-			Realm string `json:"realm"`
+			Realm        string `json:"realm"`
+			CallbackBase string `json:"callback_base"`
 		}
-		if json.Unmarshal(raw, &reqBody) == nil && reqBody.Realm == auth.RealmIntl {
-			realm = auth.RealmIntl
+		if json.Unmarshal(raw, &reqBody) == nil {
+			if reqBody.Realm == auth.RealmIntl {
+				realm = auth.RealmIntl
+			}
+			if b := strings.TrimSpace(reqBody.CallbackBase); b != "" {
+				u, uerr := url.Parse(b)
+				if uerr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Path != "" {
+					writeErr(w, http.StatusBadRequest, "callback_base 需形如 http(s)://host[:port]")
+					return
+				}
+				callback = strings.TrimRight(b, "/") + "/panel/oauth/callback/" + id + "/authorize"
+			}
 		}
 	}
-	link, err := loginURL(machine, device, realm)
+	link, err := loginURL(machine, device, realm, callback)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "login url failed")
 		return
@@ -253,6 +273,90 @@ func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, co
 	p.loginMu.Unlock()
 	log.Printf("panel: account added uid=%s", uid)
 	return uid, nick, http.StatusOK, nil
+}
+
+// oauthCallback 公网回跳：授权页把浏览器跳回这里（回调地址 = callback_base + 本路径）。
+//
+// 无需面板密钥——浏览器跳转不带 Authorization 头；鉴权靠路径里那个一次性随机会话 id
+// （randHex(16)，15 分钟过期，用后即删），猜不到就没法往池子里塞别人的号。
+// 凭证解析与「粘贴回跳」共用 parseCallback + completeLogin，两条路行为完全一致。
+func (p *Panel) oauthCallback(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	// 授权页可能 GET 回跳，也可能 POST 回来（表单里带参数）：一并合进 query 再解析。
+	q := r.URL.Query()
+	if r.Method == http.MethodPost {
+		_ = r.ParseForm()
+		for k, v := range r.PostForm {
+			if q.Get(k) == "" && len(v) > 0 {
+				q.Set(k, v[0])
+			}
+		}
+	}
+	cb, err := parseCallback(r.URL.Path + "?" + q.Encode())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "回跳里没有 refreshToken")
+		return
+	}
+	uid, nick, code, err := p.completeLogin(id, cb)
+	if err != nil {
+		writeErr(w, code, err.Error())
+		return
+	}
+	log.Printf("panel: account added uid=%s via oauth callback", uid)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>登录完成</title>
+<body style="font:15px system-ui;padding:2rem">账号 <b>%s</b>（%s）已加入账号池，可以关掉本页回到面板。</body>`,
+		html.EscapeString(nick), html.EscapeString(uid))
+}
+
+// loginRefresh refreshToken 直登：不经过浏览器，把一条 refreshToken 直接换成凭证落盘。
+//
+// 与授权页回跳能不能落到本面板无关，是最稳的一条兜底（用户的 refreshToken 有效期以年计）。
+// 换票、取用户信息、落盘、进池全部复用 completeLogin——只是凭证来源从「回跳参数」换成
+// 「用户手输」，所以这里造一个一次性会话再调它。
+func (p *Panel) loginRefresh(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<13))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read body failed")
+		return
+	}
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+		Realm        string `json:"realm"`
+	}
+	if json.Unmarshal(raw, &req) != nil {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
+	rt := strings.TrimSpace(req.RefreshToken)
+	if rt == "" || len(rt) > 4096 {
+		writeErr(w, http.StatusBadRequest, "refresh_token 为空或过长")
+		return
+	}
+	machine, err1 := randHex(16)
+	device, err2 := randHex(16)
+	id, err3 := randHex(16)
+	if err1 != nil || err2 != nil || err3 != nil {
+		writeErr(w, http.StatusInternalServerError, "random failed")
+		return
+	}
+	p.loginMu.Lock()
+	if p.logins == nil {
+		p.logins = map[string]loginSession{}
+	}
+	p.logins[id] = loginSession{Machine: machine, Device: device, At: time.Now()}
+	p.loginMu.Unlock()
+	cb := callbackCreds{Refresh: rt}
+	if req.Realm == auth.RealmIntl {
+		// 国际版的换票 base 是它的 OAuth host（与回调 host 参数同一套判据）。
+		cb.Host = upstream.UgHostIntl
+	}
+	uid, nick, code, err := p.completeLogin(id, cb)
+	if err != nil {
+		writeErr(w, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "nickname": nick})
 }
 
 func parseCallback(raw string) (callbackCreds, error) {

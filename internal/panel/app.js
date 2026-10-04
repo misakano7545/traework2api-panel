@@ -1486,8 +1486,22 @@ function openAdd() {
   $('btnOpenUrl').hidden = true;
   $('btnAddFinish').hidden = true;
   $('callback').value = '';
+  $('addRefreshToken').value = '';
   $('addVeil').classList.add('on');
-  api('login/start', { method: 'POST', body: JSON.stringify({ realm: addRealm }) }).then(d => {
+  loadAddLink();
+}
+
+// loadAddLink 取授权链接。勾了「公网回跳」就把回跳甩给面板自己（callback_base 用当前
+// origin）；不勾就用 TRAE 认的那条 127.0.0.1:18080，回来后粘贴。
+function loadAddLink() {
+  $('addLoad').hidden = false;
+  $('addReady').hidden = true;
+  $('btnCopyUrl').hidden = true;
+  $('btnOpenUrl').hidden = true;
+  $('btnAddFinish').hidden = true;
+  const body = { realm: addRealm };
+  if ($('addPublicCb').checked) body.callback_base = location.origin;
+  api('login/start', { method: 'POST', body: JSON.stringify(body) }).then(d => {
     loginID = d.id;
     $('addUrl').textContent = d.url;
     $('addLoad').hidden = true;
@@ -1501,6 +1515,24 @@ function openAdd() {
     $('addErr').textContent = e.message;
   });
 }
+
+// refreshToken 直登：把一条 refreshToken 直接换成凭证（后端复用换票→取信息→落盘的同一路）。
+async function refreshLogin() {
+  const rt = $('addRefreshToken').value.trim();
+  if (!rt) { toast('先填一条 refreshToken', 'err'); return; }
+  const btn = $('btnRefreshLogin');
+  btn.disabled = true;
+  try {
+    const d = await api('login/refresh', { method: 'POST', body: JSON.stringify({ refresh_token: rt, realm: addRealm }) });
+    toast('已加入：' + (d.nickname || d.uid), 'ok');
+    $('addVeil').classList.remove('on');
+    loadOverview(true);
+  } catch (e) {
+    $('addErr').hidden = false;
+    $('addErr').textContent = e.message;
+  } finally { btn.disabled = false; }
+}
+
 async function finishAdd() {
   const btn = $('btnAddFinish');
   btn.disabled = true;
@@ -1570,6 +1602,8 @@ function boot() {
   // 新标签页打开：点击是用户手势，弹窗拦截不挡；noopener 不给新页面 window.opener 句柄。
   $('btnOpenUrl').onclick = () => window.open($('addUrl').textContent, '_blank', 'noopener');
   $('btnAddFinish').onclick = finishAdd;
+  $('btnRefreshLogin').onclick = refreshLogin;
+  $('addPublicCb').onchange = loadAddLink;
   $('callback').addEventListener('keydown', e => { if (e.key === 'Enter') finishAdd(); });
   $('btnKey').onclick = submitKey;
   $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitKey(); });
