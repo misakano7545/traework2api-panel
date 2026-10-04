@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/url"
 	"slices"
 	"sort"
@@ -134,6 +135,24 @@ func (s *Scheduler) Run(ctx context.Context) {
 // checkinRefreshSkew 签到前预刷新窗口：access token 剩不到这么久就先换一张。
 const checkinRefreshSkew = 2 * time.Hour
 
+// checkinGap / checkinGapJitter 多账号签到之间的间隔（基准 + 0..jitter 抖动）。
+// 上游按设备/时段限流，背靠背连签容易吃到 9074「当前参与用户太多」——star620/TraeTools
+// 用的是同一手（账号间 3~6s 随机间隔）。三条号也就多花 ~10s，且这是小时级任务。
+// 变量而非常量：测试要把它置 0，不然每条用例白等十几秒。
+var checkinGap, checkinGapJitter = 3 * time.Second, 3 * time.Second
+
+// checkinPace 两个账号之间该等多久；<=0 表示不等（测试）。
+func checkinPace() time.Duration {
+	if checkinGap <= 0 {
+		return 0
+	}
+	d := checkinGap
+	if checkinGapJitter > 0 {
+		d += time.Duration(rand.Int64N(int64(checkinGapJitter)))
+	}
+	return d
+}
+
 // isSessionDead 上游判定的「凭证失效」（401/1001 家族）：签到路径据此换票重试一次。
 func isSessionDead(err error) bool {
 	var ue *upstream.Error
@@ -225,7 +244,10 @@ func contains(hours []int, h int) bool {
 func (s *Scheduler) RunCheckinNow() ([]CheckinResult, []error) {
 	results := []CheckinResult{} // 非 nil：面板拿到的是 [] 而不是 null
 	var errs []error
-	for _, uid := range s.byUrgency() {
+	for i, uid := range s.byUrgency() {
+		if i > 0 {
+			time.Sleep(checkinPace()) // 第一个不等；最后一个签完也不用再等
+		}
 		res, err := s.CheckinUID(uid)
 		results = append(results, res)
 		if err != nil {
@@ -365,8 +387,20 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 				log.Printf("checkin claim %s: %v", uid, err)
 			}
 		} else {
-			res.Status, res.Credits = "ok", reward
-			log.Printf("checkin %s: ok +%d", uid, reward)
+			// 复核：claim 回 code 0 不等于真签上（上游偶发只回执不落账），再查一次 status，
+			// 只有 checked_in=true 才算成功。wild-work 的 DailyCheckin 与 star620/TraeTools
+			// 的 status→claim→status 都是这套。
+			if verified, _, _, verr := s.cfg.Upstream.CheckinStatus(a); verr != nil {
+				checkinErr = fmt.Errorf("签到复核失败：%w", verr)
+				log.Printf("checkin verify %s: %v", uid, verr)
+			} else if !verified {
+				// 按业务失败同口径：复核不过说明上游状态不自洽，给签到域短冷却，别在下一轮里硬追。
+				checkinErr = &upstream.BusinessError{Message: "签到复核未通过：上游仍报未签到"}
+				log.Printf("checkin verify %s: status still checked_in=false", uid)
+			} else {
+				res.Status, res.Credits = "ok", reward
+				log.Printf("checkin %s: ok +%d", uid, reward)
+			}
 		}
 	}
 	if res.Status == "" {

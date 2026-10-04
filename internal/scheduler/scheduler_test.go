@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,6 +53,26 @@ type fakeUpstream struct {
 	claimResponse  string
 	resourceRemain int64
 	resourceUsed   int64
+	// claimedFor：按账号记录「claim 成功过」（key = Authorization 头）。上游就是这个序
+	// （status→claim→status 复核），假上游永远回 false 会让复核永远失败；而用一个全局标志
+	// 又会让第二个账号被误当成已签（多账号用例会少签一个号）。
+	claimedMu  sync.Mutex
+	claimedFor map[string]bool
+}
+
+func (f *fakeUpstream) markClaimed(auth string) {
+	f.claimedMu.Lock()
+	defer f.claimedMu.Unlock()
+	if f.claimedFor == nil {
+		f.claimedFor = map[string]bool{}
+	}
+	f.claimedFor[auth] = true
+}
+
+func (f *fakeUpstream) isClaimed(auth string) bool {
+	f.claimedMu.Lock()
+	defer f.claimedMu.Unlock()
+	return f.claimedFor[auth]
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -59,12 +80,19 @@ func (f *fakeUpstream) server() *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
 			f.checkinCalls.Add(1)
-			w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
+			checked := "false"
+			if f.isClaimed(r.Header.Get("Authorization")) {
+				checked = "true"
+			}
+			w.Write([]byte(`{"checked_in":` + checked + `,"credits":200,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
 			body := f.claimResponse
 			if body == "" {
 				body = `{"code":0,"message":"success"}`
+			}
+			if strings.Contains(body, `"code":0`) {
+				f.markClaimed(r.Header.Get("Authorization"))
 			}
 			w.Write([]byte(body))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
@@ -85,6 +113,9 @@ func jsonI64(v int64) string {
 }
 
 func newTestScheduler(f *fakeUpstream, p *pool.Pool, srv *httptest.Server) *Scheduler {
+	// 账号间间隔在生产是 3~6s 的墙钟等待：测试里置 0，否则每条多账号用例白等十几秒
+	// （要验间隔本身的用例自己设）。
+	checkinGap, checkinGapJitter = 0, 0
 	up := &upstream.Client{
 		HTTP:      srv.Client(),
 		AgentHost: srv.URL,
@@ -112,8 +143,9 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 
 	s := newTestScheduler(f, p, srv)
 	s.RunCheckinNow()
-	if f.checkinCalls.Load() != 1 {
-		t.Errorf("checkin status calls=%d", f.checkinCalls.Load())
+	// 2 次 = 签到前探一次 + claim 后复核一次（复核是新增的第三步）。
+	if f.checkinCalls.Load() != 2 {
+		t.Errorf("checkin status calls=%d want 2", f.checkinCalls.Load())
 	}
 	if f.claimCalls.Load() != 1 {
 		t.Errorf("claim calls=%d", f.claimCalls.Load())
@@ -408,8 +440,8 @@ func TestCatchUpRunsAfterCheckinHour(t *testing.T) {
 	s.cfg.CheckinEnabled = true
 	s.mu.Unlock()
 	s.CatchUp()
-	if got := f.checkinCalls.Load(); got != 1 {
-		t.Fatalf("catch-up must check in: status calls=%d", got)
+	if got := f.checkinCalls.Load(); got != 2 { // 探测 + claim 后复核
+		t.Fatalf("catch-up must check in: status calls=%d want 2", got)
 	}
 }
 
@@ -526,8 +558,8 @@ func TestManualCheckinIgnoresCheckinCooldown(t *testing.T) {
 	if _, err := newTestScheduler(f, p, srv).CheckinUID("u1"); err != nil {
 		t.Fatalf("manual checkin must run: %v", err)
 	}
-	if got := f.checkinCalls.Load(); got != 1 {
-		t.Fatalf("status calls=%d want 1", got)
+	if got := f.checkinCalls.Load(); got != 2 { // 探测 + claim 后复核
+		t.Fatalf("status calls=%d want 2", got)
 	}
 }
 

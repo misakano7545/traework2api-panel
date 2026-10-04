@@ -10,7 +10,7 @@ import (
 
 // trae-mate gen2 派生算法的测试向量（与 AiCheckin 参考实现交叉验证）。
 func TestTraeDeviceIdentityVectors(t *testing.T) {
-	dev, market, sess := traeDeviceIdentity("1234567890123456")
+	dev, market, sess := traeDeviceIdentity("1234567890123456", 0)
 	if dev != "413174708280782" {
 		t.Errorf("device_id=%q", dev)
 	}
@@ -21,11 +21,22 @@ func TestTraeDeviceIdentityVectors(t *testing.T) {
 		t.Errorf("session_id=%q", sess)
 	}
 	// 确定性：同一 uid 必得同一身份；不同 uid 必不同。
-	if d2, m2, s2 := traeDeviceIdentity("1234567890123456"); d2 != dev || m2 != market || s2 != sess {
+	if d2, m2, s2 := traeDeviceIdentity("1234567890123456", 0); d2 != dev || m2 != market || s2 != sess {
 		t.Error("派生不确定：同一 uid 两次结果不同")
 	}
-	if d3, m3, _ := traeDeviceIdentity("1234567890123457"); d3 == dev || m3 == market {
+	if d3, m3, _ := traeDeviceIdentity("1234567890123457", 0); d3 == dev || m3 == market {
 		t.Error("不同 uid 派生出相同身份")
+	}
+	// 换指纹（种子非 0）必须换出一整套新身份，且同一账号 + 同一种子仍确定性。
+	d4, m4, s4 := traeDeviceIdentity("1234567890123456", 1)
+	if d4 == dev || m4 == market || s4 == sess {
+		t.Fatal("换指纹没有换出新身份")
+	}
+	if d5, m5, s5 := traeDeviceIdentity("1234567890123456", 1); d5 != d4 || m5 != m4 || s5 != s4 {
+		t.Error("换指纹后的派生不确定")
+	}
+	if s6, _, _ := traeDeviceIdentity("1234567890123456", 2); s6 == d4 {
+		t.Error("不同种子应派生出不同身份")
 	}
 }
 

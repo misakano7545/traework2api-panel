@@ -648,6 +648,12 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain, total, expire int64, err er
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, 0, fmt.Errorf("ent usage parse: %w", err)
 	}
+	if len(resp.UserEntitlementPackList) == 0 {
+		// 空包列表 = 接口返回了异常结构（未登录/风控/结构变了），**不是**「剩余 0 分」。
+		// 当成 0 分会把好号的积分静默清零（面板显示 0、选号权重一起塌），照
+		// star620/TraeTools 的判据：宁可报解析失败，让调用方保留上一次的值。
+		return 0, 0, 0, errors.New("ent usage: 包列表为空（接口异常，不当作 0 分）")
+	}
 	now := time.Now().Unix()
 	var expireCredit, expireAny int64
 	for _, p := range resp.UserEntitlementPackList {
