@@ -338,12 +338,16 @@ function mdSortList(list, f) {
 function mdRowHtml(m) {
   const tip = m.name ? ' title="' + esc(m.name) + '"' : '';
   return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
-    '<td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div>' +
+    '<td class="who"' + tip + '><div class="nm">' + esc(m.id) +
+      (m.legacy ? ' ' + tag('warn', '上代', m.legacy_reason || '客户端已隐藏，本仓仍放行') : '') + '</div>' +
     (m.name ? '<div class="id">' + esc(m.name) + '</div>' : '') + '</td>' +
     '<td>' + (m.capability ? tag('mute', m.capability) : '—') + '</td>' +
     '<td>' + thinkCell(m) + '</td>' +
     '<td>' + tag('mute', fnLabel(m.function)) + '</td>' +
-    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    // 倍率：上游基准积分倍率（客户端选择器同源）。没有就是上游没给，显示 — 而不是编一个数。
+    '<td class="num">' + (m.credit_rate ? m.credit_rate.toFixed(2) + '×' : '—') + '</td>' +
+    '<td class="num"' + (m.context_length_max ? ' title="声明口径 max ' + fmtNum(m.context_length_max) + '（本列显示的是 __dev 实际请求口径）"' : '') + '>' +
+      (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
     '<td class="num">' + (m.max_output_tokens ? Math.round(m.max_output_tokens / 1000) + 'K' : '—') + '</td></tr>';
 }
 function renderModels() {

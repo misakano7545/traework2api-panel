@@ -330,6 +330,21 @@ func (h *Handler) modelList() []map[string]any {
 			if mi.Function != "" {
 				entry["function"] = mi.Function
 			}
+			// 客户端选择器视图带来的权威元数据（面板消费）：声明上下文双口径、积分倍率、
+			// 多模态、以及「客户端已隐藏但本仓仍放行」的上代标记。
+			if mi.ContextMax > 0 {
+				entry["context_length_max"] = mi.ContextMax
+			}
+			if mi.Rate != nil {
+				entry["credit_rate"] = *mi.Rate
+			}
+			if mi.SupportsImage != nil {
+				entry["supports_image"] = *mi.SupportsImage
+			}
+			if mi.Legacy {
+				entry["legacy"] = true
+				entry["legacy_reason"] = mi.LegacyWhy
+			}
 			out = append(out, entry)
 		}
 		return out

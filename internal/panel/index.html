@@ -716,7 +716,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>能力</th><th>思考</th><th>通道</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>能力</th><th>思考</th><th>通道</th>
+              <th class="num" title="上游基准积分倍率（consumption_rate.data.rate，客户端选择器展示的就是它）">倍率</th>
+              <th class="num">上下文长度</th><th class="num">最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>

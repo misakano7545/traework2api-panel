@@ -29,8 +29,12 @@ const (
 	FunctionCoder = "solo_coder"
 
 	// 端点
-	EpChat          = "/api/agent/v3/llm_utils_chat"
-	EpModels        = "/api/ide/v1/get_detail_param"
+	EpChat   = "/api/agent/v3/llm_utils_chat"
+	EpModels = "/api/ide/v1/get_detail_param"
+	// EpModelsBatch 客户端**模型选择器**用的批量端点：一次要 7 个 function，每组一份配置表。
+	// 与单 function 的 EpModels 是两个视图（可见性标志与上下文口径都不同），
+	// 见 fetchBatchCatalog 的说明。同一 host 上并存，客户端走这个。
+	EpModelsBatch   = "/api/ide/v1/batch_get_detail_param"
 	EpExchange      = "/cloudide/api/v3/trae/oauth/ExchangeToken"
 	EpUserInfo      = "/cloudide/api/v3/trae/GetUserInfo"
 	EpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -339,6 +340,17 @@ type ModelInfo struct {
 	// Function 该模型属于哪条通道（solo_work_lite / solo_coder）：出站 function 要跟着模型走，
 	// 不然 coder 面的模型会被 Work 通道判 4001。
 	Function string
+
+	// 以下来自客户端模型选择器视图（batch_get_detail_param，见 fetchBatchCatalog）：
+	//   ContextMax 客户端**声明**口径（ContextWindow 是 __dev 实际请求口径）；批量视图没有则 0
+	//   Rate       基准积分倍率（上游 consumption_rate.data.rate）
+	//   Image      多模态（display_config.multimodal）
+	//   Legacy/Why  客户端已隐藏（上代/内部）——**仍然可调**，只是不在客户端选择器里
+	ContextMax    int64
+	Rate          *float64
+	SupportsImage *bool
+	Legacy        bool
+	LegacyWhy     string
 }
 
 // paramConfig 是 get_detail_param 响应里的一条模型配置。
@@ -349,12 +361,23 @@ type paramConfig struct {
 	DisplayConfig     struct {
 		DisplayName     string `json:"display_name"`
 		ModelCapability string `json:"model_capability"`
+		Multimodal      *bool  `json:"multimodal"`
 	} `json:"display_config"`
 	ContextWindowTokens struct {
 		Dev int64 `json:"dev"`
+		// Max 客户端**声明**口径（dev 是 __dev 实际请求口径）；批量视图才有值。
+		Max int64 `json:"max"`
 	} `json:"context_window_tokens"`
-	ModelDetailList []struct {
+	// ConfigSwitch 客户端是否开启该条目；批量视图才有（false = 客户端已关闭）。
+	ConfigSwitch *bool `json:"config_switch"`
+	// CustomModels 非空 = 服务端自定义预设的回显（客户端主选择器不列它）。
+	CustomModels []any `json:"custom_models"`
+	// DisplayContactConfig 是 JSON 字符串（要二次解码），里面有每模型积分倍率。
+	DisplayContactConfig string `json:"display_contact_config"`
+	ModelDetailList      []struct {
 		MaxTokens int64 `json:"max_tokens"`
+		// ModelName 形如 "glm-5.2__dev"：带 __dev 后缀的条目 = 可调用实证（批量视图）。
+		ModelName string `json:"model_name"`
 		// ModelExtraConfig 是 JSON 字符串（要二次解码），里面的 Thinking.Type 才是思考开关。
 		ModelExtraConfig string `json:"model_extra_config"`
 	} `json:"model_detail_list"`
@@ -427,6 +450,244 @@ func pickOfficialModels(list []paramConfig, a *auth.Auth, function string) []Mod
 	return out
 }
 
+// ── 客户端模型选择器视图（batch_get_detail_param）────────────────────────────
+//
+// 同一 host 上单 function 的 EpModels 与批量的 EpModelsBatch 是**两个视图**：可见性标志、
+// 上下文口径、模型集合都不同（2026-10-04 实测，本仓 CN 账号）。批量视图是客户端选择器用的，
+// 也是权威的那一份：
+//   - 单 function 视图缺 glm-5.3-flash / glm-5.3-flashx / kimi-k2.8-preview / qwen3.8-flash；
+//   - 单 function 视图把 12 个客户端已隐藏的上代模型当可见（glm-5/5.1、kimi-k2.5/2.6/2.7-code、
+//     minimax-m2.7、qwen-3.5/3.6-plus、Doubao-Seed-2.0-Code、DeepSeek-V4-Flash/Pro 非正式版）。
+// 参照实现：smart-open/TraeWorkAssistant（Rust/MIT）的 models_sync.rs，其请求形态与过滤规则
+// 逐条对照过；本仓按自己的结构重写。
+
+// batchRequestFunctions 客户端选择器的真实请求形态（7 个视图，顺序照抓包固化值）。
+var batchRequestFunctions = []string{
+	"builder", "builder_v3", "chat_v3", "code_reviewer", "code_review_summary", "refactor", "solo_agent",
+}
+
+// batchPriority 同一模型在多组出现时的权威次序：solo_agent / chat_v3 是主视图，
+// builder* 是降级副本，code_reviewer / refactor 是评审替身（展示名都不一样）。
+var batchPriority = []string{"solo_agent", "chat_v3", "builder", "builder_v3"}
+
+// catalogVisibleMaxMin 客户端的代际阈值：声明上下文 max 低于它的模型不出现在选择器里
+// （上代：dev 116k/200k 且 max 缺失）。
+const catalogVisibleMaxMin = 250_000
+
+// catalogInternalExact / catalogInternalPrefix 官方内部配置（子代理、摘要、槽位）。
+var catalogInternalExact = []string{"Doubao_1_6", "doubao_1_6", "aquila", "sagitta"}
+
+var catalogInternalPrefix = []string{
+	"custom_model", "search_agent", "fast_apply", "input_optimization",
+	"explore", "file_search", "browser_use", "agnes", "summary", "commit",
+}
+
+func isInternalConfig(name string) bool {
+	for _, e := range catalogInternalExact {
+		if name == e {
+			return true
+		}
+	}
+	for _, p := range catalogInternalPrefix {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// catalogMeta 批量视图给一个模型的权威元数据。
+type catalogMeta struct {
+	ID          string // 官方 config_name 原样（大小写以它为准）
+	Label       string // 权威视图的展示名
+	Visible     bool   // 客户端选择器会展示它
+	Why         string // Visible=false 的判据（面板 tooltip 用）
+	Dev, Max    int64
+	Rate        float64
+	HasRate     bool
+	Image       bool
+	HasImage    bool
+	HasDevEntry bool // model_detail_list 里有 __dev 条目 = 可调用实证
+}
+
+// contactRate 从 display_contact_config 这段 JSON 字符串里取基准积分倍率
+// （consumption_rate.data.rate；会员/闲时折扣在 discount 块，客户端展示的是基准值）。
+func contactRate(raw string) (float64, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, false
+	}
+	var m struct {
+		ConsumptionRate struct {
+			Data struct {
+				Rate float64 `json:"rate"`
+			} `json:"data"`
+		} `json:"consumption_rate"`
+	}
+	if json.Unmarshal([]byte(raw), &m) != nil {
+		return 0, false
+	}
+	return m.ConsumptionRate.Data.Rate, m.ConsumptionRate.Data.Rate > 0
+}
+
+// meta 按客户端选择器的四条尺子判定可见性，并取出倍率/双口径/图片支持。
+// 尺子（缺一条就会多出一批上代或内部条目）：
+//  1. 内部配置黑名单 / 自定义槽位回显；
+//  2. is_invisible_to_user 或 config_switch=false；
+//  3. 声明上下文 max ≥ 250k（代际）；
+//  4. 有展示名。
+func (ci paramConfig) meta() catalogMeta {
+	m := catalogMeta{ID: ci.ConfigName, Visible: true}
+	switch {
+	case isInternalConfig(ci.ConfigName):
+		m.Visible, m.Why = false, "内部配置"
+	case strings.HasPrefix(ci.ConfigName, "custom_") || ci.Usage == "custom_model" || len(ci.CustomModels) > 0:
+		m.Visible, m.Why = false, "自定义模型回显"
+	case ci.IsInvisibleToUser:
+		m.Visible, m.Why = false, "客户端标记不可见"
+	case ci.ConfigSwitch != nil && !*ci.ConfigSwitch:
+		m.Visible, m.Why = false, "客户端已关闭"
+	}
+	m.Dev, m.Max = ci.ContextWindowTokens.Dev, ci.ContextWindowTokens.Max
+	if m.Visible && (m.Max <= 0 || m.Max < catalogVisibleMaxMin) {
+		m.Visible, m.Why = false, "上代（客户端代际阈值 max<250k）"
+	}
+	m.Label = strings.TrimSpace(ci.DisplayConfig.DisplayName)
+	if m.Label == "" {
+		if m.Visible {
+			m.Visible, m.Why = false, "无展示名"
+		}
+	}
+	if r, ok := contactRate(ci.DisplayContactConfig); ok {
+		m.Rate, m.HasRate = r, true
+	}
+	if ci.DisplayConfig.Multimodal != nil {
+		m.Image, m.HasImage = *ci.DisplayConfig.Multimodal, true
+	}
+	for _, d := range ci.ModelDetailList {
+		if strings.HasSuffix(d.ModelName, "__dev") {
+			m.HasDevEntry = true
+		}
+	}
+	return m
+}
+
+// fetchBatchCatalog 拉客户端选择器视图，返回 config_name(小写) → 权威元数据。
+func (c *Client) fetchBatchCatalog(a *auth.Auth) (map[string]catalogMeta, error) {
+	body, _ := json.Marshal(map[string]any{
+		"functions":                 batchRequestFunctions,
+		"agent_type":                "solo_agent",
+		"current_config_info":       map[string]any{"config_name": "", "is_custom_model": false},
+		"mode_type":                 0,
+		"access_type":               0,
+		"ab_force_vids":             "",
+		"ab_autotest_advanced_mode": 0,
+		"show_custom_model":         true,
+	})
+	req, err := http.NewRequest(http.MethodPost, c.agentBaseFor(a)+EpModelsBatch, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	SOLOHeaders(req, a, false)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		FunctionConfigs []struct {
+			Function       string        `json:"function"`
+			ConfigInfoList []paramConfig `json:"config_info_list"`
+		} `json:"function_configs"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("batch models parse: %w", err)
+	}
+	if len(resp.FunctionConfigs) == 0 {
+		return nil, errors.New("batch models: function_configs empty")
+	}
+	rank := func(fn string) int {
+		for i, f := range batchPriority {
+			if f == fn {
+				return i
+			}
+		}
+		return len(batchPriority)
+	}
+	sort.SliceStable(resp.FunctionConfigs, func(i, j int) bool {
+		return rank(resp.FunctionConfigs[i].Function) < rank(resp.FunctionConfigs[j].Function)
+	})
+	out := map[string]catalogMeta{}
+	for _, g := range resp.FunctionConfigs {
+		for _, ci := range g.ConfigInfoList {
+			id := strings.TrimSpace(ci.ConfigName)
+			if id == "" {
+				continue
+			}
+			m := ci.meta()
+			prev, seen := out[strings.ToLower(id)]
+			// 先见者优先（已按权威视图排好序）；只有「后来者带 __dev 实证、先前的没有」才覆盖。
+			if seen && (prev.HasDevEntry || !m.HasDevEntry) {
+				continue
+			}
+			out[strings.ToLower(id)] = m
+		}
+	}
+	return out, nil
+}
+
+// mergeCatalog 用批量视图校正/补全单 function 视图的结果。
+// 不删模型：客户端已隐藏的上代条目仍然可调（mapModel 会把不在表里的模型判 400），
+// 只标记成 Legacy 让面板如实显示，是否下线由人决定。
+func mergeCatalog(list []ModelInfo, cat map[string]catalogMeta, a *auth.Auth) []ModelInfo {
+	seen := make(map[string]bool, len(list))
+	for i := range list {
+		key := strings.ToLower(list[i].ID)
+		seen[key] = true
+		m, ok := cat[key]
+		if !ok {
+			continue // 批量视图没有它（例如只在 coder 视图出现的国际模型）：不猜，保持原样
+		}
+		if m.Dev > 0 {
+			list[i].ContextWindow = m.Dev
+		}
+		list[i].ContextMax = m.Max
+		if m.HasRate {
+			r := m.Rate
+			list[i].Rate = &r
+		}
+		if m.HasImage {
+			v := m.Image
+			list[i].SupportsImage = &v
+		}
+		if !m.Visible {
+			list[i].Legacy, list[i].LegacyWhy = true, m.Why
+		}
+		if m.Label != "" {
+			list[i].Name = m.Label
+		}
+	}
+	// 批量视图可见、单 function 视图没给的新模型（客户端新上架）→ 补进来。
+	// Function 用默认通道：上游对这几根 function 轴是宽松的（实测 glm-5.2/kimi-k2.8-preview
+	// 在 solo_work_lite / solo_agent / chat_v3 / solo_coder 下都 200），不必为它改聊天路径。
+	added := make([]ModelInfo, 0)
+	for key, m := range cat {
+		if seen[key] || !m.Visible {
+			continue
+		}
+		mi := ModelInfo{ID: m.ID, Name: m.Label, ContextWindow: m.Dev, ContextMax: m.Max, Function: Function}
+		if m.HasRate {
+			r := m.Rate
+			mi.Rate = &r
+		}
+		if m.HasImage {
+			v := m.Image
+			mi.SupportsImage = &v
+		}
+		added = append(added, mi)
+	}
+	sort.Slice(added, func(i, j int) bool { return added[i].ID < added[j].ID })
+	return append(list, added...)
+}
+
 // FetchModels 拉账号当前可用的官方模型表（get_detail_param）。
 // 返回的是过滤后的官方模型，不是上游的内部全量表。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
@@ -478,6 +739,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			lastErr = fmt.Errorf("models api returned no official model")
 		}
 		return nil, lastErr
+	}
+	// 用客户端选择器视图校正：补上单 function 视图看不到的新模型、把客户端已隐藏的上代/内部
+	// 条目标记出来、带上权威倍率与上下文双口径。拉不到就退回单视图结果（不让新端点成为单点）。
+	if cat, err := c.fetchBatchCatalog(a); err == nil {
+		out = mergeCatalog(out, cat, a)
 	}
 	return out, nil
 }
