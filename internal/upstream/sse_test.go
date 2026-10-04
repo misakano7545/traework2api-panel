@@ -52,8 +52,10 @@ func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
 	if m["function"] != "solo_work_lite" {
 		t.Errorf("function=%v", m["function"])
 	}
-	if m["config_name"] != "glm-5.2" || m["model"] != "glm-5.2" {
-		t.Errorf("model fields=%v / %v", m["config_name"], m["model"])
+	// config_name 由 handler 的 setModelInBody 设（PrepareBody 不管），这里只验 model 与
+	// 消息改写；两边分工见 payload.go 与 TestSetModelInBodyConfigName。
+	if m["model"] != "glm-5.2" {
+		t.Errorf("model=%v", m["model"])
 	}
 	msgs := m["messages"].([]any)
 	first := msgs[0].(map[string]any)

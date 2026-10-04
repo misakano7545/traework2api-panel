@@ -271,6 +271,9 @@ var dynamicModelsCache struct {
 	ids []upstream.ModelInfo
 	// realmByModel 模型 → 归属地区（国际版模型国内号接不了，选号要用它过滤）。
 	realmByModel map[string]string
+	// pickOnlyByModel 批量视图独有（聊天配置表里没有）的模型：出站要去掉 config_name，
+	// 否则上游 4001。见 upstream.ModelInfo.PickOnly 的实测说明。
+	pickOnlyByModel map[string]bool
 	// fnByModel 模型 → 所属通道（solo_work_lite / solo_coder）：出站 function 跟着模型走。
 	fnByModel map[string]string
 	fetched   time.Time
@@ -371,6 +374,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	var merged []upstream.ModelInfo
 	realmByModel := map[string]string{}
 	fnByModel := map[string]string{}
+	pickOnlyByModel := map[string]bool{}
 	seen := map[string]bool{}
 	for _, acct := range h.realmReps() {
 		realm := acct.Realm()
@@ -388,6 +392,9 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 			merged = append(merged, mi)
 			realmByModel[mi.ID] = realm
 			fnByModel[mi.ID] = mi.Function
+			if mi.PickOnly {
+				pickOnlyByModel[mi.ID] = true
+			}
 		}
 	}
 	if len(merged) == 0 {
@@ -400,6 +407,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.ids = merged
 	dynamicModelsCache.realmByModel = realmByModel
 	dynamicModelsCache.fnByModel = fnByModel
+	dynamicModelsCache.pickOnlyByModel = pickOnlyByModel
 	dynamicModelsCache.fetched = time.Now()
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
@@ -407,6 +415,14 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 // modelRealm 该模型归属的地区；未知返回空（= 不限制选号，交给上游判）。
+// modelPickOnly 该模型是不是「只在客户端批量视图里可见」（聊天配置表没有它）。
+// 是的话出站必须去掉 config_name：传了上游回 4001。
+func (h *Handler) modelPickOnly(model string) bool {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return dynamicModelsCache.pickOnlyByModel[model]
+}
+
 func (h *Handler) modelRealm(model string) string {
 	dynamicModelsCache.RLock()
 	defer dynamicModelsCache.RUnlock()
@@ -455,13 +471,23 @@ func (h *Handler) realmReps() []*auth.Auth {
 // chat
 // ---------------------------------------------------------------------------
 
-// setModelInBody 将 body 中 model 字段替换为 configName，并返回改写后的 body。
-func setModelInBody(body []byte, configName string) []byte {
+// setModelInBody 出站 model/config_name 一起在这里定（PrepareBody 不再补默认值，见那边注释）。
+//
+// pickOnly=true 表示该模型只在客户端批量视图里可见、账号聊天配置表里没有它：**必须不带
+// config_name**——实测传 config_name=<自己> 上游回 4001「param is invalid」，不传正常出正文
+// （2026-10-04，glm-5.3-flash / qwen3.8-flash / kimi-k2.8-preview / glm-5.3-flashx）。
+// 聊天配置表里有的模型（glm-5.2 等）仍照旧带 config_name=model，不动现有报文形状。
+func setModelInBody(body []byte, configName string, pickOnly bool) []byte {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
 	obj["model"] = configName
+	if pickOnly {
+		delete(obj, "config_name")
+	} else if _, has := obj["config_name"]; !has {
+		obj["config_name"] = configName
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
@@ -533,7 +559,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	body = setModelInBody(body, configName)
+	body = setModelInBody(body, configName, h.modelPickOnly(configName))
 	body = h.applyPrompt(body)
 	// 国际版：没开档位的模型走租户槽位（config_name=槽位 + model=具体模型）。
 	if route, ok := upstream.IntlSlotRoute(configName); ok && realm == auth.RealmIntl {

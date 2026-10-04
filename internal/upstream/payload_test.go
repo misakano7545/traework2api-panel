@@ -23,14 +23,18 @@ func TestPrepareBodyKeepsExplicitConfigName(t *testing.T) {
 		t.Errorf("常规改写丢了: function=%v stream=%v", obj["function"], obj["stream"])
 	}
 
-	// 常规形态（客户端不给 config_name）：仍然是 model 一统两处，零回归
+	// 常规形态：PrepareBody **不再**补 config_name——由 handler 的 setModelInBody 与 model
+	// 一起设（有的模型带上 config_name 上游就回 4001，只有 handler 知道谁属于那一类）。
 	src = []byte(`{"model":"glm-5.2","messages":[]}`)
 	obj = map[string]any{}
 	if err := json.Unmarshal(PrepareBody(src), &obj); err != nil {
 		t.Fatal(err)
 	}
-	if obj["config_name"] != "glm-5.2" || obj["model"] != "glm-5.2" {
-		t.Errorf("常规路径 config_name/model 应同为 glm-5.2，得到 %v / %v", obj["config_name"], obj["model"])
+	if _, has := obj["config_name"]; has {
+		t.Errorf("PrepareBody 不该再补 config_name，得到 %v", obj["config_name"])
+	}
+	if obj["model"] != "glm-5.2" {
+		t.Errorf("model 应保持 glm-5.2，得到 %v", obj["model"])
 	}
 }
 

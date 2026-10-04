@@ -370,6 +370,13 @@ type ModelInfo struct {
 	SupportsImage *bool
 	Legacy        bool
 	LegacyWhy     string
+
+	// PickOnly 该模型只在**客户端批量视图**里可见，账号的聊天配置表里没有它。
+	// 出站 body 必须去掉 config_name：实测传 config_name=<自己> 上游回 4001
+	// 「param is invalid」，不传则正常出正文（2026-10-04，glm-5.3-flash / qwen3.8-flash /
+	// kimi-k2.8-preview / glm-5.3-flashx 四个全是这样；chat 配置表里有的模型传不传都行，
+	// 所以只对这批复单放行，不动现有流量的报文形状）。
+	PickOnly bool
 }
 
 // paramConfig 是 get_detail_param 响应里的一条模型配置。
@@ -698,7 +705,7 @@ func mergeCatalog(list []ModelInfo, cat map[string]catalogMeta, a *auth.Auth) []
 		if seen[key] || !m.Visible {
 			continue
 		}
-		mi := ModelInfo{ID: m.ID, Name: m.Label, ContextWindow: m.Dev, ContextMax: m.Max, Function: Function}
+		mi := ModelInfo{ID: m.ID, Name: m.Label, ContextWindow: m.Dev, ContextMax: m.Max, Function: Function, PickOnly: true}
 		if m.HasRate {
 			r := m.Rate
 			mi.Rate = &r

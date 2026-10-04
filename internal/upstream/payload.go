@@ -15,7 +15,7 @@ import (
 // 改写规则（SPEC §4.4）：
 //  1. messages: content 字符串 → [{"type":"text","text":...}]；已是数组 → 透传
 //  2. stream: 强制 true（非流式由服务端聚合）
-//  3. model → config_name + model
+//  3. model → config_name + model（**由调用方 handler 一起设**；这里不再补默认值）
 //  4. function: 固定 "solo_work_lite"
 //  5. tools/tool_choice: 归一化（"none" 删 tools；auto/required 保留；function 提取 name）
 func PrepareBody(src []byte) []byte {
@@ -91,10 +91,9 @@ func PrepareBody(src []byte) []byte {
 	if model == "" {
 		model = DefaultConfigName
 	}
-	// 显式给了 config_name 就别覆盖：国际版槽位旁路要 config_name=槽位 + model=具体模型。
-	if _, has := obj["config_name"]; !has {
-		obj["config_name"] = model
-	}
+	// 这里**不再**补 config_name=model：有的模型（客户端批量视图独有）带上它就是 4001
+	// 「param is invalid」，而只有 handler 知道某个模型属不属于这一类。config_name 由
+	// setModelInBody 与 model 一起设（槽位旁路照旧显式覆盖）。
 	obj["model"] = model
 
 	normalizeToolChoice(obj)
