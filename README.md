@@ -350,3 +350,7 @@ data/             （gitignored）state.json 池状态、usage.json 用量台账
 - `docs/` 不参与上传（gitignore + dockerignore）。
 - 验证类文档（`VERIFICATION.md` 等）不入库。
 - 日志/状态输出只显示 UID/Nickname/积分，不打印 token。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。
