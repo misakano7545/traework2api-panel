@@ -533,13 +533,33 @@ func anthropicUsage(v any) map[string]any {
 	}
 	// SOLO 上游直接报 cache_read_/cache_creation_input_tokens（实测 2026-09-28），
 	// 原样透出；不映射 Claude 系客户端一律显示缓存读取 0。
+	var cacheRead, cacheWrite float64
 	if n, ok := u["cache_read_input_tokens"]; ok {
 		out["cache_read_input_tokens"] = n
+		cacheRead = asNum(n)
 	}
 	if n, ok := u["cache_creation_input_tokens"]; ok {
 		out["cache_creation_input_tokens"] = n
+		cacheWrite = asNum(n)
+	}
+	// ponytail: Claude 口径的 input_tokens **不含**缓存读/写（单独字段计），拿上游
+	// 全量 prompt_tokens 直出会让 Claude Code 的上下文占用被缓存量虚抬。SOLO 实测
+	// 确实包含（`cache_read=45 / prompt=45`，见 responses.go 注），故减掉；两者都没有
+	// 时 sub=0，一字不动。
+	if sub := cacheRead + cacheWrite; sub > 0 {
+		if in := asNum(out["input_tokens"]) - sub; in < 0 {
+			out["input_tokens"] = float64(0)
+		} else {
+			out["input_tokens"] = in
+		}
 	}
 	return out
+}
+
+// asNum 宽松取数：上游用量字段是 float64（json.Unmarshal 默认），非数值当 0。
+func asNum(v any) float64 {
+	f, _ := v.(float64)
+	return f
 }
 
 func msgID(id string) string {

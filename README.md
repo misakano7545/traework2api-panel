@@ -178,6 +178,20 @@ thinking（上游没有 signature）。缓存命中各按客户端口径回：re
 客户端自己带的 `reasoning_effort` 之类字段是**原样透传**上游的，不认的也一个不吞（`PrepareBody` 只改
 `stream`/`function`/`config_name`/`model`/`tools`）。
 
+**Codex 工具契约**（`/v1/responses`，2026-10-08 实测）：Codex 的 wire 契约跟 OpenAI chat 不是一回事，
+网关侧补齐三件——① `type:"custom"`（freeform，如 `apply_patch`）降级成单 `input` 参数的 function 送出，
+回程还原成 `custom_tool_call` + `response.custom_tool_call_input.delta/done`，载荷严格解包（多键/非字符串/
+半截 JSON 一律按不可执行下发 `status:"incomplete"`，避免客户端拿脏载荷去改文件）；② `type:"namespace"`
+工具组（Codex 0.160 的 `multi_agent_v1` 就是这种）展开成扁平 function 出站，回程补回 `namespace`，组内/
+与顶层重名时加稳定后缀（`read_file_2`）并双向映射，客户端按自己声明的名字回传结果能对上；③ 无 `call_id`
+的 `function_call_output`（别的任务的回执）与 `agent_message` 注入成用户指令，不伪装成工具结果（空
+`tool_call_id` 到上游只会撞配对失败）；带图时整段保留 parts。实测：Codex 0.160 一次 `apply_patch` 建文件
+全程走通，`multi_agent_v1.list_threads` 调用回程带 `namespace`。
+
+**usage 口径**：`input_tokens`/`input_tokens_details.cached_tokens` 按各自协议出（Anthropic 口径的
+`input_tokens` **不含**缓存读/写，扣掉 `cache_read_`/`cache_creation_input_tokens`；Responses 出
+`cached_tokens`）；上游没报就不写，不拿 0 冒充「没命中」。
+
 **全模型全档实测**（不发 + 10 档 × 3 轮，取 `reasoning_tokens` 中位数，`max_tokens=2000`）：
 
 | 模型 | 不发 | none | minimal | lowest | low | medium | high | max | xhigh | ultra | highest | 档间极差 | 档内波动 | ρ(档位序) |
