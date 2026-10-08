@@ -237,7 +237,20 @@ func toolLabel(m map[string]any) string {
 }
 
 func convertAnthropicMessages(in []any) []any {
-	var out []any
+	var out, toolImgs []any
+	// 工具结果里的图片另起一条 user 消息（Chat 的 tool 消息不许带图），且必须等
+	// 这批工具结果全部落地 —— 插在 assistant.tool_calls 与它的 tool 消息之间会
+	// 打断配对（并行工具调用判 11148）。
+	flushImgs := func() {
+		if len(toolImgs) == 0 {
+			return
+		}
+		out = append(out, map[string]any{
+			"role":    "user",
+			"content": append([]any{map[string]any{"type": "text", "text": toolImagePlaceholder}}, toolImgs...),
+		})
+		toolImgs = nil
+	}
 	for _, it := range in {
 		m, ok := it.(map[string]any)
 		if !ok {
@@ -247,21 +260,37 @@ func convertAnthropicMessages(in []any) []any {
 		if role == "" {
 			role = "user"
 		}
+		if blocks, isBlocks := m["content"].([]any); !isBlocks || !hasToolResult(blocks) {
+			flushImgs()
+		}
 		switch c := m["content"].(type) {
 		case string:
 			out = append(out, map[string]any{"role": role, "content": c})
 		case []any:
-			out = append(out, blocksToMessages(role, c)...)
+			msgs, imgs := blocksToMessages(role, c)
+			out = append(out, msgs...)
+			toolImgs = append(toolImgs, imgs...)
 		default:
 			if s := asString(m["content"]); s != "" {
 				out = append(out, map[string]any{"role": role, "content": s})
 			}
 		}
 	}
+	flushImgs()
 	return out
 }
 
-func blocksToMessages(role string, blocks []any) []any {
+// hasToolResult 本条消息是否含 tool_result 块（图片消息要等这类消息处理完再落地）。
+func hasToolResult(blocks []any) bool {
+	for _, b := range blocks {
+		if m, ok := b.(map[string]any); ok && asString(m["type"]) == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
+func blocksToMessages(role string, blocks []any) (msgs []any, imgs []any) {
 	var toolCalls, toolMsgs, parts []any
 	var texts []string
 	hasNonText := false
@@ -283,11 +312,19 @@ func blocksToMessages(role string, blocks []any) []any {
 				},
 			})
 		case "tool_result":
+			// Anthropic 的 tool_result.content 允许嵌套内容块（text / image / document），
+			// 图片是真实用法（Claude Code 读截图、MCP 的截图类工具）。图不能留在 tool
+			// 消息里，由调用方另起一条 user 消息送。
+			txt, toolImgs := splitToolResultImages(m["content"])
+			if e, ok := m["is_error"].(bool); ok && e {
+				txt = "error: " + txt
+			}
 			toolMsgs = append(toolMsgs, map[string]any{
 				"role":         "tool",
 				"tool_call_id": asString(m["tool_use_id"]),
-				"content":      toolResultContent(m["content"], m["is_error"]),
+				"content":      txt,
 			})
+			imgs = append(imgs, toolImgs...)
 		case "image":
 			hasNonText = true
 			parts = append(parts, imagePart(m))
@@ -302,7 +339,7 @@ func blocksToMessages(role string, blocks []any) []any {
 	}
 	out := append([]any{}, toolMsgs...)
 	if len(toolCalls) == 0 && len(texts) == 0 && !hasNonText {
-		return out
+		return out, imgs
 	}
 	msg := map[string]any{"role": role}
 	if len(toolCalls) > 0 {
@@ -315,7 +352,7 @@ func blocksToMessages(role string, blocks []any) []any {
 	} else {
 		msg["content"] = ""
 	}
-	return append(out, msg)
+	return append(out, msg), imgs
 }
 
 func imagePart(m map[string]any) map[string]any {
@@ -372,6 +409,34 @@ func toolResultContent(v any, isError any) string {
 		return "error: " + s
 	}
 	return s
+}
+
+// splitToolResultImages 拆开 tool_result 的正文与图片。图片不能留在 tool 消息里
+// （Chat 的 tool 消息不许带图），也不能继续拼进正文 —— 拼进去等于把 base64 当正文
+// 分词：Claude Code 读截图、MCP 的截图类工具都把图放在 tool_result.content，
+// 模型其实看不到图，token 却按字符数涨。文本部分的取法与 contentToString 一致。
+func splitToolResultImages(v any) (string, []any) {
+	blocks, ok := v.([]any)
+	if !ok {
+		return contentToString(v), nil
+	}
+	var texts []string
+	var imgs []any
+	for _, b := range blocks {
+		m, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch asString(m["type"]) {
+		case "image":
+			imgs = append(imgs, imagePart(m))
+		case "document":
+			texts = append(texts, documentText(m))
+		default:
+			texts = append(texts, blockText(m))
+		}
+	}
+	return strings.Join(texts, ""), imgs
 }
 
 func contentToString(v any) string {

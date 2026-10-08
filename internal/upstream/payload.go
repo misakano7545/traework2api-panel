@@ -3,6 +3,8 @@ package upstream
 
 import (
 	"encoding/json"
+	"log"
+	"slices"
 	"strings"
 )
 
@@ -162,6 +164,10 @@ func normalizeToolChoice(obj map[string]any) {
 // 实测上游 Go struct: FunctionDefinition.tools[].function.parameters 是 string 类型
 // （OpenAI 标准是 object）→ 需把 parameters 对象序列化为 JSON 字符串。
 // 同时 tools 条目若不是 map 或缺 function，整体剔除（避免上游反序列化失败）。
+//
+// 剔除**必须留痕**：客户端声明的原生工具（Codex 每轮都发的 `type:"web_search"`、
+// Anthropic 的 server tool）都没有 `function` 键，静默丢会让客户端以为自己能联网
+// 搜索，而日志里一个字都没有 —— 「历史里莫名其妙少了东西」最难查的形态。
 func normalizeTools(obj map[string]any) {
 	raw, present := obj["tools"]
 	if !present {
@@ -172,6 +178,7 @@ func normalizeTools(obj map[string]any) {
 		return
 	}
 	out := make([]any, 0, len(list))
+	var dropped, droppedNames []string
 	for _, item := range list {
 		t, ok := item.(map[string]any)
 		if !ok {
@@ -179,6 +186,11 @@ func normalizeTools(obj map[string]any) {
 		}
 		fn, ok := t["function"].(map[string]any)
 		if !ok {
+			// 名字两处可取：扁平写法的顶层 name，与嵌套形态里层的 function.name
+			// （只看顶层会把标准 OpenAI 形态的工具全印成「无名字」）。
+			dropped = append(dropped, toolLabel(t))
+			// tool_choice 可能按顶层 name、也可能按 type 点名（原生声明常没有 name）
+			droppedNames = append(droppedNames, asString(t["name"]), asString(t["type"]))
 			continue
 		}
 		if params, ok := fn["parameters"]; ok {
@@ -190,9 +202,43 @@ func normalizeTools(obj map[string]any) {
 		}
 		out = append(out, t)
 	}
+	if len(dropped) > 0 {
+		log.Printf("WARN: [upstream] 剔除 %d 个本上游承载不了的工具（只认 type:\"function\"）: %s",
+			len(dropped), strings.Join(dropped, ", "))
+		// tool_choice 点名了被剔的工具就别留着：名字对不上，上游只当参数非法。
+		if name := strings.TrimSpace(asString(obj["tool_choice"])); name != "" && slices.Contains(droppedNames, name) {
+			delete(obj, "tool_choice")
+		}
+	}
 	if len(out) == 0 {
 		delete(obj, "tools")
 		return
 	}
 	obj["tools"] = out
+}
+
+// toolLabel 工具声明在日志里的名字：优先 name（含嵌套形态），退回 type。
+func toolLabel(t map[string]any) string {
+	name := asString(t["name"])
+	typ := asString(t["type"])
+	if name == "" {
+		if fn, ok := t["function"].(map[string]any); ok {
+			name = asString(fn["name"])
+		}
+	}
+	switch {
+	case name == "" && typ == "":
+		return "(既无 name 也无 type)"
+	case name == "":
+		return "type:" + typ
+	case typ == "":
+		return name
+	default:
+		return name + " (type:" + typ + ")"
+	}
+}
+
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
 }

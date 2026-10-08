@@ -192,6 +192,28 @@ thinking（上游没有 signature）。缓存命中各按客户端口径回：re
 `input_tokens` **不含**缓存读/写，扣掉 `cache_read_`/`cache_creation_input_tokens`；Responses 出
 `cached_tokens`）；上游没报就不写，不拿 0 冒充「没命中」。
 
+**工具结果里的图片**（`/v1/responses` 的 `function_call_output`、`/v1/messages` 的 `tool_result`）：
+图不能留在 `tool` 消息里（Chat 的 `tool` 角色只接受文本，带 `image_url` 会被 OpenAI 直接 400），
+也不能整段拍平成 JSON 文本（base64 按正文分词 ≈ 字符数×0.69，一张 400KB 截图十几万 token，而且模型
+**看不到图**）——所以拆成「文本进 tool 消息 + 图片攒到本轮工具结果**全部**落地之后补一条 user 消息」。
+不能插在中间：一轮里多条工具结果是连续的 tool 消息，中间插任何消息都会让后面的 `tool_call_id`
+失去应答（严格上游判 11148），并行工具调用必然踩中。只有图片时 tool 消息留占位文案指路。
+
+**上游承载不了的工具一律留痕剔除**：`tools[]` 里没有 `function` 键的（Codex 每轮都发
+`type:"web_search"`、Anthropic 的 server tool）在上游只承载函数工具，剔除时按名字记一条
+`WARN: [upstream] 剔除 N 个…`，并连带删掉点名了它们的 `tool_choice`（名字对不上，上游只当参数非法）。
+静默丢会让客户端以为自己能联网搜索，而日志里一个字都没有。
+
+**与参考实现对拍**（`internal/upstream/vectors_check_test.go`，`TW2A_VECTORS=<dir>` 才跑；答案卷来自
+另一套独立实现 `shadyrispy/cpa-multi-plugins` 的 `plugins/trae`，只当对拍基线，不进仓）：chat 路 18 个
+伪装头**键集逐键一致**（已固化成 `TestSOLOHeadersKeySet`），出站 body 与聚合口径除我们有意的分歧
+（不发 `config_name`、`max_tokens` 上限、未知字段透传、空流报错好换号）外全对。**4 条待决**：
+参考实现把 `403/4008`、`400/4001`、`413 too large`、`400 prompt is too long` 归成
+`plan_limit`/`model_unavailable`/`input_too_large`（调用方问题，不罚号），本仓目前一律归 `ErrClient`
+→ `NoteDegrade`（降权）——给**调用方**的超长请求降自己号的权重，与 4026 那条「上下文超长不许罚号」
+是同一类错误（见 `context_overflow_test.go`）。另外参考实现自报的客户端版本码是 `20260820`，我们钉的
+是 `20260811`（放量开关，见上「版本码矩阵」）——换码前得先按那套矩阵重测。
+
 **全模型全档实测**（不发 + 10 档 × 3 轮，取 `reasoning_tokens` 中位数，`max_tokens=2000`）：
 
 | 模型 | 不发 | none | minimal | lowest | low | medium | high | max | xhigh | ultra | highest | 档间极差 | 档内波动 | ρ(档位序) |

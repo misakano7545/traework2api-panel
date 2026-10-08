@@ -1,7 +1,10 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
+	"strings"
 	"testing"
 )
 
@@ -71,5 +74,49 @@ func TestIntlSlotRoutes(t *testing.T) {
 	}
 	if _, ok := IntlSlotRoute("gpt-5.2"); ok {
 		t.Error("普通模型（直接能调的）不该有槽位旁路")
+	}
+}
+
+// 上游承载不了的工具声明必须剔除**并留痕**：Codex 每轮都发 type:"web_search"，
+// 这里没有 function 键 → 原来静默 continue，日志一个字都没有，客户端还以为自己能
+// 联网搜索。另外 tool_choice 点了名的不许留着（名字对不上，上游只当参数非法）。
+func TestPrepareBodyLogsDroppedNativeTools(t *testing.T) {
+	old := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	src := []byte(`{"model":"glm-5.2","messages":[],
+		"tools":[
+			{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}},
+			{"type":"web_search"},
+			{"type":"namespace","name":"multi_agent_v1"}
+		],
+		"tool_choice":"web_search"}`)
+	out := PrepareBody(src)
+
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := obj["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("只该留下函数工具，得到 %#v", obj["tools"])
+	}
+	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if asString(fn["name"]) != "shell" {
+		t.Fatalf("留下的不是 shell：%#v", tools[0])
+	}
+	if raw, _ := fn["parameters"].(string); raw == "" {
+		t.Fatal("parameters 应为 JSON 字符串")
+	}
+	if _, ok := obj["tool_choice"]; ok {
+		t.Fatalf("点名了被剔工具的 tool_choice 应删掉：%v", obj["tool_choice"])
+	}
+	logged := buf.String()
+	for _, want := range []string{"web_search", "multi_agent_v1", "剔除 2 个"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("日志缺 %q：%q", want, logged)
+		}
 	}
 }

@@ -451,3 +451,80 @@ func TestMessagesEndpointNonStreamError(t *testing.T) {
 		t.Fatalf("code=%d body=%v", rec.Code, obj)
 	}
 }
+
+// tool_result 里的图片：Claude Code 读截图、MCP 的截图类工具都这么回。
+// 图不能留在 tool 消息里（Chat 的 tool 角色只接受文本），要等这批工具结果全部落地
+// 之后另起一条 user 消息（占位文本在首个 part）。
+// 口径与 workbuddy2api-panel 同款（那边先落地）。
+func TestMessagesToolResultImageMoved(t *testing.T) {
+	msgsFor := func(content string) []any {
+		t.Helper()
+		got, err := messagesToChat([]byte(`{"model":"m","messages":[{"role":"user","content":[` + content + `]}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(got, &obj); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := obj["messages"].([]any)
+		return msgs
+	}
+	roles := func(m []any) string {
+		var r []string
+		for _, x := range m {
+			r = append(r, asString(x.(map[string]any)["role"]))
+		}
+		return strings.Join(r, ",")
+	}
+
+	t.Run("text_and_image_then_client_text", func(t *testing.T) {
+		m := msgsFor(`{"type":"tool_result","tool_use_id":"toolu_1","content":[
+			{"type":"text","text":"shot"},
+			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aaa"}}]},
+			{"type":"text","text":"next"}`)
+		// 图的落点在「这批工具结果之后」的下一个消息边界（message 级 flush）：
+		// 同一块里客户端自己还有正文时，图排在它之后 —— 与 WB 同款，硬约束只是
+		// 「不能夹在 tool 消息之间」，这条形状满足。
+		if got := roles(m); got != "tool,user,user" {
+			t.Fatalf("角色序列=%s %#v", got, m)
+		}
+		if tool := m[0].(map[string]any); tool["tool_call_id"] != "toolu_1" || tool["content"] != "shot" {
+			t.Fatalf("正文该留在 tool 消息里：%v", tool)
+		}
+		if m[1].(map[string]any)["content"] != "next" {
+			t.Fatalf("客户端正文不该被合并：%v", m[1])
+		}
+		parts, ok := m[2].(map[string]any)["content"].([]any)
+		if !ok || len(parts) != 2 || asString(parts[0].(map[string]any)["text"]) != toolImagePlaceholder {
+			t.Fatalf("合成 user 消息=%#v", m[2])
+		}
+		img := parts[1].(map[string]any)
+		if img["type"] != "image_url" {
+			t.Fatalf("image part=%v", img)
+		}
+		if asString(img["image_url"].(map[string]any)["url"]) != "data:image/png;base64,aaa" {
+			t.Fatalf("data URI 拼错：%v", img)
+		}
+	})
+
+	// 只有图片时正文是空串（图另起一条 user 消息，占位文本就在那里指路）。
+	t.Run("image_only_keeps_empty_text", func(t *testing.T) {
+		m := msgsFor(`{"type":"tool_result","tool_use_id":"toolu_1","content":[
+			{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aaa"}}]}`)
+		if got := roles(m); got != "tool,user" {
+			t.Fatalf("角色序列=%s %#v", got, m)
+		}
+		if m[0].(map[string]any)["content"] != "" {
+			t.Fatalf("tool content=%v", m[0])
+		}
+	})
+
+	t.Run("is_error_still_prefixed", func(t *testing.T) {
+		m := msgsFor(`{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":[
+			{"type":"text","text":"boom"}]}`)
+		if tool := m[0].(map[string]any); tool["content"] != "error: boom" {
+			t.Fatalf("is_error 前缀丢了：%v", tool)
+		}
+	})
+}

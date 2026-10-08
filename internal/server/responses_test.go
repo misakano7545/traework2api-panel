@@ -927,3 +927,85 @@ func TestResponsesToolContractDetails(t *testing.T) {
 		t.Fatalf("非流式截断 custom 应按不可执行下发：%v", truncIt)
 	}
 }
+
+// 工具结果里的图片：必须挪出 tool 消息（Chat 的 tool 角色带 image_url 会被 OpenAI
+// 直接 400），并攒到本轮工具结果**全部**落地之后 —— 中间插消息会让后面的 tool_call_id
+// 失去应答，并行工具调用必然踩中。Codex 的 view_image 就是这么回图的。
+// 口径与 workbuddy2api-panel 同款（那边先落地）：占位文本放在合成 user 消息的首个 part。
+func TestResponsesToolOutputImageMoved(t *testing.T) {
+	msgsFor := func(input string) []any {
+		t.Helper()
+		got, _, err := responsesToChat([]byte(`{"model":"m","input":` + input + `}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(got, &obj); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := obj["messages"].([]any)
+		return msgs
+	}
+	roles := func(m []any) string {
+		var r []string
+		for _, x := range m {
+			r = append(r, asString(x.(map[string]any)["role"]))
+		}
+		return strings.Join(r, ",")
+	}
+	const img = `{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}`
+	const call = `{"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"}`
+
+	t.Run("text_and_image", func(t *testing.T) {
+		m := msgsFor(`[` + call + `,{"type":"function_call_output","call_id":"c1","output":[
+			{"type":"output_text","text":"shot"},` + img + `]}]`)
+		if got := roles(m); got != "assistant,tool,user" {
+			t.Fatalf("角色序列=%s %#v", got, m)
+		}
+		if tool := m[1].(map[string]any); tool["content"] != "shot" {
+			t.Fatalf("正文该留在 tool 消息里：%v", tool)
+		}
+		parts, ok := m[2].(map[string]any)["content"].([]any)
+		if !ok || len(parts) != 2 {
+			t.Fatalf("合成 user 消息=%#v", m[2])
+		}
+		if asString(parts[0].(map[string]any)["text"]) != toolImagePlaceholder {
+			t.Fatalf("首个 part 该是占位文本：%v", parts[0])
+		}
+		p := parts[1].(map[string]any)
+		if p["type"] != "image_url" || asString(p["image_url"].(map[string]any)["url"]) == "" {
+			t.Fatalf("image part=%v", p)
+		}
+	})
+
+	// 上一轮的图必须先于下一轮 assistant 落地：两轮一起钉「没丢」与「没插早」。
+	t.Run("two_rounds_role_sequence", func(t *testing.T) {
+		m := msgsFor(`[` + call + `,{"type":"function_call_output","call_id":"c1","output":[` + img + `]},
+			{"type":"function_call","call_id":"c2","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c2","output":"ok"}]`)
+		if got := roles(m); got != "assistant,tool,user,assistant,tool" {
+			t.Fatalf("角色序列=%s %#v", got, m)
+		}
+	})
+
+	t.Run("parallel_outputs_stay_adjacent", func(t *testing.T) {
+		m := msgsFor(`[` + call + `,
+			{"type":"function_call","call_id":"c2","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":[` + img + `]},
+			{"type":"function_call_output","call_id":"c2","output":"ok"}]`)
+		if got := roles(m); got != "assistant,tool,tool,user" {
+			t.Fatalf("两条 tool 必须紧挨着，图在其后：%s %#v", got, m)
+		}
+	})
+
+	// 纯文本路径逐字不变：不该给所有工具结果都补一条 user 消息。
+	t.Run("text_only_no_extra_message", func(t *testing.T) {
+		m := msgsFor(`[` + call + `,{"type":"function_call_output","call_id":"c1","output":"done"}]`)
+		if got := roles(m); got != "assistant,tool" {
+			t.Fatalf("角色序列=%s %#v", got, m)
+		}
+		if m[1].(map[string]any)["content"] != "done" {
+			t.Fatalf("正文=%v", m[1])
+		}
+	})
+}

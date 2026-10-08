@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 
@@ -73,5 +74,48 @@ func TestUgHeadersCompleteImpersonation(t *testing.T) {
 	}
 	if rid := req.Header.Get("X-Request-Id"); len(rid) != 36 || strings.Count(rid, "-") != 4 {
 		t.Errorf("X-Request-Id=%q", rid)
+	}
+}
+
+// chat 路的伪装头**键集**必须钉住。判据：与 cpa-multi-plugins/trae 参考实现的
+// 对拍答案卷逐键交叉核对（2026-10-08）—— 键集完全一致，只有版本号/版本码是我们按
+// 自己的探针钉的（参考实现报 0.1.61/20260820，我们钉 20260811，见 constants.go 与
+// README「版本码矩阵」）。头是「能不能过」的开关：X-App-Version-Code 缺了上游直接
+// 4001（实测），X-Ide-Version-Code 又是模型表的放量开关 —— 少一个头是静默掉模型/掉通道。
+func TestSOLOHeadersKeySet(t *testing.T) {
+	want := []string{
+		"Accept", "Authorization", "Content-Type", "Request-Traffic-Type", "User-Agent",
+		"X-App-Id", "X-App-Version", "X-App-Version-Code", "X-Cloudide-Token",
+		"X-Device-Brand", "X-Device-Id", "X-Device-Type", "X-Ide-Token", "X-Ide-Version",
+		"X-Ide-Version-Code", "X-Ide-Version-Type", "X-Machine-Id", "X-Os-Version", "X-Uid",
+	}
+	for _, stream := range []bool{true, false} {
+		req, _ := http.NewRequest(http.MethodPost, "https://api.trae.cn/x", nil)
+		SOLOHeaders(req, &auth.Auth{AccessToken: "JWT-ABC", DeviceID: "d-1", MachineID: "m-1", UID: "u-1"}, stream)
+
+		got := make([]string, 0, len(req.Header))
+		for k := range req.Header {
+			got = append(got, k)
+		}
+		sort.Strings(got)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("stream=%v 头集合不符\n got=%v\nwant=%v", stream, got, want)
+		}
+		// 头不能是空值：空 X-Device-Id / X-Uid 上游判「缺失」而不是「没有这个账号」。
+		for _, k := range want {
+			if req.Header.Get(k) == "" {
+				t.Errorf("stream=%v 头 %s 为空", stream, k)
+			}
+		}
+		accept := "application/json"
+		if stream {
+			accept = "text/event-stream"
+		}
+		if req.Header.Get("Accept") != accept {
+			t.Errorf("stream=%v Accept=%q", stream, req.Header.Get("Accept"))
+		}
+		if req.Header.Get("X-Ide-Version") != IdeVersion || req.Header.Get("X-Ide-Version-Code") != IdeVersionCode {
+			t.Errorf("版本头与常量不一致：%q/%q", req.Header.Get("X-Ide-Version"), req.Header.Get("X-Ide-Version-Code"))
+		}
 	}
 }

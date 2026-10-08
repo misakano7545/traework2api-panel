@@ -188,6 +188,10 @@ const (
 	// customToolHint 追加进 custom 工具描述：告诉模型把原始载荷整段放进 input。
 	customToolHint = "This is a freeform tool: put the complete raw payload, verbatim, " +
 		"into the `input` string parameter. Do not wrap it in extra JSON."
+	// toolImagePlaceholder 工具结果里的图片被挪进合成 user 消息时带的占位正文：
+	// Chat 的 tool 消息不许带图（OpenAI 直接 400 "Image URLs are only allowed for
+	// messages with role 'user'"），图片只能另起一条 user 消息送。
+	toolImagePlaceholder = "[image from tool result]"
 )
 
 // expandNamespaceTools 把 namespace 工具组展开成扁平 function 列表。
@@ -459,6 +463,19 @@ func (m *responsesMeta) flatToolChoice(v any) any {
 func convertInputItems(items []any, meta *responsesMeta) []any {
 	var out []any
 	var pending []any
+	// 工具结果里的图片要等本轮工具结果全部落地才发：插在 assistant.tool_calls 与它的
+	// tool 消息之间会打断配对（并行工具调用时判 11148）。
+	var toolImgs []any
+	flushImgs := func() {
+		if len(toolImgs) == 0 {
+			return
+		}
+		out = append(out, map[string]any{
+			"role":    "user",
+			"content": append([]any{map[string]any{"type": "text", "text": toolImagePlaceholder}}, toolImgs...),
+		})
+		toolImgs = nil
+	}
 	flush := func() {
 		if len(pending) == 0 {
 			return
@@ -472,6 +489,13 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 			continue
 		}
 		typ, _ := m["type"].(string)
+		// 下线点：除了工具结果本身，任何项都是「这一轮工具到此为止」。
+		// 不能挂在 flush() 里（WB 那版就是这么写的）：一轮里的多个工具结果是连续的
+		// tool 消息，处理第二条结果时先落图就会插进 c1 与 c2 之间，后面那条 tool_call_id
+		// 就此失去应答（并行工具调用必踩）。
+		if typ != "function_call_output" && typ != "custom_tool_call_output" {
+			flushImgs()
+		}
 		switch typ {
 		case "reasoning", "item_reference":
 			flush()
@@ -482,11 +506,13 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 		case "function_call_output", "custom_tool_call_output":
 			flush()
 			if id := asString(m["call_id"]); id != "" {
+				txt, imgs := splitToolImages(m["output"])
 				out = append(out, map[string]any{
 					"role":         "tool",
 					"tool_call_id": id,
-					"content":      asContentString(m["output"]),
+					"content":      txt,
 				})
+				toolImgs = append(toolImgs, imgs...)
 				continue
 			}
 			// 无 call_id 的孤儿回执（来自其他任务）：同 agent_message 注入成用户指令，
@@ -523,7 +549,31 @@ func convertInputItems(items []any, meta *responsesMeta) []any {
 		out = append(out, map[string]any{"role": role, "content": convertContent(m["content"])})
 	}
 	flush()
+	flushImgs()
 	return out
+}
+
+// splitToolImages 拆开工具输出的正文与图片：Chat 的 tool 消息不许带图（OpenAI 直接
+// 400 "Image URLs are only allowed for messages with role 'user'"），图片交给调用方
+// 以下一条 user 消息送上游。少了这一步图片会被静默丢掉（Codex 的 view_image 把图
+// 放在 function_call_output.output 的数组里）：模型看不到图却照上下文编答案。
+// 拍平成 JSON 文本更糟：base64 按正文分词（≈字符数×0.69），一张 400KB 截图十几万 token。
+func splitToolImages(output any) (string, []any) {
+	parts, ok := convertContent(output).([]any)
+	if !ok {
+		return asContentString(output), nil
+	}
+	var texts []string
+	var imgs []any
+	for _, p := range parts {
+		mm, _ := p.(map[string]any)
+		if asString(mm["type"]) == "image_url" {
+			imgs = append(imgs, mm)
+			continue
+		}
+		texts = append(texts, asString(mm["text"]))
+	}
+	return strings.Join(texts, ""), imgs
 }
 
 func toToolCall(m map[string]any, meta *responsesMeta) map[string]any {
