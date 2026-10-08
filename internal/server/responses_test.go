@@ -29,7 +29,7 @@ func TestResponsesToChat(t *testing.T) {
 		"store":true,
 		"previous_response_id":"resp_old"
 	}`)
-	got, err := responsesToChat(src)
+	got, _, err := responsesToChat(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestResponsesToChat(t *testing.T) {
 }
 
 func TestResponsesToChatStringInput(t *testing.T) {
-	got, err := responsesToChat([]byte(`{"model":"m","input":"hi","stream":true}`))
+	got, _, err := responsesToChat([]byte(`{"model":"m","input":"hi","stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestChatCompletionToResponse(t *testing.T) {
 		}},
 		"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
 	}
-	got := chatCompletionToResponse(chat)
+	got := chatCompletionToResponse(chat, nil)
 	if got["id"] != "resp_chatcmpl-1" || got["object"] != "response" || got["status"] != "completed" {
 		t.Fatalf("envelope=%v", got)
 	}
@@ -449,7 +449,7 @@ func TestResponsesStreamDropsNamelessTool(t *testing.T) {
 }
 
 func TestResponsesToChatInvalidJSON(t *testing.T) {
-	_, err := responsesToChat([]byte(`{`))
+	_, _, err := responsesToChat([]byte(`{`))
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -477,10 +477,21 @@ func TestUsageCacheFields(t *testing.T) {
 	if au["cache_creation_input_tokens"] != float64(100) {
 		t.Fatalf("anthropic cache_creation_input_tokens=%v want 100", au["cache_creation_input_tokens"])
 	}
-	// SOLO 直报口径：input_tokens 原样取 prompt_tokens，不做缓存扣减
-	//（是否需要扣减取决于 prompt 是否含缓存读——待实测证据，见实验记录）。
-	if au["input_tokens"] != float64(10000) {
-		t.Fatalf("anthropic input_tokens=%v want 10000（原样透传）", au["input_tokens"])
+	// Claude 口径：input_tokens **不含**缓存读/写（单独字段计）。旧断言钉的是
+	// 「SOLO 直报、原样透传」（当时缺证据：prompt 是否含缓存读未实测）——2026-10-08
+	// 由 responses.go 的实测记录定案：`cache_read=45 / prompt=45`，即 prompt_tokens
+	// 含缓存读，故必须扣减，否则 Claude Code 的上下文占用被虚抬。
+	// 10000 - (8960 + 100) = 940。
+	if au["input_tokens"] != float64(940) {
+		t.Fatalf("anthropic input_tokens=%v want 940（扣掉缓存读/写）", au["input_tokens"])
+	}
+	// 只报缓存读、没报 prompt 全量的极端 body：扣成负数要夹到 0，不许出现负上下文。
+	if got := anthropicUsage(map[string]any{"cache_read_input_tokens": float64(50)})["input_tokens"]; got != float64(0) {
+		t.Fatalf("扣减后 input_tokens=%v want 0（不为负）", got)
+	}
+	// 没有缓存字段的普通请求一字不动。
+	if got := anthropicUsage(map[string]any{"prompt_tokens": float64(7)})["input_tokens"]; got != float64(7) {
+		t.Fatalf("无缓存字段时 input_tokens=%v want 7（不动）", got)
 	}
 	if got := anthropicUsage(nil)["cache_read_input_tokens"]; got != nil {
 		t.Fatalf("nil usage 不该凭空造缓存字段, got=%v", got)
@@ -490,7 +501,7 @@ func TestUsageCacheFields(t *testing.T) {
 		t.Fatalf("responses input_tokens_details=%v want cached_tokens 8960", d)
 	}
 
-	chat, err := responsesToChat([]byte(`{"model":"m","prompt_cache_key":"sess-1","input":"hi"}`))
+	chat, _, err := responsesToChat([]byte(`{"model":"m","prompt_cache_key":"sess-1","input":"hi"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,5 +567,363 @@ func TestResponsesEmitAfterFlushNoSuperfluousWriteHeader(t *testing.T) {
 	}
 	if !strings.Contains(fw.body.String(), "event: response.created") {
 		t.Fatalf("body=%q", fw.body.String())
+	}
+}
+
+func TestResponsesOrphanFunctionCallOutput(t *testing.T) {
+	msgsFor := func(input string) []any {
+		t.Helper()
+		got, _, err := responsesToChat([]byte(`{"model":"m","input":` + input + `}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(got, &obj); err != nil {
+			t.Fatal(err)
+		}
+		msgs, _ := obj["messages"].([]any)
+		return msgs
+	}
+
+	// 带图：孤儿回执必须整段保留 parts，前缀是独立 text part（图不能丢）。
+	t.Run("image_parts_kept", func(t *testing.T) {
+		m := msgsFor(`[{"type":"function_call_output","output":[
+			{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]`)
+		if len(m) != 1 {
+			t.Fatalf("len=%d %#v", len(m), m)
+		}
+		msg := m[0].(map[string]any)
+		if msg["role"] != "user" {
+			t.Fatalf("role=%v", msg["role"])
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok || len(parts) != 2 {
+			t.Fatalf("content=%#v", msg["content"])
+		}
+		if p0 := parts[0].(map[string]any); !strings.HasPrefix(asString(p0["text"]), "[Message from another task") {
+			t.Fatalf("prefix part=%v", p0)
+		}
+		p1 := parts[1].(map[string]any)
+		if p1["type"] != "image_url" {
+			t.Fatalf("image part=%v", p1)
+		}
+	})
+
+	t.Run("text_only_flattens", func(t *testing.T) {
+		m := msgsFor(`[{"type":"function_call_output","output":[{"type":"output_text","text":"done"}]}]`)
+		msg := m[0].(map[string]any)
+		if msg["role"] != "user" || !strings.Contains(asString(msg["content"]), "done") {
+			t.Fatalf("got=%v", msg)
+		}
+	})
+
+	t.Run("dict_output_serialized", func(t *testing.T) {
+		m := msgsFor(`[{"type":"function_call_output","output":{"type":"output_text","text":"done"}}]`)
+		msg := m[0].(map[string]any)
+		if msg["role"] != "user" || !strings.Contains(asString(msg["content"]), "done") {
+			t.Fatalf("got=%v", msg)
+		}
+	})
+
+	// 有 call_id：仍是标准工具结果，一行不许变。
+	t.Run("with_call_id_unchanged", func(t *testing.T) {
+		m := msgsFor(`[{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":[{"type":"output_text","text":"done"}]}]`)
+		if len(m) != 2 {
+			t.Fatalf("len=%d %#v", len(m), m)
+		}
+		if m[0].(map[string]any)["role"] != "assistant" {
+			t.Fatalf("msgs[0]=%v", m[0])
+		}
+		msg := m[1].(map[string]any)
+		if msg["role"] != "tool" || msg["tool_call_id"] != "call_1" || msg["content"] != "done" {
+			t.Fatalf("tool msg=%v", msg)
+		}
+	})
+}
+
+func TestResponsesCustomToolAndNamespace(t *testing.T) {
+	src := []byte(`{"model":"m","stream":true,"input":"patch it","tools":[` +
+		`{"type":"custom","name":"apply_patch","description":"Apply a patch","format":{"type":"grammar","definition":"start: patch"}},` +
+		`{"type":"namespace","name":"codex_app","tools":[{"name":"list_threads","description":"list","parameters":{"type":"object"}}]}` +
+		`]}`)
+	chat, meta, err := responsesToChat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(chat, &body); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools=%v want 2（namespace 应展开、custom 应降级）", tools)
+	}
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		if tool["type"] != "function" {
+			t.Fatalf("tool type=%v want function（上游只认扁平 function）", tool["type"])
+		}
+		fn, _ := tool["function"].(map[string]any)
+		if fn == nil {
+			t.Fatalf("tool 未按 {\"type\",\"function\"} 包裹：%v", tool)
+		}
+		params, _ := fn["parameters"].(map[string]any)
+		props, _ := params["properties"].(map[string]any)
+		if fn["name"] == "apply_patch" && props["input"] == nil {
+			t.Fatalf("custom 工具应降级为单 input 参数：%v", tool)
+		}
+	}
+	if !meta.isCustom("apply_patch") || meta.isCustom("list_threads") {
+		t.Fatalf("customTools=%v want 只有 apply_patch", meta.customTools)
+	}
+	if meta.nsMap["list_threads"] != "codex_app" {
+		t.Fatalf("nsMap=%v want list_threads -> codex_app", meta.nsMap)
+	}
+
+	// 回程（Codex 走的流式路径）：custom 还原成 custom_tool_call/input 事件，namespace 补回。
+	rec := httptest.NewRecorder()
+	rw := &responsesWriter{ResponseWriter: rec, stream: true, meta: meta}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"apply_patch","arguments":"{\"input\":\"PATCH\"}"}}]}}]}` + "\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"list_threads","arguments":"{}"}}]}}]}` + "\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, f := range frames {
+		if _, err := rw.Write([]byte(f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rw.finish()
+	out := rec.Body.String()
+	for _, want := range []string{
+		"response.custom_tool_call_input.delta",
+		"response.custom_tool_call_input.done",
+		`"input":"PATCH"`, // 回程已把 {"input":...} 还原成 freeform 原文
+		`"namespace":"codex_app"`,
+		"response.function_call_arguments.done", // 非 custom 工具仍走 function_call 路径
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("回程缺少 %q：\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `"type":"custom_tool_call"`) && !strings.Contains(out, `"name":"apply_patch"`) {
+		t.Fatal("custom 项应带 name")
+	}
+}
+
+func sseItems(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, block := range strings.Split(body, "\n\n") {
+		for _, line := range strings.Split(block, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var m map[string]any
+			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+				continue
+			}
+			if m["type"] != "response.output_item.done" {
+				continue
+			}
+			if it, ok := m["item"].(map[string]any); ok {
+				out = append(out, it)
+			}
+		}
+	}
+	return out
+}
+
+// driveStream 把 frames 喂给 responsesWriter，返回回程 body（Codex 走的流式路径）。
+func driveStream(t *testing.T, meta *responsesMeta, frames ...string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	rw := &responsesWriter{ResponseWriter: rec, stream: true, meta: meta}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	for _, f := range frames {
+		if _, err := rw.Write([]byte(f)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rw.finish()
+	return rec.Body.String()
+}
+
+// TestResponsesToolContractDetails 三条工具契约细节（对照 ithtelab/workbuddy-manager 的
+// docs/namespace-compat.md，都是别人实测踩过的坑）：
+//  1. namespace 子工具与顶层重名时不能丢弃 —— 重名者按稳定后缀改名，回程还原客户端原名，
+//     出站方向（历史 function_call 与 tool_choice）反向映射成扁平名；
+//  2. custom 载荷只有 {"input":"<string>"}（或裸 JSON 字符串）算可信，其余不当可执行调用；
+//  3. 残缺 custom 调用（形态非法 / 无 finish_reason 与 [DONE] 的异常收尾）按 incomplete 下发。
+func TestResponsesToolContractDetails(t *testing.T) {
+	// ① 严格解包：非法形态一律不可信。
+	for _, c := range []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{`{"input":"PATCH"}`, "PATCH", true},
+		{`"PATCH"`, "PATCH", true},
+		{`{"input":"PATCH","extra":1}`, "", false}, // 多键
+		{`{"input":123}`, "", false},               // 非字符串
+		{`{"input":""}`, "", false},                // 空载荷
+		{`{"input":"PATCH"`, "", false},            // 半截 JSON（length 截断的典型形态）
+		{`*** Begin Patch`, "", false},             // 未包裹的裸文本
+		{"", "", false},
+	} {
+		got, ok := unwrapCustomInput(c.in)
+		if got != c.want || ok != c.ok {
+			t.Fatalf("unwrap(%q)=(%q,%v) want (%q,%v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+
+	// ② 重名不丢弃 + 双向映射。
+	src := []byte(`{"model":"m","stream":true,"tool_choice":"read_file","input":[` +
+		`{"type":"function_call","call_id":"c0","name":"read_file","namespace":"codex_app","arguments":"{}"}],` +
+		`"tools":[` +
+		`{"type":"function","name":"read_file","description":"top","parameters":{"type":"object"}},` +
+		`{"type":"namespace","name":"codex_app","tools":[{"name":"read_file","description":"in ns","parameters":{"type":"object"}}]}` +
+		`]}`)
+	chat, meta, err := responsesToChat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(chat, &body); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools=%d want 2（重名不得丢弃）", len(tools))
+	}
+	var names []string
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		names = append(names, asString(fn["name"]))
+	}
+	if strings.Join(names, ",") != "read_file,read_file_2" {
+		t.Fatalf("出站工具名=%v want [read_file read_file_2]", names)
+	}
+	if meta.nsMap["read_file_2"] != "codex_app" || meta.alias["read_file_2"] != "read_file" {
+		t.Fatalf("nsMap=%v alias=%v", meta.nsMap, meta.alias)
+	}
+	// 历史与 tool_choice 用客户端原名：出站必须映射成我们声明的扁平名。
+	msgs, _ := body["messages"].([]any)
+	histName := ""
+	for _, mm := range msgs {
+		m, _ := mm.(map[string]any)
+		tcs, _ := m["tool_calls"].([]any)
+		for _, tr := range tcs {
+			tc, _ := tr.(map[string]any)
+			fn, _ := tc["function"].(map[string]any)
+			histName = asString(fn["name"])
+		}
+	}
+	if histName != "read_file_2" {
+		t.Fatalf("历史 function_call 名=%q want read_file_2（出站名）", histName)
+	}
+	if tc := asString(body["tool_choice"]); tc != "read_file_2" {
+		t.Fatalf("tool_choice=%q want read_file_2（出站名）", tc)
+	}
+
+	// 回程：模型用出站名回名 → 必须还原成客户端原名，并带上 namespace。
+	streamOut := driveStream(t, meta,
+		`data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file_2","arguments":"{}"}}]}}]}`+"\n\n",
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	items := sseItems(t, streamOut)
+	if len(items) != 1 {
+		t.Fatalf("流式 items=%v", items)
+	}
+	if got := asString(items[0]["name"]); got != "read_file" {
+		t.Fatalf("流式回程 name=%q want read_file（客户端原名）", got)
+	}
+	if got := asString(items[0]["namespace"]); got != "codex_app" {
+		t.Fatalf("流式回程 namespace=%q want codex_app", got)
+	}
+
+	// 非流式出口必须与流式一致（他们那次的 bug 就是两条出口名字不一致）。
+	nsObj := map[string]any{
+		"id": "c2", "model": "m",
+		"choices": []any{map[string]any{
+			"index": 0.0, "finish_reason": "tool_calls",
+			"message": map[string]any{"tool_calls": []any{map[string]any{
+				"id": "call_b", "function": map[string]any{"name": "read_file_2", "arguments": "{}"},
+			}}},
+		}},
+	}
+	nsOut, _ := chatCompletionToResponse(nsObj, meta)["output"].([]any)
+	if len(nsOut) != 1 {
+		t.Fatalf("非流式 output=%v", nsOut)
+	}
+	nsItem, _ := nsOut[0].(map[string]any)
+	if asString(nsItem["name"]) != "read_file" || asString(nsItem["namespace"]) != "codex_app" {
+		t.Fatalf("非流式出口与流式不一致：%v", nsItem)
+	}
+
+	// ③ custom 残缺 / 形态非法不得当成可执行调用。
+	meta2 := &responsesMeta{customTools: map[string]bool{"apply_patch": true}}
+	customFrame := func(args string) string {
+		b, _ := json.Marshal(map[string]any{"id": "c3", "choices": []any{map[string]any{
+			"index": 0.0, "delta": map[string]any{"tool_calls": []any{map[string]any{
+				"index": 0.0, "id": "call_patch",
+				"function": map[string]any{"name": "apply_patch", "arguments": args},
+			}}},
+		}}})
+		return "data: " + string(b) + "\n\n"
+	}
+	finishFrame := `data: {"id":"c3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n"
+	lengthFrame := `data: {"id":"c3","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n"
+	onlyItem := func(streamBody string) map[string]any {
+		t.Helper()
+		its := sseItems(t, streamBody)
+		if len(its) != 1 {
+			t.Fatalf("items=%v body=%s", its, streamBody)
+		}
+		return its[0]
+	}
+
+	// 正常收尾 + 合法载荷 → 可执行。
+	okItem := onlyItem(driveStream(t, meta2, customFrame(`{"input":"PATCH"}`), finishFrame, "data: [DONE]\n\n"))
+	if asString(okItem["status"]) != "completed" || asString(okItem["input"]) != "PATCH" {
+		t.Fatalf("正常 custom 应为可执行：%v", okItem)
+	}
+	// length 截断（半截 JSON）→ incomplete，且不把半截当载荷。
+	truncItem := onlyItem(driveStream(t, meta2, customFrame(`{"input":"PATCH`), lengthFrame, "data: [DONE]\n\n"))
+	if asString(truncItem["status"]) != "incomplete" || asString(truncItem["input"]) != "" {
+		t.Fatalf("截断的 custom 应按不可执行下发：%v", truncItem)
+	}
+	// 异常收尾（既无 finish_reason 也无 [DONE]）：载荷可信但收尾不可信 → incomplete。
+	cutItem := onlyItem(driveStream(t, meta2, customFrame(`{"input":"PATCH"}`)))
+	if asString(cutItem["status"]) != "incomplete" || asString(cutItem["input"]) != "PATCH" {
+		t.Fatalf("异常收尾的 custom 应按不可执行下发：%v", cutItem)
+	}
+
+	// 非流式：合法载荷还原原文；截断的半截 JSON 不当作载荷。
+	nsCustom := func(args, fr string) map[string]any {
+		return map[string]any{
+			"id": "c4", "model": "m",
+			"choices": []any{map[string]any{
+				"index": 0.0, "finish_reason": fr,
+				"message": map[string]any{"tool_calls": []any{map[string]any{
+					"id": "call_patch", "function": map[string]any{"name": "apply_patch", "arguments": args},
+				}}},
+			}},
+		}
+	}
+	okNS, _ := chatCompletionToResponse(nsCustom(`{"input":"PATCH"}`, "tool_calls"), meta2)["output"].([]any)
+	okIt, _ := okNS[0].(map[string]any)
+	if asString(okIt["input"]) != "PATCH" || asString(okIt["status"]) != "completed" {
+		t.Fatalf("非流式合法 custom：%v", okIt)
+	}
+	truncNS, _ := chatCompletionToResponse(nsCustom(`{"input":"PATCH`, "length"), meta2)["output"].([]any)
+	truncIt, _ := truncNS[0].(map[string]any)
+	if asString(truncIt["status"]) != "incomplete" || asString(truncIt["input"]) != "" {
+		t.Fatalf("非流式截断 custom 应按不可执行下发：%v", truncIt)
 	}
 }
