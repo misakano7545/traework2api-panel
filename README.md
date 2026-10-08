@@ -204,15 +204,20 @@ thinking（上游没有 signature）。缓存命中各按客户端口径回：re
 `WARN: [upstream] 剔除 N 个…`，并连带删掉点名了它们的 `tool_choice`（名字对不上，上游只当参数非法）。
 静默丢会让客户端以为自己能联网搜索，而日志里一个字都没有。
 
-**与参考实现对拍**（`internal/upstream/vectors_check_test.go`，`TW2A_VECTORS=<dir>` 才跑；答案卷来自
+**与参考实现对拍**（`internal/upstream/vectors_check_test.go`，`TW2A_VECTORS=<dir>` 才跑、只报告不判红；答案卷来自
 另一套独立实现 `shadyrispy/cpa-multi-plugins` 的 `plugins/trae`，只当对拍基线，不进仓）：chat 路 18 个
 伪装头**键集逐键一致**（已固化成 `TestSOLOHeadersKeySet`），出站 body 与聚合口径除我们有意的分歧
-（不发 `config_name`、`max_tokens` 上限、未知字段透传、空流报错好换号）外全对。**4 条待决**：
-参考实现把 `403/4008`、`400/4001`、`413 too large`、`400 prompt is too long` 归成
-`plan_limit`/`model_unavailable`/`input_too_large`（调用方问题，不罚号），本仓目前一律归 `ErrClient`
-→ `NoteDegrade`（降权）——给**调用方**的超长请求降自己号的权重，与 4026 那条「上下文超长不许罚号」
-是同一类错误（见 `context_overflow_test.go`）。另外参考实现自报的客户端版本码是 `20260820`，我们钉的
-是 `20260811`（放量开关，见上「版本码矩阵」）——换码前得先按那套矩阵重测。
+（不发 `config_name`、`max_tokens` 上限、未知字段透传、空流报错好换号）外全对。
+
+对拍查出的 4 条 classify 差距已修（`client.go` 的 `Classify` 现在与 `event:error` 共用
+`soloSpecificKind` 那张具体判据表，README 早先写的「HTTP 级与流内共用一张表」名副其实）：
+`400/4001`、`413`、`400 prompt is too long` 都归**调用方问题不罚号**（与 4026 同一类，见
+`context_overflow_test.go`），`403/4008` 归软冷却。探针按**效果**比对（参考的
+`model_unavailable`/`input_too_large` 等于本仓的 `ErrNone`），跑完只剩 2 条，都是有意为之：
+① 参考实现把 4008 当 `plan_limit`（12h 硬冷却），本仓按软冷却 —— 4008/quota 是可自愈的限流
+而不是权益不足，判据钉在 `TestClassify`；② `{"error":"This input is too large"}` 参考归
+`client`（降权），本仓归不罚号 —— 调用方发太大，罚号没有意义（他们自己的标记表漏了这句）。
+传输层信号仍优先于 body 里的业务码（500 里带 quota 文案按服务端故障算）。
 
 **全模型全档实测**（不发 + 10 档 × 3 轮，取 `reasoning_tokens` 中位数，`max_tokens=2000`）：
 

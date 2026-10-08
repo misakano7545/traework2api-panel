@@ -75,45 +75,59 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类，口径照抄参考实现 trae-workbuddy-switch 的 classify_solo：
-// 先看业务码，再看文案兜底，最后才按数字区间归类。顺序有讲究 —— 把 1005 当 Client
-// 会让一个额度耗尽的号在几十分钟后被反复重试；把业务码（1005/4001/4023…）按
-// `>= 500` 之类的区间吞掉，则会把最需要单独识别的一类全归成 Server。
-func (e *SOLOStreamError) Kind() ErrKind {
-	lower := strings.ToLower(e.Msg)
+// soloSpecificKind 只看**具体**判据（业务码 + 文案标记）；认不出返回 ok=false。
+//
+// 拆出来是给 HTTP 级 Classify 共用同一张表（README 一直写着「HTTP 级与 event:error
+// 共用一张表」，代码里其实只有这张开关）。区间/兜底**不算**具体判据：HTTP 4xx 的 body
+// 里出现一个认不出的业务码时，该按 HTTP 状态归 Client，不能落到流内那套「认不出就按
+// 上游故障罚号」的兜底（把 11101 bad param 罚成 ErrServer 会白喂熔断）。
+func soloSpecificKind(code int64, msg string) (ErrKind, bool) {
+	lower := strings.ToLower(msg)
 	switch {
-	case e.Code == 1005 || strings.Contains(lower, "plan"):
-		return ErrPlanLimit
+	case code == 1005 || strings.Contains(lower, "plan"):
+		return ErrPlanLimit, true
 	// 模型配置为空 / 参数非法是**模型**问题，不是账号问题，罚号没有意义。
 	// 实测：function 给错通道时上游回 4001 "the param is invalid"，
 	// 旧口径按罚号计数，一次客户端参数错误就把好号推向熔断。
-	case e.Code == 4001 || strings.Contains(lower, "model config is empty"):
-		return ErrNone
+	case code == 4001 || strings.Contains(lower, "model config is empty"):
+		return ErrNone, true
 	// 4011 = 通道级速率/额度限制（实测 2026-09-28）：同一账号在 coder 通道被 4011 拒的同时，
 	// Work 通道立刻照常出正文。罚整个账号会让另一条通道的模型跟着躺 60 秒，所以不罚号。
-	case e.Code == 4011:
-		return ErrNone
+	case code == 4011:
+		return ErrNone, true
 	// 4026 = 上下文超长（实测：dev 窗口 232768 的模型发 ~250K token 回
 	// {"code":4026,"message":"We're sorry, your context length has exceeded the maximum limit."}）。
 	// 这是**调用方**的问题，不是账号的：老口径靠下面那条 "exceeded" 子串把它归成 ErrSoftRate，
 	// 于是一个客户端发超长 prompt 就给好号上软冷却（60s 起、指数到 2h）；它一重试，
 	// 轮转过的每个号都跟着躺下，几次就能把整池冻住。放在 4008/quota 之前，别被 "exceeded" 抢走。
-	case e.Code == 4026 || strings.Contains(lower, "context length"):
-		return ErrNone
-	case e.Code == 4001:
-		// 4001「模型配置不匹配」是**调用方问题**（模型名不在该账号配置里 / 走了错的 function
-		// 通道），罚号只会把好号降权。照 240xu/trae2api-more 的 IsModelConfigMismatch：
-		// 不冷却账号、如实回报。
-		return ErrNone
-	case e.Code == 4008 || strings.Contains(lower, "quota") ||
+	case code == 4026 || strings.Contains(lower, "context length"):
+		return ErrNone, true
+	// 4008/quota 走**软冷却**（README 有实测政策），不是 12h 计划冷却：它是可自愈的限流，
+	// 不是权益不足。
+	case code == 4008 || strings.Contains(lower, "quota") ||
 		strings.Contains(lower, "exceeded") || strings.Contains(lower, "rate"):
-		return ErrSoftRate
-	case e.Code == 401:
-		return ErrSessionDead
-	case e.Code == 429:
-		return ErrSoftRate
-	case e.Code == 404:
-		return ErrNotFound
+		return ErrSoftRate, true
+	case code == 401:
+		return ErrSessionDead, true
+	case code == 429:
+		return ErrSoftRate, true
+	case code == 404:
+		return ErrNotFound, true
+	}
+	return ErrNone, false
+}
+
+// Kind 将 SSE 流内错误分类，口径照参考实现 trae-workbuddy-switch 的 classify_solo：
+// 先看具体判据（业务码 + 文案，见 soloSpecificKind），认不出才按数字区间归类。
+// 顺序有讲究 —— 把 1005 当 Client 会让一个额度耗尽的号在几十分钟后被反复重试；
+// 把业务码（1005/4001/4023…）按 `>= 500` 之类的区间吞掉，则会把最需要单独识别的一类
+// 全归成 Server。流内只有业务码可看，所以这里的兜底比 HTTP 级狠（照旧：认不出的码
+// 按上游侧故障处理）。
+func (e *SOLOStreamError) Kind() ErrKind {
+	if k, ok := soloSpecificKind(e.Code, e.Msg); ok {
+		return k
+	}
+	switch {
 	// 只有真正的 HTTP 状态码区间才映射为 Client / Server（显式写区间上界）。
 	case e.Code >= 400 && e.Code < 500:
 		return ErrClient

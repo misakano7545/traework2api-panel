@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -123,6 +124,8 @@ func Classify(status int, body string) ErrKind {
 		}
 		return ErrSessionDead
 	}
+	// 传输层的信号优先，别被 body 里的业务码抢走：401/429/404/5xx 说的就是「这次没成」
+	// 的形态（500 里带 quota 文案仍该按服务端故障处理）。
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
@@ -132,10 +135,60 @@ func Classify(status int, body string) ErrKind {
 	if status >= 500 {
 		return ErrServer
 	}
+	// 业务码胜过「4xx 一律 Client」：同一个码走 HTTP 状态与走 SSE 流内事件是同一套上游
+	// 语义的两种到达方式，落进不同的池状态就会出怪事 —— 4008 走流内是软冷却、走 HTTP 403
+	// 却是降权，就是这么来的。分类表复用流内那张（soloSpecificKind），认不出的业务码不算。
+	if code := bodyBusinessCode(body); code != 0 {
+		if k, ok := soloSpecificKind(int64(code), body); ok {
+			return k
+		}
+	}
+	// 调用方侧的「输入过大」：罚号没有意义（同 4026 那条的教训 —— 一个客户端发超长
+	// prompt，重试一圈就把轮转过的每个号都放倒）。上游 413 或几种文案都算。
+	if status == http.StatusRequestEntityTooLarge || inputTooLarge(lower) {
+		return ErrNone
+	}
 	if status >= 400 {
 		return ErrClient
 	}
 	return ErrNone
+}
+
+// bodyBusinessCode 取上游错误信封里的业务码（`code` 与 `Code` 两种写法，值可能是数字
+// 也可能是数字字符串）。0 = 没有或认不出（认不出就当没有，交给 HTTP 状态判）。
+func bodyBusinessCode(body string) int {
+	var m map[string]any
+	if json.Unmarshal([]byte(body), &m) != nil {
+		return 0
+	}
+	for _, k := range []string{"code", "Code"} {
+		switch v := m[k].(type) {
+		case float64:
+			return int(v)
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// inputTooLargeMarkers 调用方侧「输入过大」的文案（上游几种写法都认）。
+// 故意不含宽泛的 "exceeded"/"rate"：那两块也出现在 4008 的额度文案里（"your requests
+// have exceeded the quota"），归错就变成给一个限流号免罚。
+var inputTooLargeMarkers = []string{
+	"context length", "maximum context length", "prompt is too long",
+	"input is too large", "input too large", "too many tokens",
+}
+
+func inputTooLarge(lower string) bool {
+	for _, m := range inputTooLargeMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // Client SOLO 上游 HTTP 客户端。Host 字段可覆盖便于测试。

@@ -34,6 +34,23 @@ func TestClassify(t *testing.T) {
 		{503, `unavailable`, ErrServer},
 		{400, `{"code":11101,"msg":"bad param"}`, ErrClient},
 		{200, `{"checked_in":false}`, ErrNone},
+		// 以下几条是「参考实现对拍」查出来的差距（2026-10-08）：HTTP 状态与 SSE 流内
+		// 是同一套上游语义的两种到达方式，同一个码不许落进不同的池状态。
+		{400, `{"code":4001,"msg":"We're sorry, the param is invalid"}`, ErrNone},
+		{403, `{"code":4008}`, ErrSoftRate},
+		{413, `too large`, ErrNone},
+		{400, `{"msg":"prompt is too long for this model"}`, ErrNone},
+		// 上面两条「输入过大」是调用方问题，罚号没有意义（同 4026 那条的教训）。
+		{400, `{"code":4026,"message":"context length has exceeded the maximum limit"}`, ErrNone},
+		// 4008 的额度文案不许被「输入过大」的宽松匹配抢走（含 "exceeded"，但不含任何
+		// too-large 标记）——否则一个限流号会拿到免罚。
+		{403, `{"code":4008,"msg":"Your requests have exceeded the quota"}`, ErrSoftRate},
+		// 传输层信号优先于 body 里的业务码：500 里带 quota 文案仍按服务端故障处理。
+		{500, `{"code":4008,"msg":"quota exceeded"}`, ErrServer},
+		// 认不出的业务码 + 4xx：按状态归 Client，别落到「认不出就罚号」的流内兜底。
+		{403, `{"code":99999}`, ErrClient},
+		// Code 大写 + 字符串数字（换证接口那种信封）也要认得出。
+		{400, `{"Code":"4001"}`, ErrNone},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
