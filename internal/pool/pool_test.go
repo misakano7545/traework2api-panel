@@ -225,6 +225,67 @@ func TestNoteSuccessResetsCounter(t *testing.T) {
 	}
 }
 
+// 网关冷却只延长不缩短：同一账号上并发请求时，12h 的 plan 硬冷却会被随后到达的一次 60s
+// 软冷却（429）改写成 60s —— 号提前回池被再选中，重复打 1005/429，面板原因也被改写。
+// 四种失败路径（plan/breaker/degrade/soft）都直接写 e.until，所以判据必须收在一处。
+func TestCooldownNeverShortens(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownPlan("u1")
+	st, _ := p.Status("u1")
+	if !st.Cooling || time.Until(st.Until) < 11*time.Hour || st.Reason != "plan 权益不足" {
+		t.Fatalf("plan 冷却没生效: %+v", st)
+	}
+	p.CooldownSoft("u1", "429 rate limit")
+	st, _ = p.Status("u1")
+	if time.Until(st.Until) < 11*time.Hour || st.Reason != "plan 权益不足" {
+		t.Fatalf("plan 硬冷却被软冷却缩短/改写: %+v", st)
+	}
+	p.NoteError("u1")
+	p.NoteError("u1")
+	p.NoteError("u1") // 达阈值 → breaker 冷却（10m）
+	st, _ = p.Status("u1")
+	if time.Until(st.Until) < 11*time.Hour {
+		t.Fatalf("熔断冷却缩短了 plan 硬冷却: %+v", st)
+	}
+}
+
+// expiring_soon 清空 = 禁用分桶：配置层把空串解析成 0（注释写明 0 = 禁用），Default() 保证
+// 「键缺席」是 168h，所以传进 ApplyLimits 的 0 只可能是显式禁用——不能当「没填」跳过。
+func TestApplyLimitsExpiringSoonZeroDisables(t *testing.T) {
+	p := New("")
+	if p.Limits().ExpiringSoon <= 0 {
+		t.Fatalf("默认应为 168h: %v", p.Limits().ExpiringSoon)
+	}
+	p.ApplyLimits(Limits{ExpiringSoon: 0})
+	if got := p.Limits().ExpiringSoon; got != 0 {
+		t.Fatalf("显式 0 未生效，仍为 %v（面板说保存成功、行为没变）", got)
+	}
+}
+
+// NoteSuccess 清的四个计数都持久化在 state.json：清了不落盘，崩在下次落盘前就会带着虚高
+// 的退避档位回来（下次一次 429 直接跳高档位）。
+func TestNoteSuccessPersistsReset(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteDegrade("u1") // 降权计数 1（< 阈值 5）→ 只累计并落盘，不进冷却
+	p.NoteSuccess("u1")
+	if st, _ := p.Status("u1"); st.Degraded != 0 {
+		t.Fatalf("内存里没清: %+v", st)
+	}
+	// 直接看重载后的持久值：Pick() 那条路会被 Add 重建状态，验不到盘上的数。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"}) // Add 对已存在的 uid 只挂回 auth，计数保留
+	st, ok := p2.Status("u1")
+	if !ok {
+		t.Fatal("state 未加载")
+	}
+	if st.Degraded != 0 {
+		t.Fatalf("NoteSuccess 没落盘：重启后仍带虚高退避档位 degrade_count=%d", st.Degraded)
+	}
+}
+
 func TestList(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1", Nickname: "nick1"})

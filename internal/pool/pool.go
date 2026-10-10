@@ -249,7 +249,10 @@ func (p *Pool) ApplyLimits(l Limits) {
 	if l.IdleWeightMax > 0 {
 		cur.IdleWeightMax = l.IdleWeightMax
 	}
-	if l.ExpiringSoon > 0 {
+	// ExpiringSoon 用 >= 0：配置层把空串解析成 0，注释写明「0 = 禁用分桶」，而 Default()
+	// 保证「键缺席」是 168h——所以到这里 0 只可能来自显式禁用。跟着 > 0 走会让「清空该键」
+	// 悄悄退回 168h（面板说保存成功、行为一点没变）。调用点只有 limitsOf（启动 + 面板保存）。
+	if l.ExpiringSoon >= 0 {
 		cur.ExpiringSoon = l.ExpiringSoon
 	}
 	if l.PlanCooldown > 0 {
@@ -588,11 +591,20 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // cooldownLocked 调用方须持 p.mu（时长可能取自 p.lim，必须在锁内求值）。
 func (p *Pool) cooldownLocked(uid string, d time.Duration, reason string) {
 	if e, ok := p.byUID[uid]; ok {
-		e.until = time.Now().Add(d)
-		e.reason = reason
+		e.setCooldownLocked(time.Now().Add(d), reason)
 		e.errCount = 0
 	}
 	p.saveLocked()
+}
+
+// setCooldownLocked 网关冷却只延长、不缩短（模块头承诺的「不叠加：取更长者」，也是
+// CooldownCheckin 的做法）。四种失败路径都走它：并发请求下 12h 的 plan 硬冷却曾被随后
+// 一次 60s 软冷却改写成 60s，号提前回池被再选中 → 重复打 1005/429，面板原因也被改写。
+// 提前解除冷却只有显式路径（ClearCooldown / ReenableIfCredits / 面板按钮）。
+func (e *entry) setCooldownLocked(until time.Time, reason string) {
+	if until.After(e.until) {
+		e.until, e.reason = until, reason
+	}
 }
 
 // Disable 永久禁用（session 失效），需人工重登后手工恢复或文件替换。
@@ -775,8 +787,7 @@ func (p *Pool) NoteError(uid string) {
 	if d <= 0 || d > p.lim.BreakerCooldownMax {
 		d = p.lim.BreakerCooldownMax
 	}
-	e.until = time.Now().Add(d)
-	e.reason = fmt.Sprintf("breaker x%d", e.breakerStreak)
+	e.setCooldownLocked(time.Now().Add(d), fmt.Sprintf("breaker x%d", e.breakerStreak))
 	p.saveLocked()
 }
 
@@ -799,8 +810,7 @@ func (p *Pool) NoteDegrade(uid string) {
 	if d > p.lim.DegradeCooldownMax {
 		d = p.lim.DegradeCooldownMax
 	}
-	e.until = time.Now().Add(d)
-	e.reason = "degraded"
+	e.setCooldownLocked(time.Now().Add(d), "degraded")
 	p.saveLocked()
 }
 
@@ -818,8 +828,7 @@ func (p *Pool) CooldownSoft(uid, reason string) {
 	if d <= 0 || d > p.lim.SoftCooldownMax {
 		d = p.lim.SoftCooldownMax
 	}
-	e.until = time.Now().Add(d)
-	e.reason = reason
+	e.setCooldownLocked(time.Now().Add(d), reason)
 	e.errCount = 0
 	p.saveLocked()
 }
@@ -839,10 +848,14 @@ func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.errCount = 0
-		e.degradeCount = 0
-		e.breakerStreak = 0
-		e.softStreak = 0
+		// breakerStreak/softStreak/degradeCount 持久化在 state.json（errCount 只在内存）：
+		// 清了持久字段就必须落盘，否则崩在下次落盘前会带着虚高退避档位回来（下次一次 429
+		// 跳到高档位）。成功是热路径，所以只在真清了持久字段时才写一次。
+		persisted := e.degradeCount != 0 || e.breakerStreak != 0 || e.softStreak != 0
+		e.errCount, e.degradeCount, e.breakerStreak, e.softStreak = 0, 0, 0, 0
+		if persisted {
+			p.saveLocked()
+		}
 	}
 }
 
