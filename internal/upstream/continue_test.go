@@ -245,3 +245,38 @@ func lastUsageLine(t *testing.T, s string) map[string]any {
 	t.Fatalf("输出里没有 token_usage 帧:\n%s", s)
 	return nil
 }
+
+// cutReader 先吐一段数据、再报一个非 EOF 的读错误（模拟上游中途断连）。
+type cutReader struct {
+	data string
+	sent bool
+	err  error
+}
+
+func (c *cutReader) Read(p []byte) (int, error) {
+	if !c.sent {
+		c.sent = true
+		return copy(p, c.data), nil
+	}
+	return 0, c.err
+}
+
+func (c *cutReader) Close() error { return nil }
+
+// 上游中途断连必须把读错误交给上层：吞掉就会被当成「正常收尾」——补一个 [DONE]、
+// token_usage 已到就按成功记账，客户端拿到一条看似完整实则截断的回复。
+func TestContinueReaderSurfacesTransportError(t *testing.T) {
+	c, _ := fakeCutUpstream(t, func(int) (int, string) { return 200, "" })
+	// 带 max_tokens → 显式限额不续写，测试不会去打假上游。
+	body := `{"model":"glm-5.2","max_tokens":100,"messages":[]}`
+	seg := "event:output\ndata:{\"response\":\"半句话\"}\n\n"
+	r := newTestContinueReader(t, c, body, &cutReader{data: seg, err: io.ErrUnexpectedEOF})
+
+	out, err := io.ReadAll(r)
+	if err == nil || err == io.EOF {
+		t.Fatalf("中途断连应把读错误抛给上层，实际 err=%v", err)
+	}
+	if !strings.Contains(string(out), "半句话") {
+		t.Errorf("已写出的字节要先交完再报错，实际 %q", out)
+	}
+}

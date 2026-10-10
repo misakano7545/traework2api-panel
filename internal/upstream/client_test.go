@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,4 +478,40 @@ func TestWorkChannelIdentityFrozen(t *testing.T) {
 	if hdr.Get("X-Ide-Version") != "9.9.9" || hdr.Get("User-Agent") != "TraeClient/TTNet" {
 		t.Errorf("该生效的覆盖没生效: ver=%q ua=%q", hdr.Get("X-Ide-Version"), hdr.Get("User-Agent"))
 	}
+}
+
+// SetTimeouts（面板热改配置）与在途请求并发：早期无锁直接改 http.Client /
+// Transport 字段，请求正在 Do 就是数据竞争 —— -race 会报警。
+func TestSetTimeoutsConcurrentWithChatStream(t *testing.T) {
+	c := testClient(rtFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(soloNormalSeg)),
+		}, nil
+	}))
+	c.SetTimeouts(time.Minute, time.Minute, time.Second)
+	a := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			c.SetTimeouts(time.Minute, time.Duration(30+i%60)*time.Second, time.Second)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			rc, _, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+			if err != nil {
+				t.Errorf("ChatStream: %v", err)
+				return
+			}
+			_, _ = io.Copy(io.Discard, rc)
+			_ = rc.Close()
+		}
+	}()
+	wg.Wait()
 }

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"traework2api/internal/auth"
@@ -203,6 +204,13 @@ type Client struct {
 	// idleTimeout 聊天 SSE 流内空闲上限（0 = 不看门狗）。由 SetTimeouts 更新。
 	idleTimeout time.Duration
 
+	// timeoutMu 保护上面三个超时（HTTP.Timeout / Transport.ResponseHeaderTimeout /
+	// idleTimeout）。面板热改配置会调 SetTimeouts，并发请求正在 Do —— 直接改
+	// http.Client 结构体字段就是数据竞争。请求路径持**读锁跨过 Do**：Do 返回即释放，
+	// body 读取不碰这些字段（ResponseHeaderTimeout 只在等响应头时被读）。
+	// ponytail: 写锁要等一个在途 Do 落地；保存配置是人工低频动作，够用。
+	timeoutMu sync.RWMutex
+
 	AgentHost string // https://trae-api-cn.mchost.guru
 	// AgentHostIntl 国际版（realm=intl）的 agent host；空则用内置默认。
 	AgentHostIntl string // https://a0ai-api-sg.byteintlapi.com
@@ -256,7 +264,9 @@ func identFor(a *auth.Auth) (version, versionCode string) {
 
 // doJSON 发请求并解 JSON；HTTP 非 2xx 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
+	c.timeoutMu.RLock()
 	resp, err := c.HTTP.Do(req)
+	c.timeoutMu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -366,11 +376,15 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	}
 	SOLOHeaders(req, a, true)
 	// 用专用流客户端（无总超时），避免长 SSE 流被 HTTP.Timeout 截断。
+	// 读锁跨过 Do：SetTimeouts（面板热改）写的就是这两个 client 里的超时字段。
+	c.timeoutMu.RLock()
 	hc := c.HTTP
 	if c.StreamHTTP != nil {
 		hc = c.StreamHTTP
 	}
+	idle := c.idleTimeout
 	resp, err := hc.Do(req)
+	c.timeoutMu.RUnlock()
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
@@ -383,8 +397,8 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	if c.idleTimeout > 0 {
-		return &idleTimeoutReader{rc: resp.Body, idle: c.idleTimeout}, resp.StatusCode, nil, nil
+	if idle > 0 {
+		return &idleTimeoutReader{rc: resp.Body, idle: idle}, resp.StatusCode, nil, nil
 	}
 	return resp.Body, resp.StatusCode, nil, nil
 }
@@ -1114,11 +1128,13 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 
 // SetTimeouts 更新超时三元组：短 RPC 总时长 / 聊天首字节 / 聊天流内空闲。
 // 流式整流仍不设总超时（长推理不该被截断），"上游既不吐数据也不断连"交给空闲看门狗。
-// ponytail: 与在途 Do 并发写；管理页保存很稀，-race 报警再加锁。
+// 持写锁：请求路径持读锁跨过 Do，两边互斥后才不会改到正在用的 http.Client。
 func (c *Client) SetTimeouts(short, header, idle time.Duration) {
 	if c == nil || c.HTTP == nil {
 		return
 	}
+	c.timeoutMu.Lock()
+	defer c.timeoutMu.Unlock()
 	if short > 0 {
 		c.HTTP.Timeout = short
 	}

@@ -64,6 +64,10 @@ type ContinueReader struct {
 	toolSeen bool
 	errSeen  bool
 	done     bool
+	// readErr 上游读取错误（非 EOF）。吞掉它，中途断连就会被当成「正常收尾」——
+	// 补一个 [DONE]、token_usage 已有就记成功，客户端拿到一条看似完整实则截断的回复。
+	// 这正是本文件要防的事（截断不可见，见文件头注释）。Read 把已写出的字节交完后再返回它。
+	readErr error
 }
 
 // NewContinueReader 包装一段 SOLO 上游 body：截断自动续写（同账号同模型）。
@@ -96,6 +100,11 @@ func (r *ContinueReader) Read(p []byte) (int, error) {
 		n := copy(p, r.out)
 		r.out = r.out[n:]
 		return n, nil
+	}
+	// 已写出的字节先交完，错误最后再抛：上游中途断连必须让上层看见（否则会补 [DONE]
+	// 并按成功记账），而不是伪装成 io.EOF 的正常结束。
+	if r.readErr != nil {
+		return 0, r.readErr
 	}
 	return 0, io.EOF
 }
@@ -131,6 +140,10 @@ func (r *ContinueReader) step() {
 	}
 	if err != nil {
 		// EOF 或读错误：收尾当前事件；未见的 done 走 canContinue 抉择。
+		// 读错误要记住（EOF 不算）：正常收尾由 handleDone 清掉，没清掉就说明这段流是断的。
+		if err != io.EOF {
+			r.readErr = err
+		}
 		if len(r.pend) > 0 {
 			r.flushEvent()
 		}
@@ -213,6 +226,8 @@ func (r *ContinueReader) handleDone(pend []string) {
 	}
 	r.emitBlock(pend)
 	r.done = true
+	// 上游正常收尾：即便之前某段是断的（续写救回来了），整体也是完整的，不算错误。
+	r.readErr = nil
 }
 
 // endSegment 无 done 的 EOF 收尾：能续就换段，否则直接结束（solosse 兜底补 [DONE]）。
