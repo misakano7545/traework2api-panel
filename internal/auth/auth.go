@@ -5,6 +5,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,13 +69,38 @@ const (
 	RealmIntl = "intl"
 )
 
+// knownHostDomains 国际版已知域。判据必须按**域名边界**匹配：用 strings.Contains 时
+// `https://trae.ai.attacker.com` 也过关，而这个 host 会被写进 a.ApiHost 当换票/取用户
+// 信息的基址——真实 token 就发到那台机器上了（面板密钥泄露即全号外泄）。
+var knownHostDomains = []string{"trae.ai", "byteintlapi.com"}
+
+// IsKnownHostDomain 判断 s（URL 或裸 host，可带端口）是否落在国际版已知域里。
+func IsKnownHostDomain(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if !strings.Contains(s, "://") {
+		s = "https://" + s // 回调里的 host 参数可能不带 scheme
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	for _, d := range knownHostDomains {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
 // Realm 从凭证自带的 Domain/ApiHost 判地区。老 auth 文件没有这两个字段（或写成
 // trae.cn 口径）一律按国内版；国际版是登录回调里的 host 参数写进来的。
 func (a *Auth) Realm() string {
-	for _, s := range []string{a.Domain, a.ApiHost} {
-		if strings.Contains(s, "trae.ai") || strings.Contains(s, "byteintlapi") {
-			return RealmIntl
-		}
+	if IsKnownHostDomain(a.Domain) || IsKnownHostDomain(a.ApiHost) {
+		return RealmIntl
 	}
 	return RealmCN
 }

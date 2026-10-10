@@ -627,3 +627,67 @@ func TestApplyAPIKeyHotSwap(t *testing.T) {
 		t.Fatalf("新密钥应通过: %d", code)
 	}
 }
+
+// 隧道/反代会把 RemoteAddr 变成 127.0.0.1 并补转发头：那时「空 key = 仅本机」会对公众全放行。
+func TestIsLoopbackIgnoresForwardedHeader(t *testing.T) {
+	req := httptest.NewRequest("GET", "/panel/api/overview", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	if !isLoopback(req) {
+		t.Fatal("本机请求应判为 loopback")
+	}
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	if isLoopback(req) {
+		t.Fatal("带转发头的请求不算本机")
+	}
+	p := New(Config{Pool: pool.New(""), AuthDir: t.TempDir(), Logs: NewRing(20)})
+	r2 := httptest.NewRequest("GET", "/panel/api/overview", nil)
+	r2.RemoteAddr = "127.0.0.1:1234"
+	r2.Header.Set("X-Forwarded-For", "203.0.113.7")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, r2)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("空 key + 反代应 401，实得 %d", rec.Code)
+	}
+}
+
+// 回调里的 uid 未经上游确认时不许覆盖已有账号：uid 在 /panel/api/overview 里直接列着，
+// 不设这道闸就能拿自己的 refreshToken 顶掉任意账号的 auths 文件与池内凭证。
+func TestLoginRefusesUnverifiedUIDOverwrite(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/ExchangeToken") {
+			w.Write([]byte(`{"Result":{"Token":"attacker-at","RefreshToken":"attacker-rt","TokenExpireAt":1786805537}}`))
+			return
+		}
+		http.NotFound(w, r) // GetUserInfo 失败 → uid 只能来自回调
+	}))
+	defer srv.Close()
+	up := upstream.New()
+	up.HTTP = srv.Client()
+	up.OAuthHost = srv.URL
+
+	dir := t.TempDir()
+	pl := pool.New("")
+	victimFile := filepath.Join(dir, "trae-victim.json")
+	if err := (&auth.Auth{UID: "victim", AccessToken: "old-at", RefreshToken: "old-rt", FilePath: victimFile}).SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	pl.Add(&auth.Auth{UID: "victim", AccessToken: "old-at", FilePath: victimFile})
+	p := New(Config{Pool: pl, Upstream: up, AuthDir: dir, APIKey: "k", Logs: NewRing(20)})
+	p.loginMu.Lock()
+	p.logins["sid"] = loginSession{Machine: "m", Device: "d", At: time.Now()}
+	p.loginMu.Unlock()
+
+	if _, _, code, err := p.completeLogin("sid", callbackCreds{Refresh: "attacker-rt", UID: "victim"}); err == nil || code != http.StatusBadRequest {
+		t.Fatalf("未确认的 uid 不该覆盖已有账号：code=%d err=%v", code, err)
+	}
+	raw, rerr := os.ReadFile(victimFile)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !bytes.Contains(raw, []byte("old-at")) || bytes.Contains(raw, []byte("attacker-at")) {
+		t.Fatalf("victim 的 auths 文件被改写: %s", raw)
+	}
+	if a := pl.AuthByUID("victim"); a == nil || a.AccessToken != "old-at" {
+		t.Fatal("池内凭证被替换")
+	}
+}

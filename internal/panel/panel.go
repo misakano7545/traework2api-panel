@@ -135,7 +135,12 @@ func (p *Panel) ApplyAPIKey(k string) {
 	p.keyMu.Unlock()
 }
 
+// isLoopback 请求是否来自本机。见过转发头就直接判否：隧道/反代（Cloudflare、nps、frp）
+// 会把 RemoteAddr 变成 127.0.0.1 并补上转发头，那时「空 key = 仅本机」等于对公众全放行。
 func isLoopback(r *http.Request) bool {
+	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-Ip") != "" || r.Header.Get("Forwarded") != "" {
+		return false
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr

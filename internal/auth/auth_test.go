@@ -18,6 +18,43 @@ const existingFormat = `{
   }
 }`
 
+// 域判据必须按域名边界匹配：Contains 会让 trae.ai.attacker.com 也过，
+// 而那个值会被当 ApiHost 当基址，token 就发出去了。
+func TestIsKnownHostDomainAndRealm(t *testing.T) {
+	yes := []string{
+		"https://api-sg-central.trae.ai", "api-sg-central.trae.ai", "trae.ai",
+		"https://trae.ai:443", "https://a0ai-api-sg.byteintlapi.com",
+	}
+	no := []string{
+		"", "https://trae.ai.attacker.com", "https://byteintlapi.com.evil.io",
+		"https://evil.io/?x=trae.ai", "http://127.0.0.1:7864", "https://api.trae.cn",
+	}
+	for _, s := range yes {
+		if !IsKnownHostDomain(s) {
+			t.Errorf("IsKnownHostDomain(%q) = false，期望 true", s)
+		}
+	}
+	for _, s := range no {
+		if IsKnownHostDomain(s) {
+			t.Errorf("IsKnownHostDomain(%q) = true，期望 false", s)
+		}
+	}
+	realm := []struct {
+		a    *Auth
+		want string
+	}{
+		{&Auth{Domain: "trae.ai"}, RealmIntl},
+		{&Auth{ApiHost: "https://api-sg-central.trae.ai:443"}, RealmIntl},
+		{&Auth{Domain: "trae.ai.attacker.com"}, RealmCN},
+		{&Auth{Domain: "trae.cn", ApiHost: "https://api.trae.com.cn"}, RealmCN},
+	}
+	for _, c := range realm {
+		if got := c.a.Realm(); got != c.want {
+			t.Errorf("Realm(%+v) = %q，期望 %q", c.a, got, c.want)
+		}
+	}
+}
+
 func TestParseExistingFormat(t *testing.T) {
 	a, err := Parse([]byte(existingFormat))
 	if err != nil {

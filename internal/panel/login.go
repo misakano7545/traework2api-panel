@@ -70,9 +70,10 @@ type callbackCreds struct {
 
 // intlHost 回调里的 host 参数是不是国际 OAuth host；是就返回 (domain, apiHost)，
 // 不是（国内回调 / 老回调 / 测试里的假上游）返回空串，由调用方决定回落。
-// ponytail: 判据与 auth.Realm() 同一套（trae.ai / byteintlapi 家族）。
+// 判据与 auth.Realm() 同一套（trae.ai / byteintlapi.com 家族），按域名边界匹配：
+// 这个值会直接当换票/取用户信息的基址，子串匹配等于把 token 交给 trae.ai.attacker.com。
 func intlHost(host string) (string, string) {
-	if strings.Contains(host, "trae.ai") || strings.Contains(host, "byteintlapi") {
+	if auth.IsKnownHostDomain(host) {
 		return "trae.ai", host
 	}
 	return "", ""
@@ -233,8 +234,9 @@ func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, co
 		return "", "", http.StatusBadRequest, errors.New("回调里没有 refreshToken")
 	}
 	uid, nick, ent, infoErr := p.cfg.Upstream.GetUserInfo(a)
-	if infoErr != nil || uid == "" {
-		uid = cb.UID
+	verified := infoErr == nil && uid != "" // uid 由上游给出才算可信
+	if !verified {
+		uid = cb.UID // 兜底：回调里的 uid（面板请求方可控）
 	}
 	if nick == "" {
 		nick = cb.Nickname
@@ -245,6 +247,12 @@ func (p *Panel) completeLogin(id string, cb callbackCreds) (uid, nick string, co
 	if !validUID(uid) {
 		log.Printf("panel: login rejected uid")
 		return "", "", http.StatusBadRequest, errors.New("上游没返回可用的 UserID")
+	}
+	// 未经上游确认的 uid 不许覆盖已有账号：uid 在 /panel/api/overview 里直接列着，不设这道闸
+	// 就能拿自己的 refreshToken 顶掉任意账号的 auths 文件与池内凭证（原凭证不可找回）。
+	if !verified && p.cfg.Pool != nil && p.cfg.Pool.AuthByUID(uid) != nil {
+		log.Printf("panel: login rejected unverified uid overwrite")
+		return "", "", http.StatusBadRequest, errors.New("上游未确认该账号，不能覆盖已有账号")
 	}
 	path, err := authPath(p.cfg.AuthDir, uid)
 	if err != nil {
