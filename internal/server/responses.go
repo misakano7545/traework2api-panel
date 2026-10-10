@@ -7,6 +7,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -16,7 +17,11 @@ import (
 )
 
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readCappedBody(r)
+	if errors.Is(err, errBodyTooLarge) {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
+		return
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
@@ -906,7 +911,14 @@ func (w *responsesWriter) finish() {
 		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
 			if w.x.created && !w.x.completed && !w.x.failed {
 				_ = w.closeOpenItems()
-				_ = w.emitCompleted()
+				// 内层一条 [DONE]/finish_reason 都没见着 = 上游中途断（continue.go 已把读错误
+				// 上抛，这条流到此为止）。补 response.completed 等于把截断的回复伪装成完整
+				// 答复，与文件头「截断如实报」相反；如实报 failed，客户端才不会拿着半个答案走。
+				if w.x.sawFinish || w.x.sawDone {
+					_ = w.emitCompleted()
+				} else {
+					_ = w.emitFailed(map[string]any{"type": "stream_interrupted", "message": "upstream stream interrupted"})
+				}
 			}
 			return
 		}

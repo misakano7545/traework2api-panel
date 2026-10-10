@@ -9,6 +9,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -31,7 +32,11 @@ func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readCappedBody(r)
+	if errors.Is(err, errBodyTooLarge) {
+		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds 8MB limit")
+		return
+	}
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
 		return
@@ -682,14 +687,17 @@ type messagesWriter struct {
 
 type anthState struct {
 	started, failed, done bool
-	id, model, stop       string
-	thinkOpen             bool
-	thinkIdx              int
-	textOpen              bool
-	textIdx, next         int
-	tools                 map[int]*anthTool
-	toolOrder             []int
-	usage                 map[string]any
+	// sawDone 见过内层的 [DONE]（上游正常收尾）：finish 只有在它之后才允许补
+	// message_stop，否则等于把中途断掉的回复伪装成完整答复（见 continue.go）。
+	sawDone         bool
+	id, model, stop string
+	thinkOpen       bool
+	thinkIdx        int
+	textOpen        bool
+	textIdx, next   int
+	tools           map[int]*anthTool
+	toolOrder       []int
+	usage           map[string]any
 }
 
 type anthTool struct {
@@ -733,7 +741,13 @@ func (w *messagesWriter) finish() {
 	if w.stream {
 		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
 			if w.x.started && !w.x.done && !w.x.failed {
-				_ = w.closeAndStop()
+				if w.x.sawDone {
+					_ = w.closeAndStop()
+				} else {
+					// 内层没写 [DONE] = 上游中途断（continue.go 已把读错误上抛）。补
+					// message_stop 会让 Claude 客户端拿着半个答复当完整结果。
+					_ = w.emitError("upstream stream interrupted", "api_error")
+				}
 			}
 			return
 		}
@@ -801,6 +815,7 @@ func (w *messagesWriter) handleFrame(frame string) error {
 		return nil
 	}
 	if strings.HasPrefix(frame, "data: [DONE]") {
+		w.x.sawDone = true // 内层正常收尾的标志，finish 据此决定能不能补 message_stop
 		return w.closeAndStop()
 	}
 	payload, ok := strings.CutPrefix(frame, "data: ")

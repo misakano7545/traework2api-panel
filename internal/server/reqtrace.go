@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -201,7 +202,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.Begin()
 	tw := &traceWriter{ResponseWriter: w}
-	h.mux.ServeHTTP(tw, r.WithContext(context.WithValue(r.Context(), reqTraceKey{}, tr)))
+	// panic 兜在**内层**：net/http 只会断掉这条连接，而下面的 rec.Record 就跑不到了——
+	// 面板的请求记录里这次请求会整条消失。恢复后把状态定格成 500，记录照常落。
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Printf("PANIC: %s %s: %v\n%s", r.Method, r.URL.Path, p, debug.Stack())
+				if tw.status == 0 {
+					writeOpenAIError(tw, http.StatusInternalServerError, "internal_error", "internal error")
+				}
+				tw.status = http.StatusInternalServerError
+			}
+		}()
+		h.mux.ServeHTTP(tw, r.WithContext(context.WithValue(r.Context(), reqTraceKey{}, tr)))
+	}()
 	status := tw.status
 	if status == 0 {
 		status = 200 // 处理器什么都没写也已在 WriteHeader 前定格；此处兜底

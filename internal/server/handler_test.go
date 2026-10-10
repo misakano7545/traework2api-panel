@@ -11,6 +11,7 @@ import (
 
 	"traework2api/internal/auth"
 	"traework2api/internal/pool"
+	"traework2api/internal/reqlog"
 	"traework2api/internal/session"
 	"traework2api/internal/upstream"
 	"traework2api/internal/usage"
@@ -422,16 +423,62 @@ func TestAPIKeyAuth(t *testing.T) {
 func TestRequestBodyTooLarge(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	big := strings.Repeat("a", maxBodyBytes+1)
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(big))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("code=%d body=%s", rec.Code, rec.Body)
+	// 三套入站协议同一口限：早期只有 chat 有检查，/v1/responses 与 /v1/messages
+	// 是裸 io.ReadAll —— 原始超大体先整个进内存，持 key 即可打爆进程。
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", path, strings.NewReader(big)))
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("%s code=%d body=%s", path, rec.Code, rec.Body)
+		}
+		var e map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &e)
+		if e["error"] == nil {
+			t.Errorf("%s 缺 error 信封: %s", path, rec.Body)
+		}
 	}
-	var e map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &e)
-	if e["error"] == nil {
-		t.Errorf("want error envelope: %s", rec.Body)
+}
+
+// 用量台账按**解析后的**上游模型名分桶：客户端按 /v1/models 的形态发 cn:glm-5.2 时，
+// 早期会照原样入桶，面板「模型」视图把同一个模型拆成 cn:glm-5.2 / glm-5.2 两行。
+func TestUsageLedgerKeysOnResolvedModel(t *testing.T) {
+	rec := usage.New("")
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, soloSSE, true })
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Usage:    rec,
+	})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:glm-5.2","stream":true,"messages":[]}`)))
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
+	}
+	snap := rec.Snapshot(72, nil)
+	if len(snap.ByModel) != 1 {
+		t.Fatalf("模型行数=%d（应合成一行）: %+v", len(snap.ByModel), snap.ByModel)
+	}
+	if got := snap.ByModel[0].Key; got != "glm-5.2" {
+		t.Errorf("台账模型键=%q，期望解析后的上游名 glm-5.2", got)
+	}
+}
+
+// handler panic 不能只在面板记录里留个洞：net/http 会断连接，但请求记录（含失败计数）
+// 必须照常落下，状态定格 500。
+func TestPanicRecordedAs500(t *testing.T) {
+	rl := reqlog.New(reqlog.Config{})
+	h := &Handler{cfg: Config{RequestLog: rl}, mux: http.NewServeMux()}
+	h.mux.HandleFunc("POST /v1/chat/completions", func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{}`)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("panic 应回 500，实际 %d", rec.Code)
+	}
+	if s := rl.Snapshot(); s.Completed != 1 || s.Failed != 1 {
+		t.Errorf("panic 请求没记进去: %+v", s)
 	}
 }
 

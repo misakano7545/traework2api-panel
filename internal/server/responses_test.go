@@ -1009,3 +1009,16 @@ func TestResponsesToolOutputImageMoved(t *testing.T) {
 		}
 	})
 }
+
+// 上游中途断（内层一条 [DONE] 都没写）：finish 不许补 response.completed —— 那等于把
+// 截断的回复伪装成完整答复，与文件头「截断如实报」相反。必须如实报 response.failed。
+func TestResponsesInterruptedStreamEmitsFailed(t *testing.T) {
+	body := driveStream(t, &responsesMeta{},
+		`data: {"id":"chatcmpl-1","model":"glm-5.2","choices":[{"index":0,"delta":{"content":"半句话"}}]}`+"\n\n")
+	if !strings.Contains(body, "response.failed") {
+		t.Errorf("中断的流应报 response.failed:\n%s", body)
+	}
+	if strings.Contains(body, "response.completed") {
+		t.Errorf("中断的流不许补 response.completed:\n%s", body)
+	}
+}

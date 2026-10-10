@@ -528,3 +528,23 @@ func TestMessagesToolResultImageMoved(t *testing.T) {
 		}
 	})
 }
+
+// 同 responses 侧：内层没写 [DONE] 说明上游中途断，finish 不许补 message_stop，
+// 否则 Claude 客户端会把半个答复当完整结果。如实发 error 事件。
+func TestMessagesInterruptedStreamEmitsError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &messagesWriter{ResponseWriter: rec, stream: true}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	if _, err := rw.Write([]byte(`data: {"id":"chatcmpl-1","model":"glm-5.2","choices":[{"index":0,"delta":{"content":"半句话"}}]}` + "\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	rw.finish()
+	body := rec.Body.String()
+	types := sseTypes(body)
+	if !containsStr(types, "error") {
+		t.Errorf("中断的流应发 error 事件: %v\n%s", types, body)
+	}
+	if containsStr(types, "message_stop") {
+		t.Errorf("中断的流不许补 message_stop: %v\n%s", types, body)
+	}
+}

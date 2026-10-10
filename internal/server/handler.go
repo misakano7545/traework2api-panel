@@ -45,6 +45,23 @@ type Config struct {
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
 const maxBodyBytes = 8 << 20
 
+// errBodyTooLarge 请求体超过 maxBodyBytes。
+var errBodyTooLarge = errors.New("request body too large")
+
+// readCappedBody 读请求体并限长：三套入站协议共用同一口限（超限返回 errBodyTooLarge）。
+// 用 LimitReader 在**读取前**就截断——早期 /v1/responses、/v1/messages 直接 io.ReadAll，
+// 原始超大体先整个进内存才轮到检查，是持 key 即可触发的内存 DoS。
+func readCappedBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxBodyBytes {
+		return nil, errBodyTooLarge
+	}
+	return body, nil
+}
+
 // Handler 主路由。
 type Handler struct {
 	cfg  Config
@@ -518,13 +535,13 @@ type chatRequest struct {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	body, err := readCappedBody(r)
+	if errors.Is(err, errBodyTooLarge) {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
 		return
 	}
-	if len(body) > maxBodyBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
 	var peek chatRequest
@@ -558,6 +575,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			realm = r
 		}
 	}
+
+	// 台账用**解析后的**上游模型名（config_name）：客户端可能发 cn:glm-5.2 或别名，
+	// 按入站原样分桶会把同一个模型在面板上拆成多行，别名还查不到单价（积分显示 —）。
+	// 请求记录（tr.Model）仍记 bareModel —— 那是「客户端要了什么」，两边口径不同是故意的。
+	peek.Model = configName
 
 	body = setModelInBody(body, configName, h.modelPickOnly(configName))
 	body = h.applyPrompt(body)
