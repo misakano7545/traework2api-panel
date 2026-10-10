@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -78,7 +79,9 @@ func main() {
 				failN++
 				continue
 			}
-			_ = a.SaveAtomic()
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("refresh 落盘失败 %s: %v", f, err)
+			}
 		}
 
 		// 签到

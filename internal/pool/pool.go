@@ -18,6 +18,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -993,7 +994,10 @@ func (p *Pool) saveLocked() {
 	}
 	tmp := p.stateFp + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("[pool] 状态落盘失败（冷却/禁用标记可能在重启后丢失）: %v", err)
 		return
 	}
-	_ = os.Rename(tmp, p.stateFp)
+	if err := os.Rename(tmp, p.stateFp); err != nil {
+		log.Printf("[pool] 状态替换失败（同上）: %v", err)
+	}
 }

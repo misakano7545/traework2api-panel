@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -675,7 +676,11 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 		return false, err
 	}
 	if refreshed {
-		_ = acct.SaveAtomic()
+		if err := acct.SaveAtomic(); err != nil {
+			// refreshToken 每次换票都**轮换**：新值只有落盘成功才算真到手。写失败就只留在
+			// 内存里，重启后拿旧 token 去换 → 上游判失效 → 账号被自动禁用，日志里查不到原因。
+			log.Printf("token 落盘失败 uid=%s（重启后需重新登录该账号）: %v", acct.UID, err)
+		}
 		// 刷新成功 = 号还活着，清连续失效计数（没有真刷新就不清，否则每请求清零，
 		// 连续计数永远到不了禁用阈值）。
 		h.cfg.Pool.ClearSessionDead(acct.UID)
