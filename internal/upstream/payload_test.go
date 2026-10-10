@@ -61,6 +61,27 @@ func TestPrepareBodyKeepsExplicitFunction(t *testing.T) {
 	}
 }
 
+// 无 name 的 tool_call（两种形态都没有）要剔除：上游 FunctionCall.Name 必填，留着会让
+// 整条请求按参数非法被拒——一条畸形 tool_call 拖垮整轮对话。
+func TestPrepareBodyDropsNameLessToolCall(t *testing.T) {
+	src := []byte(`{"model":"glm-5.2","messages":[{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","index":0},{"id":"call_2","type":"function","function":{"name":"ok","arguments":"{}"}}]}]}`)
+	var obj map[string]any
+	if err := json.Unmarshal(PrepareBody(src), &obj); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages=%v", obj["messages"])
+	}
+	tcs, ok := msgs[0].(map[string]any)["tool_calls"].([]any)
+	if !ok || len(tcs) != 1 {
+		t.Fatalf("畸形 tool_call 没被剔除: %v", msgs[0])
+	}
+	if fc, _ := tcs[0].(map[string]any)["function_call"].(map[string]any); fc["name"] != "ok" {
+		t.Fatalf("留下的应是带 name 的那条: %v", tcs[0])
+	}
+}
+
 // 槽位旁路表：只登记实测能出正文的组合（改表前先真发一遍）。
 func TestIntlSlotRoutes(t *testing.T) {
 	for model, want := range map[string]SlotRoute{

@@ -57,12 +57,15 @@ func PrepareBody(src []byte) []byte {
 							tc["function_call"] = fn
 							delete(tc, "function")
 						}
-						// 上游要求 FunctionCall.Name 必填: 无 name 的 tool_call 剔除
-						if fc, ok := tc["function_call"].(map[string]any); ok {
-							name, _ := fc["name"].(string)
-							if strings.TrimSpace(name) == "" {
-								continue
-							}
+						// 上游要求 FunctionCall.Name 必填：无 name 的 tool_call 剔除。两种形态都没有
+						// （畸形客户端把 name/arguments 摊在顶层）同样剔——留着只会让整条请求被上游
+						// 按参数非法拒掉，一条畸形 tool_call 拖垮整轮对话。
+						fc, ok := tc["function_call"].(map[string]any)
+						if !ok {
+							continue
+						}
+						if name, _ := fc["name"].(string); strings.TrimSpace(name) == "" {
+							continue
 						}
 						kept = append(kept, tc)
 					}
