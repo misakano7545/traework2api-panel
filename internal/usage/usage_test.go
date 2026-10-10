@@ -86,6 +86,28 @@ func TestRollupIdempotent(t *testing.T) {
 	}
 }
 
+// 折叠进**已存在的**日桶时要连缓存命中量一起累加：漏加会让命中率偏低，且计费公式里
+// (PT-CH) 变大 → 积分被多算，全程静默（新建日桶的分支是整块拷贝，丢不了）。
+func TestRollupMergeKeepsCacheHit(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	y, mo, d := now.Add(-200 * 24 * time.Hour).Date()
+	h1 := time.Date(y, mo, d, 9, 0, 0, 0, time.Local)
+	h2 := time.Date(y, mo, d, 10, 0, 0, 0, time.Local) // 同一天 → 第二个小时桶走合并分支
+	dd := delta(4, 4, 8, 0)
+	dd.CacheHitTokens, dd.HasCacheHit = 3, true
+	r.Add(h1, "u1", "m", dd, true)
+	r.Add(h2, "u1", "m", dd, true)
+	r.Rollup(now)
+	got := r.Snapshot(0, nil).Totals
+	if got.CacheHitTokens != 6 || got.CacheSamples != 2 {
+		t.Fatalf("折叠后缓存命中 = %d/%d，期望 6/2", got.CacheHitTokens, got.CacheSamples)
+	}
+	if got.TotalTokens != 16 {
+		t.Fatalf("折叠后总量 = %d，期望 16", got.TotalTokens)
+	}
+}
+
 // 落盘 → 重启读回：用量不能因重启丢失。
 func TestSaveAndReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")

@@ -249,6 +249,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.PT += src.PT
 			dst.CT += src.CT
 			dst.TT += src.TT
+			dst.CH += src.CH
+			dst.CHN += src.CHN
 			dst.LatMs += src.LatMs
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
