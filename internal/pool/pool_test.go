@@ -2,6 +2,7 @@ package pool
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,5 +372,33 @@ func TestCreditsTotalPersists(t *testing.T) {
 	p2.SetCredits("u1", 4000) // 只改剩余
 	if st, _ := p2.Status("u1"); st.Credits != 4000 || st.CreditsTotal != 4941 {
 		t.Fatalf("SetCredits 后 %d/%d，分母不该变", st.Credits, st.CreditsTotal)
+	}
+}
+
+// CooldownPlan 读 p.lim.PlanCooldown 必须在锁内：早期写成 p.Cooldown(uid, CoolPlan,
+// p.lim.PlanCooldown, …) 时实参在进锁前求值，与 ApplyLimits 的整结构体写入（面板热改
+// 配置）并发就是数据竞争 —— -race 会直接报警（这条用例就是给它准备的）。
+func TestCooldownPlanConcurrentWithApplyLimits(t *testing.T) {
+	p := New(filepath.Join(t.TempDir(), "state.json"))
+	p.Add(&auth.Auth{UID: "u1"})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			p.ApplyLimits(Limits{MaxInFlight: 1 + i%3, PlanCooldown: time.Duration(i+1) * time.Minute})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			p.CooldownPlan("u1")
+		}
+	}()
+	wg.Wait()
+
+	if st, ok := p.Status("u1"); !ok || st.Reason != "plan 权益不足" {
+		t.Fatalf("硬冷却没落上: %+v ok=%v", st, ok)
 	}
 }

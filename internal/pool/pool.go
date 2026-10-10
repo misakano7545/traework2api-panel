@@ -581,6 +581,11 @@ func (p *Pool) SetCreditsExpire(uid string, credits, total, expire int64) {
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.cooldownLocked(uid, d, reason)
+}
+
+// cooldownLocked 调用方须持 p.mu（时长可能取自 p.lim，必须在锁内求值）。
+func (p *Pool) cooldownLocked(uid string, d time.Duration, reason string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.until = time.Now().Add(d)
 		e.reason = reason
@@ -819,8 +824,13 @@ func (p *Pool) CooldownSoft(uid, reason string) {
 }
 
 // CooldownPlan 1005 权益不足的硬冷却（plan_credit，固定时长不叠加）。
+//
+// 时长在**锁内**取：原写法 p.Cooldown(uid, CoolPlan, p.lim.PlanCooldown, …) 的实参在进锁前
+// 求值，与 ApplyLimits 的整结构体写入（面板热改配置）构成数据竞争（-race 实测报警）。
 func (p *Pool) CooldownPlan(uid string) {
-	p.Cooldown(uid, CoolPlan, p.lim.PlanCooldown, "plan 权益不足")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cooldownLocked(uid, p.lim.PlanCooldown, "plan 权益不足")
 }
 
 // NoteSuccess 成功请求重置连败计数与退避档位（成功即认为账号恢复正常）。
