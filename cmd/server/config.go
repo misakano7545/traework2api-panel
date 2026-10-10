@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -221,9 +222,14 @@ func WriteDefault(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
-	defer f.Close()
 	if _, err := f.Write(out); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path) // 半截 JSON 会让紧接着的 Load 直接 Fatalf，宁可当没生成过
 		return "", fmt.Errorf("write config: %w", err)
+	}
+	if err := f.Close(); err != nil { // 不查 Close：缓冲没落盘也当写成功
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close config: %w", err)
 	}
 	return key, nil
 }
@@ -251,29 +257,19 @@ func applyEnv(c *Config) {
 		c.Cooldown.SoftRateMax = v
 	}
 	if v := os.Getenv("TW2A_CHECKIN_HOURS"); v != "" {
-		if hours, err := parseHours(v); err == nil {
-			c.Schedule.CheckinHours = hours
-		}
+		envHours("TW2A_CHECKIN_HOURS", v, &c.Schedule.CheckinHours)
 	}
 	if v := os.Getenv("TW2A_KEEPALIVE_HOURS"); v != "" {
-		if hours, err := parseHours(v); err == nil {
-			c.Schedule.KeepaliveHours = hours
-		}
+		envHours("TW2A_KEEPALIVE_HOURS", v, &c.Schedule.KeepaliveHours)
 	}
 	if v := os.Getenv("TW2A_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.TimeoutSeconds = n
-		}
+		envInt("TW2A_TIMEOUT_SECONDS", v, &c.Upstream.TimeoutSeconds)
 	}
 	if v := os.Getenv("TW2A_HEADER_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.HeaderTimeoutSeconds = n
-		}
+		envInt("TW2A_HEADER_TIMEOUT_SECONDS", v, &c.Upstream.HeaderTimeoutSeconds)
 	}
 	if v := os.Getenv("TW2A_IDLE_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.IdleTimeoutSeconds = n
-		}
+		envInt("TW2A_IDLE_TIMEOUT_SECONDS", v, &c.Upstream.IdleTimeoutSeconds)
 	}
 	if v := os.Getenv("TW2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
@@ -282,9 +278,7 @@ func applyEnv(c *Config) {
 		c.Upstream.ClientVersion = v
 	}
 	if v := os.Getenv("TW2A_MAX_IN_FLIGHT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Pool.MaxInFlight = n
-		}
+		envInt("TW2A_MAX_IN_FLIGHT", v, &c.Pool.MaxInFlight)
 	}
 	if v := os.Getenv("TW2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
@@ -298,6 +292,26 @@ func applyEnv(c *Config) {
 }
 
 // parseHours 解析 env 里的时点列表（"9,21" / "9 21" / "[9 21]" 都收）。
+// envInt / envHours 环境变量覆盖的解析：合法才生效，非法记一行——静默回落默认值会让运维
+// 以为覆盖生效了（配置文件那边策略是 fail fast，env 这里至少要说一句）。
+func envInt(name, v string, dst *int) {
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("[config] %s=%q 不是整数，已忽略（用默认值 %d）", name, v, *dst)
+		return
+	}
+	*dst = n
+}
+
+func envHours(name, v string, dst *[]int) {
+	hours, err := parseHours(v)
+	if err != nil {
+		log.Printf("[config] %s=%q 不是合法时点列表，已忽略（用默认值 %v）", name, v, *dst)
+		return
+	}
+	*dst = hours
+}
+
 func parseHours(v string) ([]int, error) {
 	fields := strings.FieldsFunc(v, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '[' || r == ']'
