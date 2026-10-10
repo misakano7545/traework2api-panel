@@ -60,6 +60,9 @@ func (t *reqTrace) addUsage(model string, d usage.Delta) {
 	}
 	if d.HasTotal {
 		t.TotalTokens += d.TotalTokens
+	} else if d.HasPromptTokens || d.HasCompletion {
+		// 与 usage.Add 同口径：上游没给 total 时用 pt+ct 兜底，别让请求记录显示 0 而台账有值。
+		t.TotalTokens += d.PromptTokens + d.CompletionTokens
 	}
 	if d.HasCacheHit {
 		t.CacheHitTokens += d.CacheHitTokens
