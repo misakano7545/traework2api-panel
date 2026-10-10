@@ -9,8 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// tmpSeq 让同一个 auths 文件的临时名在进程内唯一（见 saveAtomicLocked）。
+var tmpSeq atomic.Uint64
 
 // Auth 归一化后的账号凭证。
 //
@@ -249,11 +253,18 @@ func (a *Auth) saveAtomicLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
+	// 临时名带 pid + 进程内序号：同一个文件可能被**两个不同的 *Auth 对象**写（面板登录
+	// 新建的对象 vs 池里已有对象），a.mu 是对象级锁保护不到；共用固定名 ".tmp" 时两边
+	// 会互相截断，rename 上去就是半截 JSON，重启 LoadDir 静默跳过 → 账号无声消失。
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", a.FilePath, os.Getpid(), tmpSeq.Add(1))
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, a.FilePath)
+	if err := os.Rename(tmp, a.FilePath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // LoadDir 扫描 dir 下 trae-*.json。解析失败的文件静默跳过（启动日志由调用方统计）。
