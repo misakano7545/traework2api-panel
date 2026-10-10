@@ -110,14 +110,19 @@ func (s *Scheduler) Run(ctx context.Context) {
 		<-ctx.Done()
 		return
 	}
+	// 从**计划时点**推进而不是每轮 time.Now()：任务耗时跨过相邻两档时点时，用墙上时间
+	// 重算 nextFire 会看到「下一档已经过去」，直接跳到次日，把中间那档静默吞掉。
+	next := nextFire(time.Now(), hours)
 	for {
-		timer := time.NewTimer(time.Until(nextFire(time.Now(), hours)))
+		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
-			h := time.Now().Hour()
+			fired := next
+			next = nextFire(fired, hours)
+			h := fired.Hour()
 			s.mu.RLock()
 			doCheckin := s.cfg.CheckinEnabled && contains(s.cfg.CheckinHours, h)
 			doKeepalive := s.cfg.KeepaliveEnabled && contains(s.cfg.KeepaliveHours, h)
