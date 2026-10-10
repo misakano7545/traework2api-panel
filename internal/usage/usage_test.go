@@ -1,7 +1,11 @@
 package usage
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -93,4 +97,44 @@ func TestSaveAndReload(t *testing.T) {
 	if got := back.Snapshot(72, nil).Totals; got.Requests != 1 || got.TotalTokens != 10 || got.PromptTokens != 4 {
 		t.Fatalf("重启读回 = %+v", got)
 	}
+}
+
+// 并发落盘不得写坏台账：30s 后台 ticker 与面板「刷新」的 Save 会真的同时落盘，
+// 两者共写固定名 usage.json.tmp —— rename 撞车就会把另一个写了一半的内容装上去，
+// 重启时 load() 解析失败，整个用量/积分台账从零开始（见 flush 注释）。
+func TestConcurrentFlushKeepsFileValid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	r := New(path)
+	const n = 800 // 快照够大，把单次 WriteFile 拉长到能被并发撞上
+	now := time.Now()
+	for i := 0; i < n; i++ {
+		r.Add(now, "u1", fmt.Sprintf("m%04d", i), delta(1, 1, 2, 1), true)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 12; j++ {
+				r.flush(true)
+				// 自己这次 rename 已经回来了，文件必然存在。
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Errorf("读回落盘文件失败: %v", err)
+					return
+				}
+				var f file
+				if err := json.Unmarshal(raw, &f); err != nil {
+					t.Errorf("台账被写坏（解析失败）: %v", err)
+					return
+				}
+				if len(f.Buckets) != n {
+					t.Errorf("桶数丢了: %d，期望 %d", len(f.Buckets), n)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

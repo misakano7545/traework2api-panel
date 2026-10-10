@@ -287,13 +287,22 @@ func (r *Recorder) load() error {
 	return nil
 }
 
+// flush 把内存快照落盘（force=false 时只在有变更时写）。
+//
+// 全程持锁，直到 rename 结束——写 tmp 与替换必须与其它 flush 互斥：tmp 是**固定名**
+// （path + ".tmp"），两个落盘线程（30s 后台 ticker 与面板「刷新」触发的 Save）共写同一个
+// 文件时，先 rename 的那个会把对方写了一半的内容装上去，重启时 load() 解析失败 → 整个
+// 用量/积分台账从零开始。auth.saveAtomicLocked / pool.saveLocked / SaveFile 也都是持锁
+// （各自的锁）到 rename 的，唯此处漏了。
+// ponytail: 代价是 Add 在落盘期间阻塞（KB 级、30s 一次）；真要高吞吐再换唯一 tmp 名，
+// 不必现在引入。
 func (r *Recorder) flush(force bool) {
 	if r == nil || r.path == "" {
 		return
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.dirty && !force {
-		r.mu.Unlock()
 		return
 	}
 	snap := file{Version: 1, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
@@ -301,7 +310,6 @@ func (r *Recorder) flush(force bool) {
 		snap.Buckets = append(snap.Buckets, *b)
 	}
 	r.dirty = false
-	r.mu.Unlock()
 
 	raw, err := json.Marshal(snap)
 	if err != nil {
