@@ -472,7 +472,8 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 	var pendingUsage map[string]any
 	var lastUsage map[string]any // 已收到的最后一份 token_usage（pendingUsage 会被 writeChunk 消费掉）
 	sawDone := false
-	sawModel := false // 见过 output 事件（正文/思考/工具任一）
+	sawModel := false     // 见过 output 事件（正文/思考/工具任一）
+	sawToolCalls := false // output 里见过工具调用：done 帧据此修正被上游伪装的 finish_reason
 	st := &sseState{}
 	writeChunk := func(delta map[string]any, finish string) error {
 		chunk := map[string]any{
@@ -577,6 +578,7 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 							}
 						}
 						delta["tool_calls"] = tc
+						sawToolCalls = true
 					}
 				}
 				if len(delta) > 0 {
@@ -588,7 +590,15 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			case "token_usage":
 				pendingUsage, lastUsage = ev.Usage, ev.Usage
 			case "done":
-				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
+				// SOLO 的 done 帧恒报 finish_reason:"stop"，即使模型发起了工具调用
+				// （continue.go 顶部也记着这条上游行为）。原样透传会让下游以为回合已
+				// 正常结束、不执行工具，表现为“话说一半没了”。见过 tool_calls 时把
+				// stop/空改写为 tool_calls；length 等真实截断信号保持透传。
+				fr := ev.FinishReason
+				if sawToolCalls && (fr == "" || fr == "stop") {
+					fr = "tool_calls"
+				}
+				if err := writeChunk(map[string]any{}, fr); err != nil {
 					return lastUsage, err
 				}
 				if err := writeDONE(); err != nil {

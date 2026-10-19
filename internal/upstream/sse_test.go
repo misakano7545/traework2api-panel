@@ -254,6 +254,56 @@ func TestStreamGuaranteesDone(t *testing.T) {
 	}
 }
 
+// 上游 SOLO 的 done 帧恒报 finish_reason:"stop"，即使模型发起了工具调用。
+// 透传会让下游以为回合已正常结束、不执行工具（表现为“话说一半没了”），
+// 2026-10-19 实测 traework 4/4 复现、workbuddy 正常。见过 tool_calls 时必须改写。
+func TestStreamToolCallsFinishReason(t *testing.T) {
+	toolSSE := "event:output\n" +
+		"data:{\"response\":\"\",\"reasoning_content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"function_call\":{\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}}]}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(toolSSE)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"tool_calls"`) {
+		t.Fatalf("缺少 tool_calls delta: %q", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Errorf("工具调用回合的 finish_reason 应为 tool_calls，实际: %q", body)
+	}
+}
+
+// 纯文本回合（无工具调用）必须仍报 stop，不能被误改。
+func TestStreamPlainFinishReasonUnchanged(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(soloSSEFixture)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"stop"`) {
+		t.Errorf("无工具调用时应保持 stop: %q", rec.Body.String())
+	}
+}
+
+// 上游真实截断信号（length）即使伴随工具调用也不得被改写，
+// 否则会把“被截断”谎报成“工具调用完成”。
+func TestStreamLengthNotMaskedByToolCalls(t *testing.T) {
+	toolSSE := "event:output\n" +
+		"data:{\"response\":\"\",\"reasoning_content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"function_call\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"length\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(toolSSE)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"finish_reason":"length"`) {
+		t.Errorf("截断信号不得被改写: %q", body)
+	}
+	if strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Errorf("length 回合不应被改成 tool_calls: %q", body)
+	}
+}
+
 func TestPrepareBodyToolsParametersStringified(t *testing.T) {
 	src := `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}`
 	out := PrepareBody([]byte(src))
