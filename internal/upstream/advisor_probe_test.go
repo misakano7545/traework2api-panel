@@ -7,7 +7,8 @@ package upstream
 //
 // 默认跳过，手动跑：
 //
-//	TW2A_PROBE=1 TW2A_AUTH_DIR=./auths go test ./internal/upstream -run 'TestAdvisor' -v
+//	TW2A_PROBE=1 go test ./internal/upstream -run 'TestAdvisor' -v
+//	（测试的工作目录是包目录，凭据默认读 ../../auths；传 ./auths 会找不到目录）
 //
 // 2026-10-23 真号（CN，20 个官方模型）实测结论：
 //   - 专家是**按 (function 面 × 模型)** 挂在模型配置里的：`model_extra_config.advisor_tool`
@@ -356,7 +357,7 @@ func advisorSettle(t *testing.T, c *Client, a *auth.Auth, base, minDelta float64
 
 // TestAdvisorCredit 实测「专家槽」与「主模型」的积分单价（**会花钱**，默认不跑）。
 //
-//	TW2A_PROBE=1 TW2A_CREDIT=1 TW2A_AUTH_DIR=./auths go test ./internal/upstream -run TestAdvisorCredit -v
+//	TW2A_PROBE=1 TW2A_CREDIT=1 go test ./internal/upstream -run TestAdvisorCredit -v
 //
 // 一次约 4.4 积分（8 次 ~12.5k token 请求）。结果见文件头注释。
 func TestAdvisorCredit(t *testing.T) {

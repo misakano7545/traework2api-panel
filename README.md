@@ -377,10 +377,12 @@ custom_model_kimi      → custom_model_placeholder__dev
    （`upstream.normalizeTools` / `isAdvisorToolDecl`）——专家是模型只能「叫得到才算」的工具，
    不让它存在就等于硬拦截。
 
-复跑取证：`TW2A_PROBE=1 TW2A_AUTH_DIR=./auths go test ./internal/upstream -run 'TestAdvisor' -v`
-（`TestAdvisorDump` 只读，`TestAdvisorTrigger` 发 4 次短请求）。
-积分实测另需显式同意花钱：`TW2A_PROBE=1 TW2A_CREDIT=1 TW2A_AUTH_DIR=./auths go test
-./internal/upstream -run TestAdvisorCredit -v`（8 次 ~12k token 请求，约 4.4 积分）。
+复跑取证（测试的工作目录是包目录，默认读 `../../auths`，别传 `./auths`）：
+
+```bash
+TW2A_PROBE=1 go test ./internal/upstream -run 'TestAdvisor' -v        # 只读 dump + 4 次短请求
+TW2A_PROBE=1 TW2A_CREDIT=1 go test ./internal/upstream -run TestAdvisorCredit -v  # 花钱，约 4.4 积分
+```
 
 ## 保活（防掉线）
 
