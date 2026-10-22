@@ -333,6 +333,55 @@ custom_model_kimi      → custom_model_placeholder__dev
 且烧掉 16000 个推理 token（正好是 Max 档输出上限）。随后按同样条件重跑 3 次 dev + 3 次 max 全部正常，
 2×2 上游矩阵也全正常，**复现不出来**。原因未明，可能是上游瞬时状态或满预算的思考跑飞，继续观察。
 
+## 专家模型（AdvisorTool）
+
+社区流传「TRAE 里有个强制开启、没有开关的 AdvisorTool，不管你用什么模型都会把方案送去给一个
+不可见的专家模型，积分并入本次任务且查不到」。2026-10-23 用真号（CN，20 个官方模型）实测，
+**结论对一半**：
+
+- **专家配置确实存在，且按「function 面 × 模型」挂在模型表里**：`model_extra_config.advisor_tool`
+  带 `advisor_config_name` / `advisor_model` / `max_uses_per_request=3` / `trim_system_prompt` /
+  `trim_tool_results`。所以「专家是哪个模型」其实**在接口里看得到**（面板不显示而已）。
+- **不是「不管你用什么模型」**：面板默认面 `solo_work_lite` 的 20 个官方模型一个都不带；
+  `chat_v3` 21 个里 1 个（`Doubao-Seed-Code`）；`solo_agent` 21 个里 9 个（DeepSeek 三兄弟、
+  MiniMax-M3 两兄弟、qwen3.8-flash / qwen3.8-max / qwen-3.7-plus、`Doubao-Seed-Code`）；
+  `solo_coder` 12 个都不带。
+- **带配置 ≠ 会跑**：裸 API 请求（只有 messages + tools）的 `prompt_tokens` 只有 36~41，
+  流里没有任何 advisor 事件，`provider_model_name` 也只有主模型一个 —— 服务端不会自己把方案
+  送去给专家，也**没有**注入那段 `advisor_tool_policy` 策略文本。
+- **真正的触发条件是客户端把 `AdvisorTool` 声明成普通 function**：同一句「上次方案不行，我很烦」，
+  不声明 → 0 次调用；声明 → 必然调用（14~25 帧 `tool_calls`，带 `question` 参数）。
+  只给策略文本、不声明工具，模型只能嘴上提它，调不出来。
+- **积分：专家确实另算，而且贵一个量级（2026-10-23 实测）**。用额度接口
+  `user_entitlement_pack_list[].usage.credits_amount`（浮点、45 秒内结算）做前后差，
+  两臂各 4 次、prompt 都约 12.5k token：
+
+  | 臂 | 模型（倍率） | prompt | completion | 扣积分 | 单次 |
+  |---|---|---|---|---|---|
+  | A 主模型 | `deepseek-v4.1-flash`（0.06） | 12916 | 323 | 0.5684 | 0.142 |
+  | B 专家槽 | `glm-5.2_advisor_default`（0.78） | 12356 | 1498 | 3.8024 | 0.951 |
+
+  同样输入量下专家一次 ≈ 主模型一次的 **6.7 倍**（token 单价 13 倍，专家输出也更长）。
+  按官方单价复核：专家 `12356×216/1e6 + 1498×756/1e6 = 3.80`，与实测分毫不差；主模型实测比
+  价目表估的高 43%（缓存口径偏），说明价目表对 GLM 准、对 DeepSeek 偏低。
+  真实会话里专家收到的是**整段裁剪后的历史**（几万 token 很常见），再乘「每请求最多 3 次」，
+  所以「消耗非常大」这个方向是对的——30k token 的方案转发一次约 6.5 积分。
+- **结算不慢，是显示粒度粗**：`credits_amount` 是浮点、45 秒内就更新；面板按整数显示，
+  几十 token 的小请求差值被取整吃掉，才显得「延迟十几分钟」。别拿整数位当计费依据。
+
+面板侧因此做两件事（都只影响出站，不改客户端）：
+
+1. `*_advisor*` 槽位（`glm-5.2_advisor_doubao` 这类「基础模型 + 专家」绑定槽）不进官方模型表，
+   国际版按「有显示名」放行也挡（`upstream.isAdvisorSlot`）；
+2. 客户端若声明了名为 `AdvisorTool` 的工具，出站前剔掉并留一行 WARN
+   （`upstream.normalizeTools` / `isAdvisorToolDecl`）——专家是模型只能「叫得到才算」的工具，
+   不让它存在就等于硬拦截。
+
+复跑取证：`TW2A_PROBE=1 TW2A_AUTH_DIR=./auths go test ./internal/upstream -run 'TestAdvisor' -v`
+（`TestAdvisorDump` 只读，`TestAdvisorTrigger` 发 4 次短请求）。
+积分实测另需显式同意花钱：`TW2A_PROBE=1 TW2A_CREDIT=1 TW2A_AUTH_DIR=./auths go test
+./internal/upstream -run TestAdvisorCredit -v`（8 次 ~12k token 请求，约 4.4 积分）。
+
 ## 保活（防掉线）
 
 `schedule.keepalive_hours`（默认 `[3]`）到点对**全账号无条件**刷一遍 token，不看剩余有效期：

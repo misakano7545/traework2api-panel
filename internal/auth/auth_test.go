@@ -3,6 +3,7 @@ package auth
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -106,8 +107,17 @@ func TestSaveAtomicRoundtripPreservesSOLOFields(t *testing.T) {
 	if _, err := os.Stat(fp + ".tmp"); !os.IsNotExist(err) {
 		t.Error("tmp file should not remain")
 	}
-	if fi, err := os.Stat(fp); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Errorf("file mode=%v err=%v want 0600", fi.Mode().Perm(), err)
+	// 0600 是 POSIX 语义：Windows 上 os.Chmod 只切只读位，WriteFile(0o600) 落盘一律 0666，
+	// 在这里断 0600 只会得到一条永远红的假失败。所以权限只在 POSIX 上断言，
+	// Windows 上退化成「文件确实生成了」，不假装验证了权限。
+	if fi, err := os.Stat(fp); runtime.GOOS == "windows" {
+		if err != nil {
+			t.Errorf("stat: %v", err)
+		}
+	} else if err != nil {
+		t.Errorf("stat: %v", err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Errorf("file mode=%v want 0600", fi.Mode().Perm())
 	}
 	raw, err := os.ReadFile(fp)
 	if err != nil {

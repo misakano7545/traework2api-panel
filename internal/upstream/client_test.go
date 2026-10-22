@@ -385,6 +385,10 @@ func TestPickOfficialModels(t *testing.T) {
 		{"config_name":"browser_use_subagent","is_invisible_to_user":true,"usage":"chat_completion"},
 		{"config_name":"glm-5-turbo","is_invisible_to_user":true,"usage":"chat_completion",
 		 "display_config":{"display_name":"GLM-5-Turbo","model_capability":"reasoning_model"}},
+		{"config_name":"glm-5.2_advisor_doubao","is_invisible_to_user":true,"usage":"chat_completion",
+		 "display_config":{"display_name":"GLM-5.2","model_capability":"reasoning_model"},
+		 "context_window_tokens":{"dev":200000},
+		 "model_detail_list":[{"max_tokens":32000,"model_name":"glm-5.2__dev"}]},
 		{"config_name":"custom_model_kimi","is_invisible_to_user":false,"usage":"custom_model"},
 		{"config_name":"summary","is_invisible_to_user":false,"usage":"summary"},
 		{"config_name":"","is_invisible_to_user":false,"usage":"chat_completion"}
@@ -438,6 +442,20 @@ func TestPickOfficialModels(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != "glm-5.2,Doubao-Seed-Evolving,kimi-k3,glm-5-turbo" {
 		t.Fatalf("国际版模型表=%v want [glm-5.2 Doubao-Seed-Evolving kimi-k3 glm-5-turbo]", ids)
+	}
+
+	// advisor 槽位（基础模型 + 服务端专家模型）两个域都不进官方模型表：
+	// 国内版本来就被 is_invisible_to_user 挡住，国际版按「有显示名」放行会漏，
+	// 所以判据必须落在名字上（display_name 与基础模型同名，区分不了）。
+	for _, ml := range [][]ModelInfo{got, gotIntl} {
+		for _, m := range ml {
+			if isAdvisorSlot(m.ID) {
+				t.Errorf("advisor 槽位不该出现在官方模型表: %+v", m)
+			}
+		}
+	}
+	if !isAdvisorSlot("glm-5.2_advisor_doubao") || isAdvisorSlot("glm-5.2") || isAdvisorSlot("kimi-k3") {
+		t.Error("isAdvisorSlot 判据错：只认 _advisor 段")
 	}
 }
 

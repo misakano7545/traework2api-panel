@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -199,7 +200,8 @@ func TestLoginWrites0600AndHidesToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	// 同 auth_test：0600 在 Windows 上表达不出来（落盘恒为 0666），只在 POSIX 断言。
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("perm %o", fi.Mode().Perm())
 	}
 	raw, _ := os.ReadFile(fp)

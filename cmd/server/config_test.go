@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -116,8 +117,9 @@ func TestParseBodyTakesSubmittedKeyAndMarksRestart(t *testing.T) {
 	if !strings.Contains(string(raw), "panel-key") {
 		t.Fatalf("面板填的 api_key 没写进文件: %s", raw)
 	}
-	fi, _ := os.Stat(fp)
-	if fi.Mode().Perm() != 0o600 {
+	// 0600 是 POSIX 语义：Windows 上 WriteFile(0o600) 落盘恒为 0666（os.Chmod 只能切只读位），
+	// 在这里断 0600 只会得到一条永远红的假失败。权限断言只在 POSIX 上成立。
+	if fi, _ := os.Stat(fp); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("perm %o", fi.Mode().Perm())
 	}
 }
@@ -166,7 +168,7 @@ func TestWriteDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("权限=%v，期望 0600", fi.Mode().Perm())
 	}
 	c, err := Load(fp)

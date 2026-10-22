@@ -141,3 +141,51 @@ func TestPrepareBodyLogsDroppedNativeTools(t *testing.T) {
 		}
 	}
 }
+
+// 专家工具（AdvisorTool）必须从出站 tools 里剔掉。
+//
+// 实测依据（2026-10-23，真号 CN，deepseek-v4.1-flash / solo_agent）：同一句
+// 「上次方案不行，我很烦」，不声明 AdvisorTool 时模型 0 次调用；一旦声明，模型必然调用它
+// （14~25 帧 tool_calls，带 question 参数）。策略文本只是加剧，不是必要条件。
+// 所以专家是**客户端声明出来的普通 function**，中继唯一拦得住的位置就是出站时不让它存在。
+func TestPrepareBodyDropsAdvisorTool(t *testing.T) {
+	old := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	src := []byte(`{"model":"deepseek-v4.1-flash","messages":[],
+		"tools":[
+			{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"AdvisorTool","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"advisor_tool","parameters":{"type":"object"}}},
+			{"name":"AdvisorTool","type":"function"}
+		],
+		"tool_choice":"AdvisorTool"}`)
+	out := PrepareBody(src)
+
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := obj["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("只该留下 shell，得到 %#v", obj["tools"])
+	}
+	if fn, _ := tools[0].(map[string]any)["function"].(map[string]any); asString(fn["name"]) != "shell" {
+		t.Fatalf("留下的不是 shell：%#v", tools[0])
+	}
+	if _, ok := obj["tool_choice"]; ok {
+		t.Fatalf("点名了 AdvisorTool 的 tool_choice 应删掉：%v", obj["tool_choice"])
+	}
+	if !strings.Contains(buf.String(), "AdvisorTool(专家)") {
+		t.Fatalf("剔除专家工具必须留痕：%q", buf.String())
+	}
+
+	// 普通工具名不许被误伤。
+	for _, name := range []string{"shell", "advisor", "AdvisorToolX", "my_advisor_tool"} {
+		if isAdvisorToolDecl(map[string]any{"function": map[string]any{"name": name}}) {
+			t.Errorf("%q 不该被当成专家工具", name)
+		}
+	}
+}

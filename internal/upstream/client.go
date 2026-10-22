@@ -645,6 +645,13 @@ func pickOfficialModels(list []paramConfig, a *auth.Auth, function string) []Mod
 		if cfg.ConfigName == "" || cfg.Usage != usageChat {
 			continue
 		}
+		// advisor 槽位（glm-5.2_advisor_doubao 这类）=「基础模型 + 服务端专家模型」的绑定槽，
+		// 客户端选择器不列，本仓也不该把它当官方模型播出去：跑一次就多带一路专家调用。
+		// 国内版靠 is_invisible_to_user 就能挡，但国际版按「有显示名」放行，而这些槽的
+		// display_name 与基础模型同名（GLM-5.2），不显式挡就会漏进 /v1/models。
+		if isAdvisorSlot(cfg.ConfigName) {
+			continue
+		}
 		if cfg.IsInvisibleToUser {
 			if !intl || cfg.DisplayConfig.DisplayName == "" {
 				continue
@@ -730,6 +737,19 @@ func isInternalConfig(name string) bool {
 		}
 	}
 	return false
+}
+
+// isAdvisorSlot 上游「基础模型 + 服务端专家模型」的绑定槽，形如 glm-5.2_advisor_doubao。
+//
+// 依据（本仓抓包夹具 internal/upstream/testdata/batch_max_variants.json）：
+//   - 槽名 = <基础模型>_advisor_<专家模型>，实测出现过的都长这样，所以只认名字里的 _advisor 段；
+//   - 这类槽的 display_name 与基础模型同名（GLM-5.2），按名字区分不了，只能看 config_name；
+//   - 专家调用是**服务端按模型配置**开的：deepseek-v4.1-flash 的 model_extra_config 里就带着
+//     advisor_tool{enabled:true, advisor_config_name:glm-5.3_advisor, advisor_model:glm-5.3__dev,
+//     max_uses_per_request:3, pass_tools_to_advisor:false}——即选到这个模型，专家这一路是上游跑的，
+//     中继侧关不掉，只能不选它（或让用户知道它会额外烧积分）。
+func isAdvisorSlot(name string) bool {
+	return strings.Contains(strings.ToLower(name), "_advisor")
 }
 
 // catalogMeta 批量视图给一个模型的权威元数据。
@@ -990,7 +1010,7 @@ func mergeCatalog(list []ModelInfo, cat map[string]catalogMeta, a *auth.Auth) []
 	// 在 solo_work_lite / solo_agent / chat_v3 / solo_coder 下都 200），不必为它改聊天路径。
 	added := make([]ModelInfo, 0)
 	for key, m := range cat {
-		if seen[key] || !m.Visible {
+		if seen[key] || !m.Visible || isAdvisorSlot(m.ID) {
 			continue
 		}
 		mi := ModelInfo{ID: m.ID, Name: m.Label, ContextWindow: m.Dev, ContextMax: m.Max, Function: Function, PickOnly: true,

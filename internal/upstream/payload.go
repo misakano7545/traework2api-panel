@@ -215,6 +215,17 @@ func normalizeTools(obj map[string]any) {
 			dropped = append(dropped, "(非对象条目: "+truncate(asString(item), 40)+")")
 			continue
 		}
+		// 专家工具硬拦截：实测（2026-10-23，真号 CN，deepseek-v4.1-flash / solo_agent）
+		// 同一句「上次方案不行，我很烦」——不声明 AdvisorTool 时 0 次调用，声明了就一定被调
+		// （14~25 帧 tool_calls），策略文本只是加剧、不是必要条件。也就是说专家是**客户端
+		// 声明出来的普通 function**，模型只能在它存在时叫它；而它一旦被叫，专家那一路的
+		// token 由上游按该模型的 advisor_tool 配置另算（面板与 usage 帧里都看不到）。
+		// 所以唯一拦得住的点就是「不让这个工具存在」。
+		if isAdvisorToolDecl(t) {
+			dropped = append(dropped, "AdvisorTool(专家)")
+			droppedNames = append(droppedNames, "AdvisorTool")
+			continue
+		}
 		fn, ok := t["function"].(map[string]any)
 		if !ok {
 			// 名字两处可取：扁平写法的顶层 name，与嵌套形态里层的 function.name
@@ -246,6 +257,22 @@ func normalizeTools(obj map[string]any) {
 		return
 	}
 	obj["tools"] = out
+}
+
+// isAdvisorToolDecl 这个工具声明是不是 TRAE 的专家工具（AdvisorTool）。
+//
+// 名字两处可取：标准 OpenAI 形态在 function.name，扁平写法在顶层 name；两种都要看，
+// 否则换一个客户端写法就漏过去。大小写不敏感——实测客户端写的是 "AdvisorTool"，
+// 但同一个工具在别处出现过 advisor_tool / Advisor_Tool 这类变体，按去分隔符后比对。
+func isAdvisorToolDecl(t map[string]any) bool {
+	name := asString(t["name"])
+	if fn, ok := t["function"].(map[string]any); ok {
+		if n := asString(fn["name"]); n != "" {
+			name = n
+		}
+	}
+	name = strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.TrimSpace(name)))
+	return name == "advisortool"
 }
 
 // toolLabel 工具声明在日志里的名字：优先 name（含嵌套形态），退回 type。
