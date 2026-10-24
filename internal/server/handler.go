@@ -799,7 +799,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 12 小时。实测（2026-10-21，单国际号）4 个免费模型连打 4/4 全 200，再打一次
 	// gpt-6.1-sol 就把整个号冷却到次日，剩下 34 个能用的国际模型一起 503。
 	// 计划是按模型给的，罚却是按号罚的，这里把它挡在发请求之前。
-	if h.modelPaidOnly(realm, configName) && !h.realmHasPaidAccount(realm) {
+	// 例外：走国际版槽位旁路的模型（gpt-6-sol / gpt-6-luna）。目录里的 identity_list 只描述
+	// 「直调这个模型名」那条路，槽位里挂的是 openai/gpt-5.6-sol|luna，Free 号实测能出正文。
+	// 闸门按目录判会把这条路一起挡掉（本地实测：升级前 200/2.9s，升级后 403）。
+	_, slotRouted := upstream.IntlSlotRoute(configName)
+	if h.modelPaidOnly(realm, configName) && !h.realmHasPaidAccount(realm) && !(slotRouted && realm == auth.RealmIntl) {
 		log.Printf("拒绝订阅专享模型 %s：%s 地区没有订阅档账号（Free 号调它必 1005，不罚号）", configName, realm)
 		writeOpenAIError(w, http.StatusForbidden, "model_requires_subscription",
 			"model "+configName+" requires a paid Trae subscription; every account in this realm is a Free plan")

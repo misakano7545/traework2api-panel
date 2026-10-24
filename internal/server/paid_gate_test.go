@@ -243,3 +243,30 @@ func TestPaidOnlyIsPerRealm(t *testing.T) {
 		t.Fatalf("cn:glm-5.2 code=%d body=%s，国内免费不该被国际版的档位连坐", rec.Code, rec.Body)
 	}
 }
+
+// 国际版槽位旁路模型（gpt-6-sol / gpt-6-luna）在目录里也被标成订阅专享，但必须放行：
+// identity_list 描述的是「直调模型名」那条路，槽位里挂的是 openai/gpt-5.6-sol，
+// Free 号实测能出正文。按目录一刀切会把国际版唯一能用的模型砍掉（升级回归）。
+func TestPaidOnlySlotRoutedIntlModelNotGated(t *testing.T) {
+	installCatalog(t, upstream.ModelInfo{ID: "gpt-6-sol", ContextWindow: 200000, PaidOnly: true})
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.realmByModel["gpt-6-sol"] = auth.RealmIntl
+	dynamicModelsCache.paidOnlyByModel[auth.RealmIntl+"/gpt-6-sol"] = true
+	dynamicModelsCache.Unlock()
+
+	up := &paidGateUpstream{identity: 0}
+	pool := testPoolWith(
+		&auth.Auth{UID: "cn1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "intl1", AccessToken: "at2", ExpiresAt: 9999999999, Domain: "www.trae.ai"},
+	)
+	h := NewHandler(Config{Pool: pool, Upstream: up.client()})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, chatReq("intl:gpt-6-sol"))
+	if rec.Code != 200 {
+		t.Fatalf("intl:gpt-6-sol code=%d body=%s，槽位旁路模型不该被 403 挡", rec.Code, rec.Body)
+	}
+	if up.chats != 1 {
+		t.Errorf("聊天请求打了 %d 次，期望 1（应真的走上游）", up.chats)
+	}
+}
