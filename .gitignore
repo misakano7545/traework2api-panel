@@ -35,3 +35,6 @@ __pycache__/
 # 任务输入文档
 tickets/
 reference_workbuddy2api/
+
+# 逆向抓包工件（含真实 token / 设备号，绝不入库）
+.reverse/
