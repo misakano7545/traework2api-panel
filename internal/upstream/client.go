@@ -290,16 +290,12 @@ func (c *Client) agentBaseFor(a *auth.Auth) string {
 }
 
 // identFor 账号地区对应的身份版本组（User-Agent / X-Ide-Version / *-Version-Code）。
+//
+// 实现已收敛到 identity.go：这里只做「地区 → 版本对」的转发，别再复制一份判断逻辑
+// （历史上出现过 headers 与登录各写一套、改了一处漏一处）。
 func identFor(a *auth.Auth) (version, versionCode string) {
-	if a != nil && a.Realm() == auth.RealmIntl {
-		// 运维显式钉死的版本对国际版同样生效：否则 SetIdentity 之后国际流量还是老版本，
-		// 而面板/日志里看不出「覆盖没生效」。版本码仍用国际版常量（那两个是不同的轴）。
-		if v := identOverrideVersion(); v != "" {
-			return v, IdeVersionCodeIntl
-		}
-		return IdeVersionIntl, IdeVersionCodeIntl
-	}
-	return currentIdeVersion(), IdeVersionCode
+	realm := realmOf(a)
+	return currentIdeVersionFor(realm), verCodeFor(realm)
 }
 
 // maxJSONBody 上游 JSON 响应上限。8MB：模型目录表（batch_get_detail_param）随模型数

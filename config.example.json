@@ -23,6 +23,8 @@
     "idle_timeout_seconds": 300,
     "user_agent": "",
     "client_version": "",
+    "device_brand": "",
+    "os_version": "",
     "host_discovery": true,
     "host_discovery_hours": 6,
     "agent_host": "",

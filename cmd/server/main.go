@@ -58,6 +58,7 @@ func applyUpstream(up *upstream.Client, c *Config) {
 		time.Duration(c.Upstream.IdleTimeoutSeconds)*time.Second,
 	)
 	upstream.SetIdentity(c.Upstream.UserAgent, c.Upstream.ClientVersion)
+	upstream.SetDevice(c.Upstream.DeviceBrand, c.Upstream.OsVersion)
 	// agent 基址：显式配置优先，留空回落内置常量；两者都只是「兜底」——
 	// domains.go 的自动发现一旦拿到结果就覆盖它们（见 Client.effectiveAgentBase）。
 	// 这里**必须显式写回**（不能只在非空时赋值）：否则面板里清空该项后，旧值会留在

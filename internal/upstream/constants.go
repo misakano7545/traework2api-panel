@@ -32,18 +32,39 @@ const (
 	// ⇒ 本仓所有已有账号的 token 都是 SOLO 档登录铸出来的，改成 IDE 档会让**全部账号**
 	// 换票失败。SOLO 档本身健在：GetPCAuthCode 两档都 200，伪造 client_id 才 400
 	// 「Invalid client.」（有区分力的对照）。
-	ClientID    = "en1oxy7wnw8j9n" // SOLO stable
-	AppID       = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+	ClientID = "en1oxy7wnw8j9n" // SOLO stable
+	AppID    = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 	// IdeVersionCode 是上游的**放量开关**，不是装饰：
 	//   20260716 → 表 39 条、kimi-k3 的 access.identity_list=[2,3,100]（免费档被挡）
 	//   20260811 → 表 42 条、k3 放开到 [0,5,1,2,3,100]，多出 glm-5.3 / step-5-preview /
 	//              deepseek-v4.1-flash，少掉 glm-5 / DeepSeek-V4-Flash / DeepSeek-V4-Pro
-	// 版本号字符串本身不影响结果（0.1.43/0.1.50/1.0.0 同码同表），跟着版本码标成同批客户端即可。
-	IdeVersion     = "0.1.50"
-	IdeVersionCode = "20260811"
-	DeviceBrand    = "83DG"
-	OSVersion      = "Windows 11 Pro"
-	Function       = "solo_work_lite"
+	//   20260924 → 48 条（实测 2026-10-30，与 20260811 的模型名**逐字相同**，只是表变长）
+	//
+	// 2026-10-30 抓包实测（Trae CN 1.107.1 / appVersion 3.4.11，Agent 模式真请求）：
+	//   x-app-version / x-ide-version = 3.4.11，两个 version-code 都是 20260924。
+	//   注意 product.json 里的 traeVersionCode=20250325 是**死值**，客户端实际发的是运行时
+	//   下发的 20260924 —— 在整个安装目录 grep 20260924 零命中，静态扫不出来，只有抓包有。
+	// 版本号字符串本身不换表（20260811 与 20260924 实测同表），但它是身份指纹，跟着客户端对齐。
+	IdeVersion     = "3.4.11"
+	IdeVersionCode = "20260924"
+	// DeviceBrand / OSVersion 是**兜底值**：官方客户端读真机（实测这台机器上发的是
+	// "OpenStack Compute" / "Windows Server 2022 Standard"）。账号没记真机信息时用这两个，
+	// 由 upstream.device_brand / os_version 或 SetIdentity 覆盖成真实值。
+	DeviceBrand = "83DG"
+	OSVersion   = "Windows 11 Pro"
+
+	// 客户端 UA 家族，2026-10-30 抓包实测（UA 是完整 Chromium 串，不是 "Trae/<ver>"）：
+	//	CN   ... TraeCN/1.107.1 Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36
+	//	INTL ... Trae/1.107.1   Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36
+	// UABaseVersion 取 product.json 的 vscodeVersion（两区同为 1.107.1），**不是** appVersion。
+	UABaseVersion     = "1.107.1"
+	UAChromeVersion   = "142.0.7444.235"
+	UAElectronVersion = "39.2.7"
+
+	// DeviceCPU 出站 X-Device-Cpu。客户端读真机（实测这台是 "Intel"）。
+	DeviceCPU = "Intel"
+
+	Function = "solo_work_lite"
 	// FunctionCoder 是同一个 agent 主机的另一条通道：`solo_coder`。实测 2026-09-28，
 	// 同 token 同路径，只换 function，返回的模型表就是网页端（work.trae.ai）那 14 个
 	// （gemini-3.1-pro / gemini-3-flash-solo / minimax-m2.7 / kimi-k2.5 / gpt-5.4 / gpt-5.2 …）。
@@ -87,14 +108,23 @@ const (
 //     实测 2026-10-03）：国际版免费号返回单条 Free plan（credits_limit=0，按美元计费），
 //     付费国际号则带 credits_limit。
 const (
-	AgentHostIntl = "https://a0ai-api-sg.byteintlapi.com"
+	// AgentHostIntl 国际版的 agent 网关。2026-10-30 抓包实测：国际客户端（Trae 1.107.1 /
+	// appVersion 3.6.4）的 Referer 与逻辑域名都是 coresg-normal.trae.ai（其它区是
+	// core-normal / coreva-normal），传输层再 dispatch 到 api5-normal-alisg.mchost.guru。
+	// 旧值 a0ai-api-sg.byteintlapi.com 仍然活着（探测回 401 code:1001，路由在），
+	// 但它不是客户端在用的那台 —— 以客户端为准换成 coresg。
+	AgentHostIntl = "https://coresg-normal.trae.ai"
 	// UgHostIntl 国际版的 UG/计费网关（api.trae.cn 的国际对应物）。账号的 ApiHost
 	// （登录回调 host）优先；老账号没有这个字段时回落到这里。
 	UgHostIntl = "https://api-sg-central.trae.ai"
 	// DefaultConfigNameIntl 国际版的旗舰/默认模型（别名与空 model 都落到它）。
 	DefaultConfigNameIntl = "gpt-5.2"
-	IdeVersionIntl        = "1.0.2"
-	IdeVersionCodeIntl    = "20260811" // ponytail: 只要非空就能过，暂借国内版的值；有实测到国际专有码再换
+	// 国际版身份版本组，2026-10-30 抓包实测（国际客户端 Agent 真请求）：
+	//   x-ide-version = 3.6.4（= product.json appVersion），x-ide-version-code =
+	//   x-app-version-code = 20260924，package-type = stable_i18n，X-SS-DP = 677332。
+	//   国际版 x-app-version 发的是字面量 "default"（国内版发版本号）。
+	IdeVersionIntl     = "3.6.4"
+	IdeVersionCodeIntl = "20260924"
 )
 
 // SlotRoute 走租户自定义槽位的模型：config_name 指槽位、model 指槽位里具体那个上游模型。

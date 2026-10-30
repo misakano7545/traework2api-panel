@@ -64,10 +64,16 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流内空闲上限（持续吐数据不掐）；<=0 回落 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-		// UserAgent 出站 UA 覆盖；空 = 内置 "Trae/<client_version>"。
+		// UserAgent 出站 UA 覆盖；空 = 内置客户端 UA 家族
+		// （CN "…TraeCN/1.107.1 Chrome/…"，INTL "…Trae/1.107.1 Chrome/…"）。
 		UserAgent string `json:"user_agent"`
-		// ClientVersion Trae 客户端版本段（出站 UA 与 X-Ide-Version）；空 = 内置默认。
+		// ClientVersion Trae 客户端版本段（出站 UA 版本段与 X-Ide-Version）；空 = 内置默认
+		// （两区各自常量，见 internal/upstream/constants.go）。
 		ClientVersion string `json:"client_version"`
+		// DeviceBrand / OsVersion 出站 X-Device-Brand / X-OS-Version 覆盖。官方客户端这两个头
+		// 读的是真机；留空用内置兜底值（等于所有账号共用一台不存在的机器）。
+		DeviceBrand string `json:"device_brand"`
+		OsVersion   string `json:"os_version"`
 		// HostDiscovery 是否按 TNC 域名下发自动跟进 agent 基址（默认开，见
 		// internal/upstream/domains.go）。关掉 = 只用 agent_host / 内置常量。
 		HostDiscovery bool `json:"host_discovery"`

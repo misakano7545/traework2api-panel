@@ -58,7 +58,7 @@ func TestUgHeadersCompleteImpersonation(t *testing.T) {
 		"Package-Type":       "stable_cn",
 		"X-Lscbd-Aid":        "787976",
 		"X-Lscbd-Platform":   "windows",
-		"App-Version":        "0.1.45",
+		"App-Version":        IdeVersion,
 		"Vscode-Sessionid":   "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae",
 		"Sec-Fetch-Dest":     "empty",
 		"Sec-Fetch-Mode":     "no-cors",
@@ -77,17 +77,25 @@ func TestUgHeadersCompleteImpersonation(t *testing.T) {
 	}
 }
 
-// chat 路的伪装头**键集**必须钉住。判据：与 cpa-multi-plugins/trae 参考实现的
-// 对拍答案卷逐键交叉核对（2026-10-08）—— 键集完全一致，只有版本号/版本码是我们按
-// 自己的探针钉的（参考实现报 0.1.61/20260820，我们钉 20260811，见 constants.go 与
-// README「版本码矩阵」）。头是「能不能过」的开关：X-App-Version-Code 缺了上游直接
-// 4001（实测），X-Ide-Version-Code 又是模型表的放量开关 —— 少一个头是静默掉模型/掉通道。
+// chat 路的伪装头**键集**必须钉住。
+//
+// 口径：2026-10-30 对官方客户端（Trae CN 1.107.1，appVersion 3.4.11）Agent 模式的真请求
+// 抓包，见 constants.go / identity.go 的注释与 .reverse/agent_headers_cn_vs_intl.txt。
+// 与旧口径的差别：删了 X-Cloudide-Token / X-Uid（客户端对话链路不发），换成客户端的
+// 原生网络栈自证五件套 + ug 族 + trace 三件套。头是「像不像客户端」的开关：少一个不报错，
+// 但少得越多越像自建代理。
 func TestSOLOHeadersKeySet(t *testing.T) {
 	want := []string{
-		"Accept", "Authorization", "Content-Type", "Request-Traffic-Type", "User-Agent",
-		"X-App-Id", "X-App-Version", "X-App-Version-Code", "X-Cloudide-Token",
-		"X-Device-Brand", "X-Device-Id", "X-Device-Type", "X-Ide-Token", "X-Ide-Version",
-		"X-Ide-Version-Code", "X-Ide-Version-Type", "X-Machine-Id", "X-Os-Version", "X-Uid",
+		"Accept", "Authorization", "Content-Type", "Package-Type", "Request-Traffic-Type",
+		"Traceparent", "User-Agent",
+		"X-Agent-Host-Type", "X-Ahanet-Timeout", "X-App-Id", "X-App-Version", "X-App-Version-Code",
+		"X-Bridge-Transport", "X-Custom-Trace-Id",
+		"X-Device-Brand", "X-Device-Cpu", "X-Device-Id", "X-Device-Type",
+		"X-Flow-Traceparent", "X-Harness",
+		"X-Ide-Token", "X-Ide-Version", "X-Ide-Version-Code", "X-Ide-Version-Type",
+		"X-Lgw-Req-Sdk-Type", "X-Lscbd-Aid", "X-Lscbd-Platform",
+		"X-Machine-Id", "X-Os-Version",
+		"X-Request-Id", "X-Ss-Dp", "X-User-Region",
 	}
 	for _, stream := range []bool{true, false} {
 		req, _ := http.NewRequest(http.MethodPost, "https://api.trae.cn/x", nil)
@@ -101,21 +109,70 @@ func TestSOLOHeadersKeySet(t *testing.T) {
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Errorf("stream=%v 头集合不符\n got=%v\nwant=%v", stream, got, want)
 		}
-		// 头不能是空值：空 X-Device-Id / X-Uid 上游判「缺失」而不是「没有这个账号」。
+		// 头不能是空值：空 X-Device-Id 上游判「缺失」而不是「没有这个账号」。
 		for _, k := range want {
 			if req.Header.Get(k) == "" {
 				t.Errorf("stream=%v 头 %s 为空", stream, k)
 			}
 		}
-		accept := "application/json"
-		if stream {
-			accept = "text/event-stream"
-		}
-		if req.Header.Get("Accept") != accept {
-			t.Errorf("stream=%v Accept=%q", stream, req.Header.Get("Accept"))
+		// 客户端对两条路径都发 */*：流是靠 body.stream 决定的，不是 Accept 协商。
+		if got := req.Header.Get("Accept"); got != "*/*" {
+			t.Errorf("stream=%v Accept=%q want */*", stream, got)
 		}
 		if req.Header.Get("X-Ide-Version") != IdeVersion || req.Header.Get("X-Ide-Version-Code") != IdeVersionCode {
 			t.Errorf("版本头与常量不一致：%q/%q", req.Header.Get("X-Ide-Version"), req.Header.Get("X-Ide-Version-Code"))
+		}
+		// 国内版 x-app-version 发版本号（国际版才发 "default"）。
+		if got := req.Header.Get("X-App-Version"); got != IdeVersion {
+			t.Errorf("stream=%v X-App-Version=%q want %q", stream, got, IdeVersion)
+		}
+		// 客户端不发的那两个、以及会把明文 body 逼成密文的加密伴随头：一个都不能有。
+		// X-Request-Pin / X-Requested-At 带上去上游直接 400 base64 decode failed（实测）。
+		for _, k := range []string{"X-Cloudide-Token", "X-Uid", "X-Request-Pin", "X-Requested-At"} {
+			if req.Header.Get(k) != "" {
+				t.Errorf("stream=%v 不该发 %s", stream, k)
+			}
+		}
+	}
+}
+
+// 国际版头必须走另一套：x-app-version=default / stable_i18n / X-SS-DP=677332，
+// 且**不能**带国内的 x-user-region 与 x-lscbd-*（实测客户端没有这两个）。
+func TestSOLOHeadersIntlRealm(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://coresg-normal.trae.ai/x", nil)
+	SOLOHeaders(req, &auth.Auth{AccessToken: "JWT-ABC", Domain: "trae.ai", DeviceID: "d-1", MachineID: "m-1", UID: "u-1"}, true)
+
+	want := map[string]string{
+		"X-App-Version":      "default",
+		"X-App-Version-Code": IdeVersionCodeIntl,
+		"X-Ide-Version":      IdeVersionIntl,
+		"X-Ide-Version-Code": IdeVersionCodeIntl,
+		"Package-Type":       "stable_i18n",
+		"X-Ss-Dp":            "677332",
+	}
+	for k, v := range want {
+		if got := req.Header.Get(k); got != v {
+			t.Errorf("INTL 头 %s=%q want %q", k, got, v)
+		}
+	}
+	for _, k := range []string{"X-User-Region", "X-Lscbd-Aid", "X-Lscbd-Platform"} {
+		if got := req.Header.Get(k); got != "" {
+			t.Errorf("INTL 不该发 %s（实测客户端没有），得到 %q", k, got)
+		}
+	}
+	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "Trae/"+UABaseVersion) {
+		t.Errorf("INTL UA=%q 应含 Trae/%s", ua, UABaseVersion)
+	}
+}
+
+// 国内版 UA 必须是完整 Chromium 串（TraeCN/… 家族），不是 "Trae/<ver>"。
+func TestSOLOHeadersCNUserAgent(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://api5-normal.mchost.guru/x", nil)
+	SOLOHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1"}, true)
+	ua := req.Header.Get("User-Agent")
+	for _, frag := range []string{"Mozilla/5.0", "TraeCN/" + UABaseVersion, "Chrome/" + UAChromeVersion, "Electron/" + UAElectronVersion} {
+		if !strings.Contains(ua, frag) {
+			t.Errorf("UA=%q 缺片段 %q", ua, frag)
 		}
 	}
 }

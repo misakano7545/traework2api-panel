@@ -203,8 +203,9 @@ func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Cloud-IDE-JWT at" || gotUID != "u1" {
-		t.Errorf("headers: auth=%q uid=%q", gotAuth, gotUID)
+	// 客户端对话链路不发 X-Uid（实测），发了就是多一个特征。
+	if gotAuth != "Cloud-IDE-JWT at" || gotUID != "" {
+		t.Errorf("headers: auth=%q x-uid=%q（x-uid 应为空）", gotAuth, gotUID)
 	}
 	if gotAppID != AppID || gotIdeVer != IdeVersion {
 		t.Errorf("app headers: appid=%q idever=%q", gotAppID, gotIdeVer)
@@ -459,7 +460,7 @@ func TestWorkChannelIdentityFrozen(t *testing.T) {
 		wantModelPath = "/api/ide/v1/get_detail_param"
 		wantAppID     = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 		wantClientID  = "en1oxy7wnw8j9n"
-		wantVerCode   = "20260811"
+		wantVerCode   = "20260924"
 	)
 	if Function != wantFunction {
 		t.Errorf("function=%q want %q（换掉就是另一条产品线）", Function, wantFunction)

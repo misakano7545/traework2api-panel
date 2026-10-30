@@ -435,7 +435,8 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 | 版本码 | 模型表 | k3 的 `access.identity_list` | 结果 |
 |:--|:--|:--|:--|
 | `20260716`（旧） | 39 条 | `[2,3,100]` | 免费档被挡，请求回 `1005 plan:2` |
-| `20260811`（当前，见 `constants.go`） | 42 条 | `[0,5,1,2,3,100]` | 免费档**可用**，实测出流正常 |
+| `20260811` | 42 条 | `[0,5,1,2,3,100]` | 免费档**可用**，实测出流正常 |
+| `20260924`（当前，见 `constants.go`） | 48 条 | 同上 | 与 `20260811` 的模型名**逐字相同**，只是表变长（实测 2026-10-30） |
 | `20260814` / `20260821` / `20260927` / `20261231` | 42 条 | `[0,5,1,2,3,100]` | **与 `20260811` 逐字一致**（含故意超前的未来码） |
 
 - 可见集合在 `20260811` 换过一茬：多出 `kimi-k3` / `glm-5.3` / `step-5-preview` /
@@ -447,10 +448,36 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
   `log.snssdk.com/service/2/app_alert_check/` 实测只回 `{"message":"success"}`，取不到版本。
 - **冒充最新版能请求到模型，但没有收益**：用 `0.1.52 / 20260821` 的身份发 `kimi-k3` 拿到
   `HTTP 200` 出流，可模型表与门控跟 `20260811` 逐字一致；上游也不校验版本码（`1.0.0 / 20261231`
-  照收）。所以 `constants.go` 保持 `0.1.50 / 20260811`，不追官方版本号。
+  照收）。`constants.go` 现在跟官方客户端实测值走（`3.4.11 / 20260924`，2026-10-30 抓包），
+  理由只有一个：**身份指纹一致性**，不是功能需要。
 - 复跑矩阵（只读，6 个请求 + 一发 k3）：
   `TW2A_PROBE_VERCODE=1 go test ./internal/upstream -run TestProbeLiveVersionCode -v`
   —— 哪天阵容出现 `+`/`−` 变化，才需要动 `constants.go`（`TestWorkChannelIdentityFrozen` 会拦住改动）。
+
+### 出站请求头：以客户端抓包为准（2026-10-30）
+
+把两版客户端装在同一台机上，用本地 MITM（自签 CA + 系统代理）拦 Agent 模式的真请求，
+逐项对拍后改了 `headers.go` / `identity.go` / `constants.go`：
+
+| 面 | 客户端实测 | 旧实现 |
+|---|---|---|
+| User-Agent | `Mozilla/5.0 … TraeCN/1.107.1 Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36`（INTL 品牌段是 `Trae/`） | `Trae/0.1.50` |
+| `Accept` | `*/*`（流靠 body `stream:true`） | `text/event-stream` |
+| `x-app-version` | 国内 `3.4.11`；国际字面量 `default` | 恒 `default` |
+| `x-ide-version` | `3.4.11` / `3.6.4`（= product.json appVersion） | `0.1.50` / `1.0.2` |
+| `x-cloudide-token` / `x-uid` | **不发** | 发了 |
+| aha 五件套 | `x-harness:1` / `x-agent-host-type:0` / `x-bridge-transport:aha` / `x-lgw-req-sdk-type:3` / `package-type` | 缺 |
+| ug 族 | 国内 `stable_cn` + `x-lscbd-*` + `x-user-region:CN` + `X-SS-DP:787976`；国际 `stable_i18n` + `X-SS-DP:677332`（**无** lscbd / region） | 缺 |
+| trace | `x-custom-trace-id` + `traceparent`(00-) + `x-flow-traceparent`(04-) + `x-request-id: req_<uuid>` | 缺 |
+
+**坑（花了一次联调才定位）**：`x-request-pin` 与 `x-requested-at` 是客户端**加密载荷**的
+伴随头 —— 客户端发 `llm_utils_chat` 时 body 是 X-Medusa/X-Helios 包着的 base64 密文。
+本仓发明文 body，只要带上这两个里任意一个，上游立刻回
+`400 {"error":"x-request-pin or x-requested-at..."}`（逐头二分实测）。所以这两个头
+**必须不发**；`x-request-id` / `x-ahanet-timeout` 单独带没事。
+
+明文 body 本身不受影响：客户端风格头 + 明文 JSON 打 `api5-normal.mchost.guru` 实测 200 出 SSE 正文
+（`go test -tags wirecheck ./internal/upstream -run TestWireCheckLive -v`，需 `TW2A_CAP` 指向抓包 jsonl）。
 
 实测输出（2026-09-27；`可见` 是 13 还是 15 随 `qwen*` 灰度浮动）：
 
@@ -498,7 +525,7 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 
 | 面 | 国内版 | 国际版 |
 |---|---|---|
-| agent host（对话 / 模型表） | `api5-normal.mchost.guru`（2026-10-15 起；旧的 `trae-api-cn.mchost.guru` 仍活但已是遗留入口） | `a0ai-api-sg.byteintlapi.com` |
+| agent host（对话 / 模型表） | `api5-normal.mchost.guru`（2026-10-15 起；旧的 `trae-api-cn.mchost.guru` 仍活但已是遗留入口） | `coresg-normal.trae.ai`（2026-10-30 抓包更正；客户端逻辑域名，传输层 dispatch 到 `api5-normal-alisg.mchost.guru`。旧的 `a0ai-api-sg.byteintlapi.com` 仍活但已不是客户端在用的那台） |
 | OAuth host | `api.trae.com.cn` | 登录回调里的 `host` 参数（本次实测 `api-sg-central.trae.ai`） |
 | 登录页 | `www.trae.cn/authorization` | `www.trae.ai/authorization`（同参数集，`x_app_version=1.0.2`） |
 | 模型名 | `glm-5.2` / `kimi-k2.6` … | `gpt-5.2` / `gpt-5.4` / `kimi-k3`（`gpt-6-sol`/`gpt-6-luna` 见下） |
