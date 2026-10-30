@@ -129,8 +129,27 @@ func applyRealmHeaders(req *http.Request, realm string) {
 // 这套完整客户端伪装头 + 按 UID 确定性派生的伪设备身份后实测一次通过。
 // 参考 AiCheckin / trae-mate 的实现（派生算法测试向量已交叉验证）。
 
-// ugUA ug 族固定 UA：client 伪装要求，不跟随面板的运行期 UA 覆盖。
-const ugUA = "VSCode 1.107.1 (TRAE SOLO CN)"
+// ug 族 UA，按地区分。两者都是客户端实测值：
+//
+//	CN   "VSCode 1.107.1 (TRAE SOLO CN)"  ← 保留：9074 修复时靠这套头一次通过
+//	INTL "VSCode 1.107.1 (Trae)"
+//
+// 注：CN 客户端现在的 UA 其实是 "VSCode 1.107.1 (Trae CN)"（少个 TRAE 全大写、多 CN），
+// 但 9074 是设备维度的风控、claim 又是写操作，没有可靠复现就没必要动它。实测 checkin
+// status 两个 UA 都 200 且响应逐字一致（2026-10-30），说明鉴权层不按 UA 分支；
+// 真要动，先拿一个号验一遍 claim 再说。
+const (
+	ugUA     = "VSCode 1.107.1 (TRAE SOLO CN)" // 国内版（见上面注释，刻意不动）
+	ugUAIntl = "VSCode 1.107.1 (Trae)"         // 国际版，客户端实测
+)
+
+// ugUAFor 按地区取 ug 族 UA。
+func ugUAFor(realm string) string {
+	if realm == auth.RealmIntl {
+		return ugUAIntl
+	}
+	return ugUA
+}
 
 // traeDeviceIdentity 按 uid 确定性派生伪设备身份（trae-mate gen2 算法）：
 // 同一账号永远同一套标识，服务端按设备维度记账保持稳定。
@@ -192,44 +211,62 @@ func UGDeviceID(a *auth.Auth) string {
 	return dev
 }
 
-// UgHeaders 设置签到/积分（api.trae.cn）所需头：完整客户端伪装 + 派生设备身份。
+// UgHeaders 设置签到/积分（ug 族）所需头：完整客户端伪装 + 派生设备身份。
 //
-// ★ 已知差距（2026-10-30 抓包，尚未改）：国际版账号也走这个函数（见 client.go 的
-// ugBaseFor），但这里发的是国内那套 ug 头。国际客户端实测是另一套：
+// 两区的 ug 族头不同，2026-10-30 抓包实测（国际票据从客户端 Agent 抓包里捞的，
+// 不是 .trae/trae-jwt-token 那个静态文件 —— 那个在国际网关上是 401 code:1001）：
 //
-//	package-type: stable_i18n / X-SS-DP: 677332 / store-country-code(-src)
-//	且**没有** x-user-region 与 x-lscbd-*
+//	CN   api.trae.cn        v2 路径  stable_cn   + x-user-region:CN + x-lscbd-*
+//	     UA "VSCode 1.107.1 (Trae CN)"
+//	INTL growsg-normal      v1 路径  stable_i18n
+//	     UA "VSCode 1.107.1 (Trae)"
 //
-// 没直接切的原因：手上没有能通过 API 鉴权的国际票据（.trae/trae-jwt-token 在国际各家
-// agent/ug 网关上都是 401 code:1001），改了就无法验证「国际额度接口还能不能读」。
-// 等有一枚能用的国际 refresh token 时，按 realmOf(a) 分叉即可，测试在
-// TestUgHeadersIntlRealm（待补）。
+// 实测结论：**两区 ug 接口都不按这些头分支**（拿国内头打国际网关、拿国际头打国内网关
+// 都是 200，响应逐字一致）。分叉的理由是身份一致性，不是功能必需。
+//
+// 刻意不发的两个（客户端会发，但本仓没有数据源）：
+//   - x-user-region：国际版客户端发 SG，但那是账号所在区（US/SG/…），登录回调与
+//     auth 文件里都没有这个字段，硬编码等于给所有国际号贴同一个区。
+//   - store-country-code(-src)：同理，客户端发 kr 是账号国家，编不出来。
+//
+// 缺了不影响鉴权（见上一条实测），发错了才是明确的错误信号。
 func UgHeaders(req *http.Request, a *auth.Auth) {
+	realm := realmOf(a)
 	dev, market, sess := traeDeviceIdentity(a.UID, a.DeviceSeedValue())
 	h := req.Header
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "*/*")
-	h.Set("User-Agent", ugUA)
+	h.Set("User-Agent", ugUAFor(realm))
 	h.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
 	h.Set("X-Market-Client-Id", "VSCode 1.107.1")
 	h.Set("X-Market-User-Id", market)
-	h.Set("X-User-Region", "CN")
 	h.Set("X-Device-Id", dev)
 	h.Set("X-Lgw-Req-Sdk-Type", "3")
-	h.Set("Package-Type", "stable_cn")
-	h.Set("X-Lscbd-Aid", "787976")
-	h.Set("X-Lscbd-Platform", "windows")
-	// App-Version 跟客户端对齐：2026-10-30 抓包实测 api.trae.cn 上发的是 3.4.11
-	// （旧值 0.1.45 是历史遗留，已经落后好几个季度）。
-	h.Set("App-Version", currentIdeVersionFor(auth.RealmCN))
 	h.Set("X-Tt-Trace-Id", "00-"+ugRandHex(8)+"-01")
 	h.Set("Vscode-Sessionid", sess)
 	h.Set("Sec-Fetch-Dest", "empty")
 	h.Set("Sec-Fetch-Mode", "no-cors")
 	h.Set("Sec-Fetch-Site", "none")
 	h.Set("X-Request-Id", ugUUIDv4())
+	applyUgRealmHeaders(h, realm)
 	// ponytail: 不带 accept-encoding —— Go transport 自动加 gzip 并透明解压，
 	// 手动设置反而会关掉自动解压（参考实现里的显式 gzip 行故意省略）。
+}
+
+// applyUgRealmHeaders 两区 ug 族各自独有的头。
+func applyUgRealmHeaders(h http.Header, realm string) {
+	if realm == auth.RealmIntl {
+		h.Set("Package-Type", "stable_i18n")
+		h.Set("App-Version", currentIdeVersionFor(realm)) // 3.6.4
+		return
+	}
+	h.Set("Package-Type", "stable_cn")
+	h.Set("X-User-Region", "CN")
+	h.Set("X-Lscbd-Aid", "787976")
+	h.Set("X-Lscbd-Platform", "windows")
+	// App-Version 跟客户端对齐：2026-10-30 抓包实测 api.trae.cn 上发的是 3.4.11
+	// （旧值 0.1.45 是历史遗留，已经落后好几个季度）。
+	h.Set("App-Version", currentIdeVersionFor(realm))
 }
 
 // OAuthHeaders 设置 ExchangeToken / GetUserInfo 所需头（无签名，仅 UA）。

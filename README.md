@@ -479,6 +479,45 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 明文 body 本身不受影响：客户端风格头 + 明文 JSON 打 `api5-normal.mchost.guru` 实测 200 出 SSE 正文
 （`go test -tags wirecheck ./internal/upstream -run TestWireCheckLive -v`，需 `TW2A_CAP` 指向抓包 jsonl）。
 
+### ug 族（签到 / 积分 / 额度）也分地区
+
+`UgHeaders` 原先对国际账号发的是国内那套头，2026-10-30 补上了分叉。两区实测差异：
+
+| 面 | 国内（`api.trae.cn`，v2 路径） | 国际（`growsg-normal.trae.ai`，v1 路径） |
+|---|---|---|
+| `package-type` | `stable_cn` | `stable_i18n` |
+| `app-version` | `3.4.11` | `3.6.4` |
+| `user-agent` | `VSCode 1.107.1 (Trae CN)` | `VSCode 1.107.1 (Trae)` |
+| `x-user-region` | `CN` | 客户端发 `SG`，但那是**账号所在区**（US/SG/…），本仓无数据源 → **不发** |
+| `x-lscbd-aid` / `-platform` | `787976` / `windows` | **不发** |
+| `store-country-code(-src)` | 不发 | 客户端发 `kr` / `uid`，同样是账号属性 → **不发** |
+| `x-market-user-id` / `x-device-id` | 按 UID 派生的伪身份（**两区一致，不动**） | 同左 |
+
+**关键实测**：两区 ug 接口都**不按这些头分支** —— 拿国内头打国际网关、拿国际头打国内网关
+都是 `200` 且响应逐字一致。所以分叉是为了身份一致性，不是功能必需；缺 `x-user-region` /
+`store-country-code` 也不影响鉴权（发错了才是明确的错误信号）。
+
+国内版 UA 里那个 `(TRAE SOLO CN)` 是唯一**故意没动**的旧值：客户端现在是 `(Trae CN)`，
+但 9074 是设备维度的风控、`claim` 又是写操作，没有可靠复现就不碰。实测 `checkin/status`
+两个 UA 都 200 且响应一致，说明鉴权层不按 UA 分支；真要改，先拿一个号验 `claim`。
+
+双区联调：
+
+```bash
+TW2A_CAP=<CN抓包jsonl> TW2A_CAP_INTL=<国际抓包jsonl> \
+  go test -tags wirecheck ./internal/upstream -run TestUgHeadersLive -v
+```
+
+实测输出（2026-10-30）：
+
+```
+INTL ent_usage v1: status=200 code=0 dollar=true 套餐数=1
+CN  checkin status: status=200 {"checked_in":true,"code":0,"credits":100,...,"message":"success"}
+```
+
+`UgHostIntl` 保留 `api-sg-central.trae.ai`（与登录回调的 ApiHost 同域）；客户端自己打的是
+`growsg-normal.trae.ai`，两台实测都 200 且响应一致，所以没有硬切。
+
 实测输出（2026-09-27；`可见` 是 13 还是 15 随 `qwen*` 灰度浮动）：
 
 ```

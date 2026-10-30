@@ -116,6 +116,12 @@ const (
 	AgentHostIntl = "https://coresg-normal.trae.ai"
 	// UgHostIntl 国际版的 UG/计费网关（api.trae.cn 的国际对应物）。账号的 ApiHost
 	// （登录回调 host）优先；老账号没有这个字段时回落到这里。
+	//
+	// 2026-10-30 抓包实测：国际客户端自己的 ug 请求打的是 growsg-normal.trae.ai。
+	// 本常量保留 api-sg-central.trae.ai 是因为实测**两台都能路由**（拿同一枚票据、
+	// 同一套头打 /trae/api/v1/pay/ide_user_ent_usage，两边都 200 且响应逐字一致），
+	// 而 api-sg-central 与登录回调给出的 ApiHost 同域，老账号回落时更稳。
+	// 要完全贴客户端就换成 https://growsg-normal.trae.ai。
 	UgHostIntl = "https://api-sg-central.trae.ai"
 	// DefaultConfigNameIntl 国际版的旗舰/默认模型（别名与空 model 都落到它）。
 	DefaultConfigNameIntl = "gpt-5.2"

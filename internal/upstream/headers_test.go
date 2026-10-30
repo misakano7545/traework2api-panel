@@ -77,6 +77,35 @@ func TestUgHeadersCompleteImpersonation(t *testing.T) {
 	}
 }
 
+// 国际账号的 ug 族头必须走另一套：stable_i18n + 3.6.4 + Trae 品牌 UA，
+// 且**不能**带国内的 x-user-region / x-lscbd-*（实测客户端不发，硬编码等于贴错区）。
+func TestUgHeadersIntlRealm(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://growsg-normal.trae.ai/x", nil)
+	UgHeaders(req, &auth.Auth{AccessToken: "at", Domain: "trae.ai", UID: "1234567890123456"})
+
+	want := map[string]string{
+		"Package-Type":     "stable_i18n",
+		"App-Version":      IdeVersionIntl,
+		"User-Agent":       "VSCode 1.107.1 (Trae)",
+		"X-Market-User-Id": "746608f9-7f37-4960-b4c7-8553cec6d366",
+		"X-Device-Id":      "413174708280782",
+	}
+	for k, v := range want {
+		if got := req.Header.Get(k); got != v {
+			t.Errorf("INTL ug 头 %s=%q want %q", k, got, v)
+		}
+	}
+	for _, k := range []string{"X-User-Region", "X-Lscbd-Aid", "X-Lscbd-Platform"} {
+		if got := req.Header.Get(k); got != "" {
+			t.Errorf("INTL ug 不该发 %s，得到 %q", k, got)
+		}
+	}
+	// 派生设备身份必须两区一致（同 uid 同 seed 同结果）—— 换了就是换指纹，不是分地区。
+	if got := req.Header.Get("X-Device-Id"); got != "413174708280782" {
+		t.Errorf("派生身份被地区污染了：%q", got)
+	}
+}
+
 // chat 路的伪装头**键集**必须钉住。
 //
 // 口径：2026-10-30 对官方客户端（Trae CN 1.107.1，appVersion 3.4.11）Agent 模式的真请求
