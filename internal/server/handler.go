@@ -981,9 +981,10 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 
 	if peek.Stream {
 		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 截断自动续写（见 upstream/continue.go）：SOLO 32000 硬截断（done 仍报 stop）
-		// 时同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流；
-		// 续写失败/显式限额/工具分片 → 自动降级为旧行为（截断终态）。
+		// 截断自动续写（见 upstream/continue.go）：SOLO 按模型的输出硬截断（glm-5.3
+		// 16000 / deepseek 32000，done 仍报 stop）时同账号同模型补发「已输出内容+续写
+		// 指令」，多段拼成一条客户端可见流；续写失败/显式限额小于 cap/工具分片 → 自动
+		// 降级为旧行为（截断终态）。
 		cont := upstream.NewContinueReader(h.cfg.Upstream, acct, body, rc)
 		// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
 		streamErr := false

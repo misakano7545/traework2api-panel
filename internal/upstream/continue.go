@@ -1,18 +1,23 @@
 // continue.go 上游截断自动续写（SOLO 版）：同一账号同一模型，把多段上游流
 // 拼成一条客户端可见的连续 SSE。
 //
-// 背景：SOLO 对单次响应有 32000 输出 token 的硬上限（实测 cn:deepseek-v4.1-flash
-// 在 32000 处截断，但 done 事件仍报 finish_reason:"stop"——截断信号被上游伪装），
-// Codex 这类不带输出限额的客户端写大文件/长分析会在半途被截而毫无察觉。
+// 背景：SOLO 对单次响应有输出 token 硬上限，且**按模型不同**（实测 cn:deepseek-v4.1-flash
+// 在 32000 处截断、glm-5.3 在 16000 处截断；两者 done 事件都仍报 finish_reason:"stop"
+// ——截断信号被上游伪装），Codex 这类不带输出限额的客户端写大文件/长分析会在半途被截
+// 而毫无察觉。
 //
 // 这里挂在 SOLO 帧层（StreamWithError 之下、上游 body 之上）：识别「截断特征」
-// （token_usage.completion_tokens >= soloCutCap 且正常 stop 收尾/静默 EOF）后，
+// （token_usage.completion_tokens >= 该模型 cap 且正常 stop 收尾/静默 EOF）后，
 // 用「已输出内容作 assistant + 续写指令」补发同模型请求（实测：模型从中断处
 // 无缝接续），后续事件直接接进同一条流；本段的 done 被吞、usage 跨段合成为
 // 累计值、客户端只看到一次连续输出。
 //
-// ponytail: 只续纯文本段（有 tool_calls 分片不续——残缺参数拼接风险大）；每请求
-// 最多 maxContinueSegments 段；客户端显式限额（max_tokens 等）不续（尊重意图）。
+// ponytail: 只续纯文本段（有 tool_calls 分片不续——残缺参数拼接风险大）；每请求段数
+// 无显式限额时取 maxContinueSegments，显式限额 ≥ cap 时按 ceil(限额/cap) 扩容
+// （硬顶 maxContinueSegmentsHard）；显式限额只在**小于**该模型 cap 时才视为「尊重意图」
+// 不续——客户端 max_completion_tokens=128000 这类「上限而非目标」的声明不该把续写关掉
+// （实测 2026-10-31：ZCode 按 128k 请求、glm-5.3 在 16000 截断，续写被双重挡住）；
+// 限额 ≥ cap 时续写照常，但跨段累计到限额即止，不越客户端的权。
 package upstream
 
 import (
@@ -26,16 +31,54 @@ import (
 )
 
 const (
-	// soloCutCap SOLO 单次输出的 32000 token 上限（实测 2026-10-02）。kimi 等其他
-	// 模型是否同值待验；用 >= 判定，上游将来抬高上限时本特性自动静默。
-	soloCutCap = 32000
+	// soloCutCapDefault 单次输出硬上限的默认值（实测 2026-10-02，cn:deepseek-v4.1-flash）。
+	// 上游按模型区分这个值，查不到的模型回落默认；用 >= 判定，上游将来抬高上限时本特性
+	// 自动静默。
+	soloCutCapDefault = 32000
 
-	// maxContinueSegments 单请求最多上游段数（1 段原生 + 最多 2 次续写），防失控级联。
+	// maxContinueSegments 单请求最多上游段数的默认值（1 段原生 + 最多 2 次续写），防失控级联。
 	maxContinueSegments = 3
+
+	// maxContinueSegmentsHard 显式限额扩容段数的硬顶。限额再大也不无限级联：
+	// 每次续写都整段重发对话+已输出内容，段数越大输入成本与失败面越大。
+	maxContinueSegmentsHard = 8
 
 	// continueNudge 续写指令：线上实测该措辞能让模型从断点无缝接续（不重头、不道歉）。
 	continueNudge = "你上一条回复因达到输出长度上限被截断。请从中断处继续输出剩余内容；不要重复已输出过的部分，不要道歉或解释，直接继续。"
 )
+
+// soloCutCaps 按模型实测的单次输出硬上限。键用出站体的裸模型 ID（config_name 口径，
+// 带 `__dev`/`__max` 变体后缀的会剥后缀再查）；实测值变动时更新此处。
+var soloCutCaps = map[string]int{
+	"glm-5.3": 16000, // 实测 2026-10-31：done 仍报 stop，completion 恰停在 16000
+}
+
+// cutCapFor 出站请求体 → 该模型的单次输出硬上限。出站体 model 是变体名
+// （glm-5.3__max）、config_name 是裸 ID（见 client.go 出站实测注释），两个键都试、
+// 变体名再剥 `__` 后缀兜底；都查不到回落 soloCutCapDefault。解析失败同样回落默认
+// （与旧行为一致：宁可漏判截断，不可凭空续写）。
+func cutCapFor(body []byte) int {
+	var obj struct {
+		Model      string `json:"model"`
+		ConfigName string `json:"config_name"`
+	}
+	if json.Unmarshal(body, &obj) != nil {
+		return soloCutCapDefault
+	}
+	keys := []string{obj.ConfigName, obj.Model}
+	if i := strings.Index(obj.Model, "__"); i > 0 {
+		keys = append(keys, obj.Model[:i])
+	}
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if cap, ok := soloCutCaps[k]; ok {
+			return cap
+		}
+	}
+	return soloCutCapDefault
+}
 
 // ContinueReader 读 SOLO SSE 并做事件级续写拼接。上层（StreamWithError/
 // Aggregate 消费方）看到的永远是「一条完整且恰好一个 done 的流」。
@@ -48,8 +91,10 @@ type ContinueReader struct {
 	br  *bufio.Reader
 	out []byte
 
-	seg      int
-	limitSet bool
+	seg       int
+	limitTok  int64 // 客户端显式输出限额（min(max_tokens, max_completion_tokens, max_output_tokens)）；-1 = 未设
+	cutCap    int   // 本模型的单次输出硬上限（soloCutCaps / soloCutCapDefault）
+	segBudget int   // 本请求允许的上游段数（continueSegBudget 算好存住，段间不重算）
 
 	// 事件组装（对齐 solosse 的 event:/data: 跨行累积）。
 	evEvent string
@@ -74,22 +119,66 @@ type ContinueReader struct {
 func NewContinueReader(c *Client, a *auth.Auth, body []byte, rc io.ReadCloser) *ContinueReader {
 	r := &ContinueReader{c: c, acct: a, body: body, cur: rc}
 	r.br = bufio.NewReaderSize(rc, 64*1024)
-	r.limitSet = bodyHasOutputLimit(body)
+	r.cutCap = cutCapFor(body)
+	if limit, ok := bodyOutputLimit(body); ok {
+		r.limitTok = limit
+	} else {
+		r.limitTok = -1
+	}
+	r.segBudget = continueSegBudget(r.limitTok, r.cutCap)
 	return r
 }
 
-// bodyHasOutputLimit 请求体显式带输出限额则尊重之，不续写。解析失败按有限额处理。
-func bodyHasOutputLimit(body []byte) bool {
+// bodyOutputLimit 请求体的显式输出限额（三个常见字段取最小在场值）。ok=false 表示
+// 未设限额。解析失败按「已设 0」保守处理（0 < 任何 cap → 不续写，与旧的
+// bodyHasOutputLimit 行为一致）；字段在场但值非正数同样按 0 处理——客户端声明
+// max_tokens=0/负值不是「想要完整输出」，是坏参数，不替它扩权。
+func bodyOutputLimit(body []byte) (int64, bool) {
 	var obj map[string]any
 	if json.Unmarshal(body, &obj) != nil {
-		return true
+		return 0, true
 	}
+	found := false
+	minTok := int64(0)
 	for _, k := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-		if v, ok := obj[k]; ok && v != nil {
-			return true
+		v, ok := obj[k]
+		if !ok || v == nil {
+			continue
 		}
+		tok := int64(0)
+		if f, ok := v.(float64); ok && f > 0 {
+			tok = int64(f)
+		}
+		if !found || tok < minTok {
+			minTok = tok
+		}
+		found = true
 	}
-	return false
+	if !found {
+		return 0, false
+	}
+	return minTok, true
+}
+
+// continueSegBudget 本请求允许的上游段数。无显式限额（limitTok<0）或限额比 cap 还小
+// （续写本来就不成立）→ 默认 maxContinueSegments；限额 ≥ cap → 按 ceil(limit/cap)
+// 扩容（下限仍是默认值，硬顶 maxContinueSegmentsHard）——让「客户端要 128k」的请求
+// 真能续到接近它的意图，同时保住防失控级联的上限。
+func continueSegBudget(limitTok int64, cutCap int) int {
+	if limitTok < 0 || limitTok < int64(cutCap) {
+		return maxContinueSegments
+	}
+	segs := int(limitTok) / cutCap
+	if int64(segs*cutCap) < limitTok {
+		segs++
+	}
+	if segs < maxContinueSegments {
+		segs = maxContinueSegments
+	}
+	if segs > maxContinueSegmentsHard {
+		segs = maxContinueSegmentsHard
+	}
+	return segs
 }
 
 func (r *ContinueReader) Read(p []byte) (int, error) {
@@ -246,19 +335,33 @@ func (r *ContinueReader) endSegment(sawDone bool) {
 	r.done = true
 }
 
-// canContinue 续写资格：本段真的撞了 cap（completion >= 32000）且是纯文本段。
+// canContinue 续写资格：本段真的撞了**该模型**的 cap（completion >= cutCap）且是
+// 纯文本段，且没有违背客户端的显式限额——限额比 cap 还小（客户端本来就不想要更多）
+// 不续；限额 ≥ cap 时续写照常，但跨段累计到限额即止（再续就越了客户端的权）。
 func (r *ContinueReader) canContinue() bool {
 	switch {
-	case r.seg >= maxContinueSegments-1:
+	case r.seg >= r.segBudget-1:
 		return false
-	case r.errSeen || r.toolSeen || r.limitSet:
+	case r.errSeen || r.toolSeen:
 		return false
 	case r.text.Len() == 0:
 		return false
-	case r.segTok < soloCutCap:
+	case r.segTok < float64(r.cutCap):
 		return false
+	case r.limitTok >= 0:
+		if r.limitTok < int64(r.cutCap) || r.cumTok() >= float64(r.limitTok) {
+			return false
+		}
 	}
 	return true
+}
+
+// cumTok 跨段累计的 completion_tokens（usage 合并帧口径，与记账同源）。
+func (r *ContinueReader) cumTok() float64 {
+	if v, ok := r.usage["completion_tokens"].(float64); ok {
+		return v
+	}
+	return 0
 }
 
 // switchSegment 用「已输出内容 + 续写指令」补发同模型请求；成功则换段并清本段判定位。
