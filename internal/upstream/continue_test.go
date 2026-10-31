@@ -225,6 +225,113 @@ func TestContinueReaderCapTolerance(t *testing.T) {
 	}
 }
 
+// TestContinueReaderPerModelCap 输出硬上限按模型区分：glm-5.3 实测 16000（done 仍报
+// stop），16000 必须判截断并续写；同值落在默认 cap（32000）的模型上则不判截断。
+// 变体名（glm-5.3__max）与裸 config_name 两条键都要能查到。
+func TestContinueReaderPerModelCap(t *testing.T) {
+	seg53 := strings.Replace(soloCutSeg, `"completion_tokens":32000`, `"completion_tokens":16000`, 1)
+	cases := []struct {
+		name       string
+		body       string
+		wantReqs   int
+		wantReason string
+	}{
+		{"裸名 glm-5.3", `{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`, 1, "16000=cap 应续写"},
+		{"变体名 glm-5.3__max", `{"model":"glm-5.3__max","messages":[{"role":"user","content":"hi"}]}`, 1, "剥后缀后=cap 应续写"},
+		{"config_name 兜底", `{"config_name":"glm-5.3","model":"","messages":[]}`, 1, "裸 ID 键应命中"},
+		{"默认 cap 模型 16000 不续", `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`, 0, "16000 < 32000 非截断"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+			r := newTestContinueReader(t, c, tc.body, io.NopCloser(strings.NewReader(seg53)))
+			if _, err := io.ReadAll(r); err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if len(*reqs) != tc.wantReqs {
+				t.Fatalf("续写请求数=%d want %d（%s）", len(*reqs), tc.wantReqs, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestContinueReaderExplicitLimitAboveCapContinues 显式限额 ≥ cap 是「上限而非目标」：
+// max_completion_tokens=128000 的客户端（如 ZCode 按 128k 请求）不该因这个字段被关掉
+// 续写——它在 16000/32000 处被截断并不是它想要的。
+func TestContinueReaderExplicitLimitAboveCapContinues(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c,
+		`{"model":"glm-5.2","max_completion_tokens":128000,"messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(soloCutSeg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("续写请求数=%d want 1（限额 ≥ cap 应续写）", len(*reqs))
+	}
+	if !strings.Contains(string(out), "继续") {
+		t.Fatalf("续写段正文应在场:\n%s", out)
+	}
+}
+
+// TestContinueReaderCumulativeLimitStops 限额 ≥ cap 时续写照常，但跨段累计到限额即止：
+// max_tokens=64000 → 首段 32000（<64000，续）→ 段 2 再 32000（累计 64000 ≥ 64000，止）。
+func TestContinueReaderCumulativeLimitStops(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloCutSeg })
+	r := newTestContinueReader(t, c,
+		`{"model":"glm-5.2","max_tokens":64000,"messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(soloCutSeg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	if len(*reqs) != 1 {
+		t.Fatalf("续写请求数=%d want 1（累计 64000 已到限额）", len(*reqs))
+	}
+	if strings.Count(s, "event:done") != 1 {
+		t.Fatalf("到限额止后应有且仅有一个 done:\n%s", s)
+	}
+	if last := lastUsageLine(t, s); last["completion_tokens"] != float64(64000) {
+		t.Fatalf("累计 usage=%v want completion=64000", last)
+	}
+}
+
+// TestContinueReaderSegBudgetHardCap 段数随限额扩容但有硬顶：max_tokens=256000 /
+// cap 32000 → ceil=8 → 段数硬顶 8（1 原生 + 7 续写），到第 8 段累计恰 256000 也到限额。
+func TestContinueReaderSegBudgetHardCap(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloCutSeg })
+	r := newTestContinueReader(t, c,
+		`{"model":"glm-5.2","max_tokens":256000,"messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(soloCutSeg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != maxContinueSegmentsHard-1 {
+		t.Fatalf("续写请求数=%d want %d（扩容硬顶）", len(*reqs), maxContinueSegmentsHard-1)
+	}
+	if strings.Count(string(out), "event:done") != 1 {
+		t.Fatalf("封顶后应有且仅有一个 done:\n%s", out)
+	}
+}
+
+// TestContinueReaderExplicitLimitBelowCapStillRespected 限额 < cap 的旧行为保持：
+// max_tokens=4096 的客户端确实只想要这么多，截断在它眼里就是终点，不续。
+func TestContinueReaderExplicitLimitBelowCapStillRespected(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c,
+		`{"model":"glm-5.2","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(soloCutSeg)))
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("续写请求数=%d want 0（限额 < cap 尊重意图）", len(*reqs))
+	}
+}
+
 // lastUsageLine 取输出里最后一条 token_usage 的载荷。
 func lastUsageLine(t *testing.T, s string) map[string]any {
 	t.Helper()
