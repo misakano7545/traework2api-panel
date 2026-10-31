@@ -23,16 +23,24 @@ func installCatalog(t *testing.T, models ...upstream.ModelInfo) {
 	maxVariantByModel := map[string]string{}
 	paidOnlyByModel := map[string]bool{}
 	for _, m := range models {
-		realmByModel[m.ID] = auth.RealmCN
-		fnByModel[m.ID] = m.Function
+		// 缓存键是「地区/模型」：同名模型两个地区各有一条，裸名会互相覆盖。
+		realm := m.Realm
+		if realm == "" {
+			realm = auth.RealmCN
+		}
+		key := realm + "/" + m.ID
+		if _, ok := realmByModel[m.ID]; !ok {
+			realmByModel[m.ID] = realm // 裸名归属只记先到的（与 fetchDynamicModels 一致）
+		}
+		fnByModel[key] = m.Function
 		if m.PickOnly {
-			pickOnlyByModel[m.ID] = true
+			pickOnlyByModel[key] = true
 		}
 		if m.PaidOnly {
-			paidOnlyByModel[auth.RealmCN+"/"+m.ID] = true
+			paidOnlyByModel[key] = true
 		}
 		if m.MaxAvailable() {
-			maxVariantByModel[m.ID] = m.MaxModelName
+			maxVariantByModel[key] = m.MaxModelName
 		}
 	}
 	dynamicModelsCache.Lock()
@@ -48,9 +56,13 @@ func installCatalog(t *testing.T, models ...upstream.ModelInfo) {
 	t.Cleanup(func() {
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.ids = nil
+		dynamicModelsCache.realmByModel = nil
+		dynamicModelsCache.fnByModel = nil
+		dynamicModelsCache.pickOnlyByModel = nil
 		dynamicModelsCache.maxVariantByModel = nil
 		dynamicModelsCache.paidOnlyByModel = nil
 		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
 		dynamicModelsCache.Unlock()
 	})
 }

@@ -558,6 +558,11 @@ type ModelInfo struct {
 	// 所以这里只存**读到的原值**，取不到就是空串，绝不猜。见 variantNames。
 	DevModelName string
 	MaxModelName string
+
+	// Realm 该条目来自哪个地区（cn / intl）。由调用方（server.fetchDynamicModels）填，
+	// 不在这里推断：同一个模型名在**两个地区都有**时（deepseek-v4.1-flash /
+	// minimax-m2.7 / kimi-k2.5 …），裸名已经不足以标识一条条目。
+	Realm string
 }
 
 // MaxAvailable 这个模型有没有「更大的 Max 窗口」。

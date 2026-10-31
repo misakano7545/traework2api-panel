@@ -169,3 +169,61 @@ func TestFetchDynamicModelsRealmPrefix(t *testing.T) {
 		t.Fatalf("gpt-5.2 归属 = %q，重试拿到的国际模型应记为 %q", realm, auth.RealmIntl)
 	}
 }
+
+// TestSameModelKeptInBothRealms：同名模型在两个地区各留一条。
+//
+// 现场：deepseek-v4.1-flash / minimax-m2.7 / kimi-k2.5 在两个地区的上游表里都存在，
+// 但按裸名去重只留先到的（国内 UID 更小，所以永远先到）⇒ intl 版这三个从
+// /v1/models 彻底消失，客户端能选、代理没有。
+func TestSameModelKeptInBothRealms(t *testing.T) {
+	resetModelCache(t)
+
+	// 两个地区都提供同名模型：按 UID 升序 cn 先到（正是现场的失败形态）。
+	p := testPoolWith(
+		&auth.Auth{UID: "c1-cn", AccessToken: "at-cn", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "i1-intl", AccessToken: "at-intl", ExpiresAt: 9999999999, Domain: "www.trae.ai"},
+	)
+	up := sameModelUpstream(t)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	models := h.fetchDynamicModels()
+	realms := map[string]string{}
+	for _, m := range models {
+		realms[m.Realm+":"+m.ID] = ""
+	}
+	t.Logf("条目 = %v", realms)
+
+	if _, ok := realms[auth.RealmCN+":shared-model"]; !ok {
+		t.Fatalf("国内版同名模型缺失: %v", realms)
+	}
+	if _, ok := realms[auth.RealmIntl+":shared-model"]; !ok {
+		t.Fatalf("国际版同名模型被裸名去重吃掉（客户端能选、代理没有）: %v", realms)
+	}
+}
+
+// sameModelUpstream 两个地区各回一条**同名**模型。
+func sameModelUpstream(t *testing.T) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, upstream.EpModelsBatch) {
+				return &http.Response{
+					StatusCode: 500,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":500}`)),
+				}, nil
+			}
+			// 两个地区都返回同名模型 shared-model，仅展示名不同。
+			body := modelProbeBody("shared-model", "Shared Model")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+}

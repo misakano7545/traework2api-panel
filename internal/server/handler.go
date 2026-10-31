@@ -377,7 +377,8 @@ func (h *Handler) modelList() []map[string]any {
 		for _, mi := range infos {
 			// realm 前缀是网关路由协议（见 resolve_model.go）：两侧都带前缀，
 			// 客户端把 id 原样回传就带上了地区，不用猜。
-			realm := h.modelRealm(mi.ID)
+			// 地区取自条目自身：同名模型两个地区各有一条，裸名反查会混。
+			realm := mi.Realm
 			if realm == "" {
 				realm = auth.RealmCN
 			}
@@ -496,26 +497,34 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		}
 		done[realm] = true
 		for _, mi := range infos {
-			// 订阅专享按「地区/模型」登记，且必须记在同名去重之前——否则被去重掉的那个地区
-			// 的付费身份就丢了，客户端显式带前缀（intl:glm-5.2）时照样会被放过、拿 1005 罚号。
+			// 订阅专享按「地区/模型」登记：同名模型两个地区档位可以不同
+			// （intl:glm-5.2 要订阅、cn:glm-5.2 免费）。
 			if mi.PaidOnly {
 				paidOnlyByModel[realm+"/"+mi.ID] = true
 			}
-			// 两个地区同名的（如 kimi-k3）只留先到的那个：名字一样，调用哪个号都能出。
-			if seen[mi.ID] {
+			// 同名模型在两个地区**都可能存在，且不是同一个东西**（deepseek-v4.1-flash /
+			// minimax-m2.7 / kimi-k2.5 …）。按裸名去重会把后到的地区整份吃掉：实测 intl
+			// 版这三个模型因此从 /v1/models 彻底消失（客户端能选、代理没有）。
+			// 所以每个 (地区, 模型) 各留一条，地区随条目自己走（ModelInfo.Realm）。
+			key := realm + "/" + mi.ID
+			if seen[key] {
 				continue
 			}
-			seen[mi.ID] = true
+			seen[key] = true
+			mi.Realm = realm
 			merged = append(merged, mi)
-			realmByModel[mi.ID] = realm
-			fnByModel[mi.ID] = mi.Function
+			// 裸名归属只记先到的那个，给「不带前缀」的请求兜底（老客户端零回归）。
+			if _, ok := realmByModel[mi.ID]; !ok {
+				realmByModel[mi.ID] = realm
+			}
+			fnByModel[key] = mi.Function
 			if mi.PickOnly {
-				pickOnlyByModel[mi.ID] = true
+				pickOnlyByModel[key] = true
 			}
 			// 只登记「真有更大窗口」的：max_available=false 的模型进不了这张表，
 			// 客户端就算发了 max_context 也只会被如实忽略（不会发一个上游认不出的名字）。
 			if mi.MaxAvailable() {
-				maxVariantByModel[mi.ID] = mi.MaxModelName
+				maxVariantByModel[key] = mi.MaxModelName
 			}
 		}
 	}
@@ -545,10 +554,10 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 // modelRealm 该模型归属的地区；未知返回空（= 不限制选号，交给上游判）。
 // modelPickOnly 该模型是不是「只在客户端批量视图里可见」（聊天配置表没有它）。
 // 是的话出站必须去掉 config_name：传了上游回 4001。
-func (h *Handler) modelPickOnly(model string) bool {
+func (h *Handler) modelPickOnly(realm, model string) bool {
 	dynamicModelsCache.RLock()
 	defer dynamicModelsCache.RUnlock()
-	return dynamicModelsCache.pickOnlyByModel[model]
+	return dynamicModelsCache.pickOnlyByModel[realm+"/"+model]
 }
 
 func (h *Handler) modelRealm(model string) string {
@@ -558,20 +567,20 @@ func (h *Handler) modelRealm(model string) string {
 }
 
 // modelFunction 该模型属于哪条出站通道（solo_work_lite / solo_coder）；未知返回空（用默认）。
-func (h *Handler) modelFunction(model string) string {
+func (h *Handler) modelFunction(realm, model string) string {
 	dynamicModelsCache.RLock()
 	defer dynamicModelsCache.RUnlock()
-	return dynamicModelsCache.fnByModel[model]
+	return dynamicModelsCache.fnByModel[realm+"/"+model]
 }
 
 // modelMaxVariant 该模型的 Max 变体名（形如 "glm-5.2__max"）；没有更大窗口时返回空。
 //
 // 返回的是**上游表里的原值**，不是拼出来的——全表 417 条变体名里 99 条不满足 ID+后缀
 // （见 upstream.variantNames 的实测说明）。取不到就是空，调用方按「该模型没有 Max」处理。
-func (h *Handler) modelMaxVariant(model string) string {
+func (h *Handler) modelMaxVariant(realm, model string) string {
 	dynamicModelsCache.RLock()
 	defer dynamicModelsCache.RUnlock()
-	return dynamicModelsCache.maxVariantByModel[model]
+	return dynamicModelsCache.maxVariantByModel[realm+"/"+model]
 }
 
 // modelPaidOnly 该模型在该地区是不是订阅专享：目录说（identity_list 里没有 Free），
@@ -842,7 +851,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	setTraceModel()
 	peek.Model = configName
 
-	body = setModelInBody(body, configName, h.modelPickOnly(configName))
+	body = setModelInBody(body, configName, h.modelPickOnly(realm, configName))
 	body = h.applyPrompt(body)
 	// 国际版：没开档位的模型走租户槽位（config_name=槽位 + model=具体模型）。
 	if route, ok := upstream.IntlSlotRoute(configName); ok && realm == auth.RealmIntl {
@@ -850,7 +859,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// 出站通道跟着模型走：网页端那批（gemini-3.1-pro / minimax-m2.7 / kimi-k2.5 …）在
 	// solo_coder 通道，发在 Work 通道会被判 4001。
-	if fn := h.modelFunction(configName); fn != "" {
+	if fn := h.modelFunction(realm, configName); fn != "" {
 		body = setFunctionInBody(body, fn)
 	}
 	// Max 上下文：两种开法等价——模型名后缀 __max（客户端原生写法，mapModel 会把后缀
@@ -859,7 +868,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 没有更大窗口的模型**如实忽略**并留日志，不报错也不硬发：上游表里 solo_work_lite
 	// 面有 12 个条目带 __max 名却与 dev 同窗口，发了等于没发，报错又会让客户端白挂。
 	if maxOn {
-		if v := h.modelMaxVariant(configName); v != "" {
+		if v := h.modelMaxVariant(realm, configName); v != "" {
 			body = setModelNameInBody(body, v)
 			// Max 只在部分面上被声明（chat_v3 20/20 更大；solo_work_lite 0/12）。
 			// 面上换到哪儿由 max_function 配，默认 chat_v3。function 不是可调用性约束
