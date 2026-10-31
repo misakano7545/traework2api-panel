@@ -480,8 +480,8 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	maxVariantByModel := map[string]string{}
 	paidOnlyByModel := map[string]bool{}
 	seen := map[string]bool{}
-	done := map[string]bool{}   // 已拿到模型表的地区（同地区只取第一份成功的）
-	var failed []string         // 拉取失败的账号，末尾统一记一次日志
+	done := map[string]bool{} // 已拿到模型表的地区（同地区只取第一份成功的）
+	var failed []string       // 拉取失败的账号，末尾统一记一次日志
 	for _, acct := range h.realmReps() {
 		realm := acct.Realm()
 		if done[realm] {
