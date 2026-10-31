@@ -479,13 +479,22 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	maxVariantByModel := map[string]string{}
 	paidOnlyByModel := map[string]bool{}
 	seen := map[string]bool{}
+	done := map[string]bool{}   // 已拿到模型表的地区（同地区只取第一份成功的）
+	var failed []string         // 拉取失败的账号，末尾统一记一次日志
 	for _, acct := range h.realmReps() {
 		realm := acct.Realm()
+		if done[realm] {
+			continue
+		}
 		// 只读探询不占在途名额：这里若带租约，几次列模型就会把账号占到不可用。
 		infos, err := h.cfg.Upstream.FetchModels(acct)
 		if err != nil {
+			// 单个账号失败不能放弃整个地区：一个失效号曾让国际版 46 个模型全部从
+			// /v1/models 消失，而日志里一个字都没有。继续试同地区的下一个账号。
+			failed = append(failed, realm+"/"+acct.UID)
 			continue
 		}
+		done[realm] = true
 		for _, mi := range infos {
 			// 订阅专享按「地区/模型」登记，且必须记在同名去重之前——否则被去重掉的那个地区
 			// 的付费身份就丢了，客户端显式带前缀（intl:glm-5.2）时照样会被放过、拿 1005 罚号。
@@ -509,6 +518,10 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 				maxVariantByModel[mi.ID] = mi.MaxModelName
 			}
 		}
+	}
+	if len(failed) > 0 {
+		log.Printf("[models] %d 个账号拉模型表失败（同地区已换号重试）: %s",
+			len(failed), strings.Join(failed, ", "))
 	}
 	if len(merged) == 0 {
 		dynamicModelsCache.Lock()
@@ -660,19 +673,19 @@ func setFunctionInBody(body []byte, fn string) []byte {
 	return out
 }
 
-// realmReps 池里每个地区挑一个账号代表去拉模型表。
-// ponytail: 挑到谁不定（List 顺序来自 map），也不挑健康度——拉模型表只用 token，
-// 冷却中的号照样能拉；真要按健康度挑再加 pool 的按 realm 选号。
+// realmReps 池里每个地区的**候选账号**（按 UID 升序，跳过禁用/暂停的号）。
+//
+// 拉模型表只读 token，不看冷却，所以冷却中的号照样能用；但**禁用/暂停的号凭据多半已失效**，
+// 它们若排在地区首位且只取一个，整个地区的模型表会静默消失（见 fetchDynamicModels 的逐号重试）。
 func (h *Handler) realmReps() []*auth.Auth {
-	seen := map[string]bool{}
 	var out []*auth.Auth
 	for _, st := range h.cfg.Pool.List() {
-		a := h.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || seen[a.Realm()] {
+		if st.Disabled || st.Paused {
 			continue
 		}
-		seen[a.Realm()] = true
-		out = append(out, a)
+		if a := h.cfg.Pool.AuthByUID(st.UID); a != nil {
+			out = append(out, a)
+		}
 	}
 	return out
 }
