@@ -2,7 +2,6 @@
 package server
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"traework2api/internal/auth"
+	"traework2api/internal/httpauth"
 	"traework2api/internal/pool"
 	"traework2api/internal/prompt"
 	"traework2api/internal/reqlog"
@@ -200,13 +200,7 @@ func (h *Handler) authOK(r *http.Request) bool {
 	if want == "" {
 		return true
 	}
-	authz := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if len(authz) < len(prefix) || !strings.EqualFold(authz[:len(prefix)], prefix) {
-		return false
-	}
-	// 常量时间比较，防时序攻击（本地代理但按规范）。
-	return subtle.ConstantTimeCompare([]byte(authz[len(prefix):]), []byte(want)) == 1
+	return httpauth.VerifyBearer(r, want)
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {

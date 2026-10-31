@@ -568,19 +568,30 @@ func TestPanicRecordedAs500(t *testing.T) {
 	}
 }
 
-func TestAPIKeyAuthCaseInsensitivePrefix(t *testing.T) {
+func TestAPIKeyAuthPrefixExactCase(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
 		Upstream: upstream.New(),
 		APIKey:   "test-key",
 	})
-	// 大小写不同的 Bearer 前缀也应接受（按规范，前缀大小写不敏感）。
+	// 前缀大小写不敏感是曾经的本地实现（strings.EqualFold）；现在鉴权统一走
+	// internal/httpauth（与基准仓库同一份），那边按「Bearer 」精确前缀比较，
+	// 两个口子口径只有一份，改这里等于改基准。RFC 9110 允许 scheme 大小写不敏感，
+	// 真有必要兼容时应在 httpauth 里统一放宽，而不是回到各仓自己比较。
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	req.Header.Set("Authorization", "bearer test-key")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Errorf("lowercase bearer: code=%d, want 401（与 httpauth 口径一致）", rec.Code)
+	}
+	// 精确前缀 + 正确 key 放行。
+	req = httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
-		t.Errorf("lowercase bearer: code=%d", rec.Code)
+		t.Errorf("exact prefix: code=%d", rec.Code)
 	}
 	// 错误 key 仍拒绝。
 	req = httptest.NewRequest("GET", "/v1/models", nil)

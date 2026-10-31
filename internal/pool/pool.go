@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"traework2api/internal/auth"
-	"traework2api/internal/durable"
+	"traework2api/internal/safefile"
 )
 
 // CoolKind 冷却类型。
@@ -1064,7 +1064,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 
 func (p *Pool) load() {
 	// 读不出来时回落到 state.json.bak（上一代好副本）：坏文件不等于「全池没有账号」。
-	raw, note, err := durable.Read(p.stateFp, validStateFile)
+	raw, err := safefile.Read(p.stateFp, validStateFile)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return // 首次启动
@@ -1078,9 +1078,6 @@ func (p *Pool) load() {
 		}
 		log.Printf("[pool] state %s 读不出来（%v），已备份为 %s 并按空状态启动（禁用/冷却/积分需重新累积）", p.stateFp, err, bak)
 		return
-	}
-	if note != "" {
-		log.Printf("[pool] %s", note)
 	}
 	var sf stateFile
 	if err := json.Unmarshal(raw, &sf); err != nil {
@@ -1143,19 +1140,9 @@ func (p *Pool) saveLocked() {
 	if dir := filepath.Dir(p.stateFp); dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// safefile.WriteKeep：上一代留成 .bak，临时文件 fsync 后才 rename（掉电不留全零文件）。
+	if err := safefile.WriteKeep(p.stateFp, raw, 0o600); err != nil {
 		log.Printf("[pool] 状态落盘失败（冷却/禁用标记可能在重启后丢失）: %v", err)
-		return
-	}
-	// 覆盖前留上一代：状态盘坏掉时不必从零点重新累积。
-	if err := durable.Keep(p.stateFp, validStateFile); err != nil {
-		log.Printf("[pool] 上一代状态备份失败，本轮不覆盖主文件: %v", err)
-		_ = os.Remove(tmp)
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
-		log.Printf("[pool] 状态替换失败（同上）: %v", err)
 	}
 }
 

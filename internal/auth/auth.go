@@ -13,14 +13,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"traework2api/internal/durable"
+	"traework2api/internal/safefile"
 )
-
-// tmpSeq 让同一个 auths 文件的临时名在进程内唯一（见 saveAtomicLocked）。
-var tmpSeq atomic.Uint64
 
 // validCredFile 判断一份凭证文件内容是否可用（LoadDir 与 SaveAtomic 共用同一口径）。
 func validCredFile(b []byte) bool { _, err := Parse(b); return err == nil }
@@ -296,23 +292,11 @@ func (a *Auth) saveAtomicLocked() error {
 	if err != nil {
 		return err
 	}
-	// 临时名带 pid + 进程内序号：同一个文件可能被**两个不同的 *Auth 对象**写（面板登录
-	// 新建的对象 vs 池里已有对象），a.mu 是对象级锁保护不到；共用固定名 ".tmp" 时两边
+	// safefile 用同目录唯一临时名（.<base>.*）：同一个文件可能被**两个不同的 *Auth 对象**写
+	// （面板登录新建的对象 vs 池里已有对象），a.mu 是对象级锁保护不到；固定名 ".tmp" 时两边
 	// 会互相截断，rename 上去就是半截 JSON，重启 LoadDir 静默跳过 → 账号无声消失。
-	tmp := fmt.Sprintf("%s.tmp.%d.%d", a.FilePath, os.Getpid(), tmpSeq.Add(1))
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	// 覆盖前把现在这份留成 .bak：写到一半掉电时，下一次启动还能从上一代把凭证捞回来。
-	if err := durable.Keep(a.FilePath, validCredFile); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, a.FilePath); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	// safefile.WriteKeep：上一代留成 .bak，临时文件 fsync 后才 rename。
+	return safefile.WriteKeep(a.FilePath, raw, 0o600)
 }
 
 // LoadDir 扫描 dir 下 trae-*.json。解析失败的文件跳过并留日志（静默跳过 = 账号凭空消失）。
@@ -341,13 +325,10 @@ func LoadDir(dir string) ([]*Auth, error) {
 		}
 		f := filepath.Join(dir, name)
 		// 读不出来时回落到 <file>.bak（上一代好副本），别让一个坏文件等于这个号消失。
-		raw, note, rerr := durable.Read(f, validCredFile)
+		raw, rerr := safefile.Read(f, validCredFile)
 		if rerr != nil {
 			log.Printf("[auth] 账号文件 %s 读不出来，跳过: %v", f, rerr)
 			continue
-		}
-		if note != "" {
-			log.Printf("[auth] %s", note)
 		}
 		a, err := Parse(raw)
 		if err != nil {

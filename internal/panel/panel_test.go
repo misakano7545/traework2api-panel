@@ -26,7 +26,7 @@ func TestSecurityAndAuth(t *testing.T) {
 	p := New(Config{Pool: pool.New(""), APIKey: "test-key", Version: "test"})
 	page := httptest.NewRecorder()
 	p.ServeHTTP(page, httptest.NewRequest("GET", "/panel/", nil))
-	if page.Code != 200 || !strings.Contains(page.Body.String(), `<script src="app.js"></script>`) {
+	if page.Code != 200 || !strings.Contains(page.Body.String(), `<script src="app.js?`) {
 		t.Fatalf("page code=%d body=%s", page.Code, page.Body.String())
 	}
 	if strings.Contains(page.Body.String(), "<script>") {
