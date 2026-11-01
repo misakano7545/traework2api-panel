@@ -64,6 +64,17 @@ const (
 	// DeviceCPU 出站 X-Device-Cpu。客户端读真机（实测这台是 "Intel"）。
 	DeviceCPU = "Intel"
 
+	// RefererBaseCN / RefererBaseIntl 出站 Referer 的**逻辑**域名前缀。
+	//
+	// 注意它不等于传输域名：2026-10-30 抓包里客户端把请求打到 api5-normal.mchost.guru
+	// （INTL 是 api5-normal-alisg.mchost.guru），Referer 却是老的逻辑域名
+	// trae-api-cn.mchost.guru（INTL coresg-normal.trae.ai）。这是 SDK 里的「公开基址」
+	// 与实际调度地址分离，复刻时必须照抄逻辑域名，不能拿 req.URL.Host 拼。
+	//
+	// 值 = 前缀 + 同一条 path，见 soloReferer。
+	RefererBaseCN  = "https://trae-api-cn.mchost.guru"
+	RefererBaseIntl = "https://coresg-normal.trae.ai"
+
 	Function = "solo_work_lite"
 	// FunctionCoder 是同一个 agent 主机的另一条通道：`solo_coder`。实测 2026-09-28，
 	// 同 token 同路径，只换 function，返回的模型表就是网页端（work.trae.ai）那 14 个

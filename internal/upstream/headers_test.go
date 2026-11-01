@@ -115,7 +115,9 @@ func TestUgHeadersIntlRealm(t *testing.T) {
 // 但少得越多越像自建代理。
 func TestSOLOHeadersKeySet(t *testing.T) {
 	want := []string{
-		"Accept", "Authorization", "Content-Type", "Package-Type", "Request-Traffic-Type",
+		"Accept", "App-Version", "Authorization", "Connection", "Content-Type",
+		"Package-Type", "Referer", "Request-Traffic-Type",
+		"Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
 		"Traceparent", "User-Agent",
 		"X-Agent-Host-Type", "X-Ahanet-Timeout", "X-App-Id", "X-App-Version", "X-App-Version-Code",
 		"X-Bridge-Transport", "X-Custom-Trace-Id",
@@ -124,7 +126,7 @@ func TestSOLOHeadersKeySet(t *testing.T) {
 		"X-Ide-Token", "X-Ide-Version", "X-Ide-Version-Code", "X-Ide-Version-Type",
 		"X-Lgw-Req-Sdk-Type", "X-Lscbd-Aid", "X-Lscbd-Platform",
 		"X-Machine-Id", "X-Os-Version",
-		"X-Request-Id", "X-Ss-Dp", "X-User-Region",
+		"X-Request-Id", "X-Ss-Dp", "X-Tt-Trace-Id", "X-User-Region",
 	}
 	for _, stream := range []bool{true, false} {
 		req, _ := http.NewRequest(http.MethodPost, "https://api.trae.cn/x", nil)
@@ -147,6 +149,30 @@ func TestSOLOHeadersKeySet(t *testing.T) {
 		// 客户端对两条路径都发 */*：流是靠 body.stream 决定的，不是 Accept 协商。
 		if got := req.Header.Get("Accept"); got != "*/*" {
 			t.Errorf("stream=%v Accept=%q want */*", stream, got)
+		}
+		// Referer 必须是逻辑域名 + 同 path（客户端实测口径），不是传输域名 api.trae.cn。
+		if got, wantRef := req.Header.Get("Referer"), RefererBaseCN+"/x"; got != wantRef {
+			t.Errorf("stream=%v Referer=%q want %q", stream, got, wantRef)
+		}
+		// 浏览器栈自证四件套：少一个就少一层伪装。
+		for k, v := range map[string]string{
+			"Sec-Fetch-Dest": "empty",
+			"Sec-Fetch-Mode": "no-cors",
+			"Sec-Fetch-Site": "none",
+			// app-version 与 X-App-Version 是两个不同的头，国内两者同值。
+			"App-Version": IdeVersion,
+			"Connection":  "keep-alive",
+		} {
+			if got := req.Header.Get(k); got != v {
+				t.Errorf("stream=%v %s=%q want %q", stream, k, got, v)
+			}
+		}
+		// x-tt-trace-id 结构：00-<32hex>-<16hex>-01，第二段 = 第一段前 16 位。
+		tt := req.Header.Get("X-Tt-Trace-Id")
+		parts := strings.Split(tt, "-")
+		if len(parts) != 4 || parts[0] != "00" || parts[3] != "01" ||
+			len(parts[1]) != 32 || len(parts[2]) != 16 || parts[2] != parts[1][:16] {
+			t.Errorf("stream=%v X-Tt-Trace-Id=%q 结构不符 00-<32hex>-<16hex>-01", stream, tt)
 		}
 		if req.Header.Get("X-Ide-Version") != IdeVersion || req.Header.Get("X-Ide-Version-Code") != IdeVersionCode {
 			t.Errorf("版本头与常量不一致：%q/%q", req.Header.Get("X-Ide-Version"), req.Header.Get("X-Ide-Version-Code"))
@@ -178,6 +204,10 @@ func TestSOLOHeadersIntlRealm(t *testing.T) {
 		"X-Ide-Version-Code": IdeVersionCodeIntl,
 		"Package-Type":       "stable_i18n",
 		"X-Ss-Dp":            "677332",
+		// app-version 是独立头，国际版发真版本号；X-App-Version 才发字面量 default。
+		"App-Version": IdeVersionIntl,
+		// Referer 走国际的逻辑域名，不是传输域名 coresg-normal 之外的任何东西。
+		"Referer": RefererBaseIntl + "/x",
 	}
 	for k, v := range want {
 		if got := req.Header.Get(k); got != v {

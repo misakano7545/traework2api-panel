@@ -90,6 +90,23 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	req.Header.Set("X-Request-Id", "req_"+ugUUIDv4())
 	// x-ahanet-timeout 是纯传输层超时提示，单独带不影响明文解析（实测 200），留着更像客户端。
 	req.Header.Set("X-Ahanet-Timeout", "86400")
+
+	// ── 浏览器栈自证（2026-10-30 抓包，chat 与模型表两条路径都发）──────
+	//
+	// 这四条在旧的 SOLOHeaders 里完全缺失，是「头看着齐、其实少一层」的主因：
+	//   - Referer 用**逻辑**域名 + 同 path（不是 req.URL.Host，见 RefererBaseCN 注释）；
+	//   - sec-fetch-* 三件套原先只有 ug 族发，chat 链路上是空的；
+	//   - app-version（无 x- 前缀）与 X-App-Version 是两个不同的头，客户端两条都发；
+	//   - x-tt-trace-id 是字节跳动的 trace 头，格式 00-<32hex>-<16hex>-01。
+	//   - Connection: keep-alive —— Go HTTP/1.1 默认不写，客户端每条都写。
+	req.Header.Set("Referer", soloReferer(realm, req.URL.RequestURI()))
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "no-cors")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("App-Version", currentIdeVersionFor(realm))
+	req.Header.Set("X-Tt-Trace-Id", soloTtTraceID())
+	req.Header.Set("Connection", "keep-alive")
+
 	// 故意不发 x-request-pin / x-requested-at：这两个是客户端**加密载荷**的伴随头
 	// （带它们的那次实测 body 是 X-Medusa/X-Helios 密文）。本仓发明文 body，带上它们上游
 	// 会按密文去解 → 400 {"error":"base64 decode failed"}（2026-10-30 逐头二分实测复现，
@@ -203,6 +220,36 @@ func ugUUIDv4() string {
 	b[6] = (b[6] & 0x0F) | 0x40
 	b[8] = (b[8] & 0x3F) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// soloReferer 按地区拼出站 Referer：**逻辑**域名 + 请求自身的 path 与 query。
+//
+// 2026-10-30 抓包实测（chat 与 batch_get_detail_param 一致）：
+//
+//	CN   https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat
+//	INTL https://coresg-normal.trae.ai/api/agent/v3/llm_utils_chat
+//
+// 传输域名是 api5-normal(.alisg).mchost.guru，两者不是一回事 —— 别用 req.URL.Host 拼。
+func soloReferer(realm, requestURI string) string {
+	base := RefererBaseCN
+	if realm == auth.RealmIntl {
+		base = RefererBaseIntl
+	}
+	return base + requestURI
+}
+
+// soloTtTraceID 生成字节跳动风格的 x-tt-trace-id：00-<32hex>-<16hex>-01。
+//
+// 抓包样本（2026-10-30）：
+//
+//	00-8b83d4ec0dee56e4358467ba8e91ffff-8b83d4ec0dee56e4-01
+//	00-8b8248f00dee56e4358467bbb4c1ffff-8b8248f00dee56e4-01
+//
+// 两段的关系固定：第二段 = 第一段前 16 个 hex 字符；第一段末 4 位恒为 ffff。
+// 中间的时间/机器段出不来，只保证结构与长度一致。
+func soloTtTraceID() string {
+	head := ugRandHex(14) + "ffff" // 28 + 4 = 32 hex
+	return "00-" + head + "-" + head[:16] + "-01"
 }
 
 // UGDeviceID 面板展示用：这个账号 ug 族当前会发出的 X-Device-Id（换指纹后随之变）。
