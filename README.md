@@ -507,13 +507,18 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 gzip/deflate 走标准库，br 走 `andybalholm/brotli`，zstd 走 `klauspost/compress/zstd`。
 后两个是 utls 的传递依赖，本来就在树里，补齐四值不再额外增重。
 
-**故意没做的三条**：
+**头顺序：已对齐**（`order.go`）。客户端是 aha 的固定顺序，而 `net/http` 的
+`Header.writeSubset` 按 key 字母序写、不受调用方控制。做法是在 `net.Conn` 层再包一层：
+判断这次 `Write` 是不是一整段报文头，是就按客户端顺序重排后写出 —— Transport 完全
+不知情，连接池 / 超时 / chunked / SSE 流仍是标准库在管。
 
-- **头顺序**：客户端是 TTNet 的固定顺序（`host → connection → content-length →
-  accept-encoding → sec-fetch-* → content-type → user-agent → …`），Go 的 `Header`
-  按 key 字母序写出，且**顺序不可控**。要一致只能绕开 `net/http` 自己拼报文 ——
-  等于重造连接池、keep-alive、chunked 与并发安全，风险远高于收益。大小写已经对齐，
-  顺序留着。
+只处理「一次 Write 里就有完整头」的情况，头被拆开时退回字母序：跨 Write 缓冲要跟着
+请求边界重置，判断错一次就会把上个请求的 body 拼进新头里（实测第二次请求直接 400）。
+宁可少对齐一层，也不能发坏包。端到端有 `TestWireTransportHeaderOrderEndToEnd` 钉住 ——
+它在 TLS listener 侧读**明文**头，核对顺序与头名大小写。
+
+**故意没做的两条**：
+
 - **`X-Medusa` / `X-Helios` / `x-request-pin` / `x-requested-at`**：客户端这几条伴随
   的是**加密 body**，本仓发明文，带了反而 400。这条差异无法用「头对齐」消除，
   只能实现那套加密 —— 属于另一件事。

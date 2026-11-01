@@ -132,7 +132,8 @@ func dialTLSWithFingerprint(ctx context.Context, network, addr string, fp *tlsFi
 			raw.Close()
 			return nil, err
 		}
-		return c, nil
+		// 包一层：握手完成后第一次 Write 就是 HTTP 报文头，在那一层重排顺序。
+		return newHeadConn(c, realmForHost(host)), nil
 	}
 	spec, err := specWithALPN(fp, alpnForWire())
 	if err != nil {
@@ -153,7 +154,7 @@ func dialTLSWithFingerprint(ctx context.Context, network, addr string, fp *tlsFi
 		raw.Close()
 		return nil, err
 	}
-	return u, nil
+	return newHeadConn(u, realmForHost(host)), nil
 }
 
 // specWithALPN 取指定档位的 spec 并把 ALPN 换成指定列表。
