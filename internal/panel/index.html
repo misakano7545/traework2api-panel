@@ -189,6 +189,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
+/* 「剩余/总额」这种比率串（积分 67098/67100、美元 $0.99387/$1.000）在 26px 等宽 + nowrap 下
+   必压到隔壁格（1280 宽实测：文字 166/227px，单元格仅 93px 可用），这两张卡单独缩字号并允许断行。 */
+.stat .v.frac { font-size: 17px; line-height: 1.3; white-space: normal; overflow-wrap: anywhere; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
 
@@ -679,10 +682,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分合计</div></div>
+        <div class="stat"><div class="v frac" id="sCredits">-</div><div class="k">积分合计</div></div>
         <!-- 国际版不是「无限免费」：Free plan 走美元计量（实测 basic_usage_limit=1 即 $1 额度）。
              单列一张卡，不把美元并进「积分合计」——两种单位不可换算。无美元账号时整卡隐藏。 -->
-        <div class="stat" id="sCreditsUsdBox" hidden><div class="v" id="sCreditsUsd">-</div><div class="k">国际额度（美元）</div></div>
+        <div class="stat" id="sCreditsUsdBox" hidden><div class="v frac" id="sCreditsUsd">-</div><div class="k">国际额度（美元）</div></div>
         <div class="stat warn"><div class="v" id="sCheckin">-</div><div class="k">签到冷却</div></div>
         <!-- 排程现状：下次签到/保活几点（时点在服务端配置里，改排程要重启）。 -->
         <div class="stat" title="排程现状（面板只读）"><div class="v" id="sSchedule">-</div><div class="k">下次签到</div></div>
