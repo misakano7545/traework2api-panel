@@ -479,6 +479,49 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 明文 body 本身不受影响：客户端风格头 + 明文 JSON 打 `api5-normal.mchost.guru` 实测 200 出 SSE 正文
 （`go test -tags wirecheck ./internal/upstream -run TestWireCheckLive -v`，需 `TW2A_CAP` 指向抓包 jsonl）。
 
+### 出站报文形态：第二轮对拍（抓包 vs 代码逐头差集）
+
+第一轮只对齐了「发什么头」，第二轮把抓包按链路拆开做集合差集，发现少的是两层：
+**报文形态**（大小写 / HTTP 版本 / 编码协商）和**地区分支**。口径全部来自
+`.reverse/cap_cn_full.jsonl` 与 `.reverse/capture_intl_agent.jsonl`。
+
+| 面 | 客户端实测 | 本轮改动 |
+|---|---|---|
+| `Referer` | 逻辑域名 + 同 path：CN `https://trae-api-cn.mchost.guru/…`、INTL `https://coresg-normal.trae.ai/…`。**不是**传输域名 `api5-normal(.alisg).mchost.guru` | 此前零实现 → `soloReferer` + `RefererBaseCN/Intl` |
+| `sec-fetch-*` | chat 与模型表都发 | 原先只有 `UgHeaders` 有 |
+| `app-version` | 独立头：CN `3.4.11`、INTL `3.6.4`。与 `x-app-version` 是两个头（INTL 的 `x-app-version` 反而是 `default`） | 补 |
+| `x-tt-trace-id` | `00-<32hex>-<16hex>-01`，第二段 = 第一段前 16 位，末 4 位恒 `ffff` | 补（`soloTtTraceID`） |
+| `Connection` | `keep-alive` | 补；同时**关掉 HTTP/2**（h2 拒绝 Connection 头，客户端本来就是 h1） |
+| 头名大小写 | 只有 `Host / Connection / Content-Length / Referer / X-SS-DP / X-Helios / X-Medusa / X-Neptune` 首字母大写，其余**全小写** | Go 的 `Header.Set` 会把 `x-os-version` 规范成 `X-Os-Version`、`X-SS-DP` 成 `X-Ss-Dp` → Transport 层改写副本 |
+| `request-traffic-type` | **只有国际发**，CN 的 chat 与模型表都没有 | 改成仅 INTL |
+| `traceparent` | CN 有；INTL 只有 `x-flow-traceparent` | 改成仅 CN |
+| `x-harness` | CN 有，INTL 无 | 改成仅 CN |
+| `x-trae-request-id` | INTL chat 独有（uuidv4） | 补 |
+| `Accept-Encoding` | `gzip, deflate, br, zstd` | 显式发 `gzip, deflate`（见下条注意事项） |
+
+**Accept-Encoding 的坑**：`net/http` 的透明解压在 `Accept-Encoding` 非空时**会关掉**
+（`transport.go` 里 `requestedGzip` 只在 header 为空时置真）。所以自己写这个头就必须
+自己解压，否则读到的是压缩字节 —— `wire.go` 的 `decodeBody` 接管了 gzip/flate。
+只 advertise 这两个是刻意的：br/zstd 标准库没有，advertise 了解不了，上游真回 brotli
+就是全链路坏掉，代价远大于少两个值。（`go.mod` 现在零依赖，为这个引第三方库不划算。）
+
+**故意没做的三条**：
+
+- **头顺序**：客户端是 TTNet 的固定顺序（`host → connection → content-length →
+  accept-encoding → sec-fetch-* → content-type → user-agent → …`），Go 的 `Header`
+  按 key 字母序写出，且**顺序不可控**。要一致只能绕开 `net/http` 自己拼报文 ——
+  等于重造连接池、keep-alive、chunked 与并发安全，风险远高于收益。大小写已经对齐，
+  顺序留着。
+- **br / zstd**：见上。
+- **`X-Medusa` / `X-Helios` / `x-request-pin` / `x-requested-at`**：客户端这几条伴随
+  的是**加密 body**，本仓发明文，带了反而 400。这条差异无法用「头对齐」消除，
+  只能实现那套加密 —— 属于另一件事。
+
+TLS 层同样没动：Go `crypto/tls` 的 ClientHello 是 13 个套件、单 supported_group
+（只有 x25519）、扩展 10 个、**无 GREASE**；客户端走 aha/TTNet（BoringSSL 系）。
+要像只能引 `utls` 自己构造 ClientHello spec，会破零依赖，且 `HelloChrome_Auto`
+模拟的是 Chrome 不是 TTNet —— 只能说「更像浏览器」，不等于「像客户端」。
+
 ### ug 族（签到 / 积分 / 额度）也分地区
 
 `UgHeaders` 原先对国际账号发的是国内那套头，2026-10-30 补上了分叉。两区实测差异：
