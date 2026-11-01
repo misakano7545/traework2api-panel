@@ -10,7 +10,11 @@
 package upstream
 
 import (
+	"compress/flate"
+	"compress/gzip"
 	"crypto/tls"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -54,7 +58,63 @@ func (t *headerCaseTransport) RoundTrip(r *http.Request) (*http.Response, error)
 		h[clientHeaderCase(k)] = v
 	}
 	r2.Header = h
-	return t.base.RoundTrip(r2)
+	resp, err := t.base.RoundTrip(r2)
+	if err != nil {
+		return nil, err
+	}
+	return decodeBody(resp)
+}
+
+// decodeBody 按 Content-Encoding 包一层解压 reader。
+//
+// 为什么要自己做：一旦请求侧显式写了 Accept-Encoding，net/http 就不再自动
+// 加 gzip、也不再透明解压（transport.go 里 requestedGzip 只在 header 为空时置真）。
+// 而客户端发的是多值，不显式写就少一层伪装。
+//
+// 只支持 gzip 与 deflate：这两个标准库有，且我们**只 advertise 这两个**，
+// 上游不会回 brotli/zstd，所以不存在解不了的分支。要上 br/zstd 得先引入
+// 第三方解压库（会破当前零依赖），收益是 Accept-Encoding 字符串完整对齐 ——
+// 记在 README 的待办里。
+func decodeBody(resp *http.Response) (*http.Response, error) {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if enc == "" || enc == "identity" {
+		return resp, nil
+	}
+	var rc io.ReadCloser
+	switch enc {
+	case "gzip":
+		zr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("gzip 响应解压失败: %w", err)
+		}
+		rc = zr
+	case "deflate":
+		rc = flate.NewReader(resp.Body)
+	default:
+		resp.Body.Close()
+		return nil, fmt.Errorf("不支持的 Content-Encoding %q（只发 gzip/deflate，不该收到这个）", enc)
+	}
+	resp.Body = &decodedBody{Reader: rc, raw: resp.Body}
+	// 解压后长度与编码都不再成立，留着会让上层读错。
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	resp.Uncompressed = true
+	return resp, nil
+}
+
+// decodedBody 关掉解压器时一并关掉底层连接，避免 SSE 长流泄漏。
+type decodedBody struct {
+	io.Reader
+	raw io.ReadCloser
+}
+
+func (b *decodedBody) Close() error {
+	if c, ok := b.Reader.(io.Closer); ok {
+		_ = c.Close()
+	}
+	return b.raw.Close()
 }
 
 // SetResponseHeaderTimeout 让热改超时能穿透这层包装。

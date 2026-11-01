@@ -115,7 +115,7 @@ func TestUgHeadersIntlRealm(t *testing.T) {
 // 但少得越多越像自建代理。
 func TestSOLOHeadersKeySet(t *testing.T) {
 	want := []string{
-		"Accept", "App-Version", "Authorization", "Connection", "Content-Type",
+		"Accept", "Accept-Encoding", "App-Version", "Authorization", "Connection", "Content-Type",
 		"Package-Type", "Referer",
 		"Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
 		"Traceparent", "User-Agent",

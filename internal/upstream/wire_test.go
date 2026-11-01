@@ -2,9 +2,11 @@ package upstream
 
 import (
 	"bufio"
+	"compress/gzip"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +64,61 @@ func rawHead(t *testing.T, build func(*http.Request)) string {
 	case <-time.After(5 * time.Second):
 		t.Fatal("裸监听超时，没收到报头")
 		return ""
+	}
+}
+
+// 显式写 Accept-Encoding 会关掉 net/http 的自动解压，解压由 decodeBody 接管。
+// 这条用真 gzip 往返验证：服务端压缩，客户端必须读回明文。
+func TestDecodeBodyGzipRoundtrip(t *testing.T) {
+	const payload = `{"ok":true,"msg":"中文也要能解"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "gzip, deflate" {
+			t.Errorf("出站 Accept-Encoding=%q want gzip, deflate", got)
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		_, _ = zw.Write([]byte(payload))
+		_ = zw.Close()
+	}))
+	defer srv.Close()
+
+	cl := &http.Client{Timeout: 5 * time.Second, Transport: newWireTransport(&http.Transport{})}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader("{}"))
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	resp, err := cl.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != payload {
+		t.Fatalf("解压结果=%q want %q", body, payload)
+	}
+	// 解压后这两个头不能留着，否则上层按 ContentLength 读会截断。
+	if resp.Header.Get("Content-Encoding") != "" || resp.Header.Get("Content-Length") != "" {
+		t.Errorf("解压后应删掉 Content-Encoding/Content-Length，得到 %v", resp.Header)
+	}
+}
+
+// 只 advertise gzip/deflate，真收到别的编码要明确报错，不能把压缩字节当正文喂给上层。
+func TestDecodeBodyRejectsUnadvertisedEncoding(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		_, _ = w.Write([]byte("\x00\x01binary"))
+	}))
+	defer srv.Close()
+
+	cl := &http.Client{Timeout: 5 * time.Second, Transport: newWireTransport(&http.Transport{})}
+	resp, err := cl.Get(srv.URL)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("收到 br 却当成明文返回了，上层会读到压缩字节")
+	}
+	if !strings.Contains(err.Error(), "Content-Encoding") {
+		t.Fatalf("错误信息应点明编码问题，得到 %v", err)
 	}
 }
 
