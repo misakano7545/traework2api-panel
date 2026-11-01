@@ -552,6 +552,50 @@ MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复�
 - `setHeaderTimeout` 原先断言 `*http.Transport` 改字段，包了 `headerCaseTransport`
   之后会静默失效 —— 改成走接口（`SetResponseHeaderTimeout`）。
 
+
+### 真实上游实测（2026-11-01）
+
+两个带 build tag 的探针，常规 `go test ./...` 不会跑：
+
+```bash
+go test -tags tlsprobe ./internal/upstream -run TestLiveTLSProbe -v       # 只握手，不吃额度
+go test -tags liveauth ./internal/upstream -run TestLiveAccountModels -v  # 真票据拉模型表
+TW2A_LIVE_CHAT=1 go test -tags liveauth ./internal/upstream \
+  -run TestLiveAccountIntlSlot -v                                         # 会吃额度
+```
+
+**握手矩阵**（四个生产主机 × 两种指纹，全部成功）：
+
+| 主机 | crypto/tls | utls chrome_133 |
+|---|---|---|
+| `api5-normal.mchost.guru`（CN agent） | 189ms · ALPN 空 | 13ms · ALPN `http/1.1` |
+| `api.trae.cn`（CN ug） | 122ms · ALPN 空 | 10ms · ALPN `http/1.1` |
+| `api5-normal-alisg.mchost.guru`（INTL agent） | 155ms · ALPN 空 | 11ms · ALPN `http/1.1` |
+| `growsg-normal.trae.ai`（INTL ug） | 1.17s · ALPN 空 | 1.73s · ALPN `http/1.1` |
+
+两侧协商结果都是 TLS 1.3（`0x0304`）+ `TLS_AES_256_GCM_SHA384`（`0x1302`）。
+Go 侧 JA3 恒为 `f27d2fb55f81674260957aae4330985b`（13 套件 / 单 group `4587` / 无 GREASE），
+utls 侧带 GREASE 与 17 个扩展。ALPN 那列是「Go 根本不 offer」对「我们 offer 且协商到 h1」，
+不是失败。
+
+**真票据业务矩阵**（票据从 `.reverse/` 抓包里捞，真客户端出站的那张）：
+
+| 区 | 指纹 | 模型表 | 会话 |
+|---|---|---|---|
+| CN | chrome_133 | 29 条 / 0.65s | 流建立正常，`4011` 通道限流 |
+| CN | go | 29 条 / 0.64s | 同上（错误码逐字一致） |
+| INTL | chrome_133 | 31 条 / 5.6s | 直发 `1005`；走槽位出正文 5658B |
+| INTL | go | 31 条 / 5.7s | 同上 |
+
+两种指纹的**业务结果逐字一致** —— 换握手层不影响功能，只是把指纹从脚本栈挪到浏览器栈。
+
+关于 CN 的 `4011`：额度显示 3599/3600（不是欠费），签到 / 额度 / 积分包三个只读接口全 200，
+换 coder 通道、换模型、换成官方格式的 body 都是同一个码 —— 是**账号维度的通道限流**，
+不是链路问题。要验证 CN 出正文得换一张没被限的票。
+
+INTL 的 `1005 {plan:4}` 是付费档门控，绕法是走 `custom_model_gpt-5` 槽位
+（`openai/gpt-5.6-sol`），这条能出正文，也是唯一能证明「会话真的产出内容」的路径。
+
 ### ug 族（签到 / 积分 / 额度）也分地区
 
 `UgHeaders` 原先对国际账号发的是国内那套头，2026-10-30 补上了分叉。两区实测差异：

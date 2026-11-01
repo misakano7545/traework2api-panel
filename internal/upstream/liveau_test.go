@@ -12,6 +12,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -381,5 +382,75 @@ func TestLiveAccountChatStream(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLiveAccountChatOnce 单发一次：只挑一个模型、只打一次，用来探「限流是否恢复」。
+// 连打会把自己打成 4011，探活必须克制。
+//
+//	TW2A_LIVE_CHAT=1 TW2A_ONCE_MODEL=Doubao-Seed-2.1-Turbo //	  go test -tags liveauth ./internal/upstream -run TestLiveAccountChatOnce -v
+func TestLiveAccountChatOnce(t *testing.T) {
+	fp := os.Getenv("TW2A_ONCE_FP")
+	if fp == "" { fp = "chrome_133" }
+	if err := SetTLSFingerprint(fp); err != nil {
+		t.Fatal(err)
+	}
+	for _, tk := range findTickets(t) {
+		if !strings.Contains(tk.Host, "api5-normal.mchost.guru") {
+			continue
+		}
+		a := authFromTicket(tk)
+		up := New()
+		model := os.Getenv("TW2A_ONCE_MODEL")
+		if model == "" {
+			models, err := up.FetchModels(a)
+			if err != nil || len(models) == 0 {
+				t.Fatalf("拉模型表失败: %v", err)
+			}
+			model = models[0].ID
+		}
+		// 与 probe_live_test 里能出正文的样例同形：content 是字符串、带 max_tokens。
+		payload := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":8,"stream":true}`, model)
+		start := time.Now()
+		rc, status, body, err := up.ChatStream(a, []byte(payload))
+		if err != nil {
+			t.Fatalf("发起失败(%v) status=%d body=%.200s", time.Since(start), status, body)
+		}
+		raw, _ := io.ReadAll(io.LimitReader(rc, 256<<10))
+		rc.Close()
+		text := string(raw)
+		code, msg := bizError(text)
+		t.Logf("fp=%s model=%s 耗时=%v 字节=%d 业务码=%d msg=%.80s", fp, model, time.Since(start), len(raw), code, msg)
+		if s := extractText(text, 60); s != "" {
+			t.Logf("正文=%q", s)
+		}
+	}
+}
+
+// TestLiveAccountReadonly 跑 ug 族的只读业务接口：付费身份 / 额度 / 积分包。
+// 这些不吃模型额度、不改账号状态，用来证明 ug 链路在真实上游是通的。
+func TestLiveAccountReadonly(t *testing.T) {
+	for _, tk := range findTickets(t) {
+		if ticketRealm(tk.Host) != auth.RealmCN {
+			continue // ug 族国际接口本仓不支持
+		}
+		a := authFromTicket(tk)
+		up := New()
+
+		if id, known, err := up.PayIdentity(a); err != nil {
+			t.Logf("PayIdentity 失败: %v", err)
+		} else {
+			t.Logf("PayIdentity OK: identity=%d known=%v", id, known)
+		}
+		if remain, total, expire, err := up.UserEntUsage(a); err != nil {
+			t.Logf("UserEntUsage 失败: %v", err)
+		} else {
+			t.Logf("UserEntUsage OK: 剩余=%d 总量=%d 过期=%d", remain, total, expire)
+		}
+		if pkgs, eu, err := up.BalancePackages(a); err != nil {
+			t.Logf("BalancePackages 失败: %v", err)
+		} else {
+			t.Logf("BalancePackages OK: 包数=%d 额度=%+v", len(pkgs), eu)
+		}
 	}
 }
