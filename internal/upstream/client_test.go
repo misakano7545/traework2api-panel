@@ -499,8 +499,12 @@ func TestWorkChannelIdentityFrozen(t *testing.T) {
 		t.Fatal(err)
 	}
 	rc.Close()
-	if gotAppID != wantAppID || gotVerCode != wantVerCode || gotVerType != "stable" || gotTraffic != "prod" {
-		t.Errorf("出站头: appid=%q verCode=%q type=%q traffic=%q", gotAppID, gotVerCode, gotVerType, gotTraffic)
+	if gotAppID != wantAppID || gotVerCode != wantVerCode || gotVerType != "stable" {
+		t.Errorf("出站头: appid=%q verCode=%q type=%q", gotAppID, gotVerCode, gotVerType)
+	}
+	// request-traffic-type 是国际客户端独有的头，国内账号不该出现（2026-10-30 抓包）。
+	if gotTraffic != "" {
+		t.Errorf("国内账号发了 Request-Traffic-Type=%q（实测客户端不发）", gotTraffic)
 	}
 	if !bytes.Contains(gotBody, []byte(`"function":"solo_work_lite"`)) {
 		t.Errorf("请求体 function 不是 Work 通道: %s", gotBody)

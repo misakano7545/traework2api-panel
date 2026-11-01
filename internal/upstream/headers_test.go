@@ -116,7 +116,7 @@ func TestUgHeadersIntlRealm(t *testing.T) {
 func TestSOLOHeadersKeySet(t *testing.T) {
 	want := []string{
 		"Accept", "App-Version", "Authorization", "Connection", "Content-Type",
-		"Package-Type", "Referer", "Request-Traffic-Type",
+		"Package-Type", "Referer",
 		"Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
 		"Traceparent", "User-Agent",
 		"X-Agent-Host-Type", "X-Ahanet-Timeout", "X-App-Id", "X-App-Version", "X-App-Version-Code",
@@ -183,7 +183,8 @@ func TestSOLOHeadersKeySet(t *testing.T) {
 		}
 		// 客户端不发的那两个、以及会把明文 body 逼成密文的加密伴随头：一个都不能有。
 		// X-Request-Pin / X-Requested-At 带上去上游直接 400 base64 decode failed（实测）。
-		for _, k := range []string{"X-Cloudide-Token", "X-Uid", "X-Request-Pin", "X-Requested-At"} {
+		// Request-Traffic-Type 只有国际客户端发，国内 chat 与模型表都没有。
+		for _, k := range []string{"X-Cloudide-Token", "X-Uid", "X-Request-Pin", "X-Requested-At", "Request-Traffic-Type"} {
 			if req.Header.Get(k) != "" {
 				t.Errorf("stream=%v 不该发 %s", stream, k)
 			}
@@ -218,6 +219,19 @@ func TestSOLOHeadersIntlRealm(t *testing.T) {
 		if got := req.Header.Get(k); got != "" {
 			t.Errorf("INTL 不该发 %s（实测客户端没有），得到 %q", k, got)
 		}
+	}
+	// 国际 trace 口径与国内不同：只发 x-flow-traceparent，不发 traceparent；
+	// 要发 x-trae-request-id 与 request-traffic-type（国内两条都没有）。
+	for _, k := range []string{"Traceparent", "X-Harness"} {
+		if got := req.Header.Get(k); got != "" {
+			t.Errorf("INTL 不该发 %s（实测客户端没有），得到 %q", k, got)
+		}
+	}
+	if got := req.Header.Get("Request-Traffic-Type"); got != "prod" {
+		t.Errorf("INTL Request-Traffic-Type=%q want prod", got)
+	}
+	if rid := req.Header.Get("X-Trae-Request-Id"); len(rid) != 36 || strings.Count(rid, "-") != 4 {
+		t.Errorf("INTL X-Trae-Request-Id=%q 应为 uuidv4", rid)
 	}
 	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "Trae/"+UABaseVersion) {
 		t.Errorf("INTL UA=%q 应含 Trae/%s", ua, UABaseVersion)

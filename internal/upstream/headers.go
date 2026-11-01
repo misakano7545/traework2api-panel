@@ -72,11 +72,15 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	}
 
 	// ── 原生网络栈自证（aha / TTNet 桥） ───────────────────────────────
-	req.Header.Set("X-Harness", "1")
+	//
+	// x-harness 只有国内客户端发；国际抓包里这条是空的（见 applyRealmHeaders
+	// 上面的分歧表），无条件发等于给国际链路贴国内标签。
+	if realm != auth.RealmIntl {
+		req.Header.Set("X-Harness", "1")
+	}
 	req.Header.Set("X-Agent-Host-Type", "0")
 	req.Header.Set("X-Bridge-Transport", "aha")
 	req.Header.Set("X-Lgw-Req-Sdk-Type", "3")
-	req.Header.Set("Request-Traffic-Type", "prod")
 
 	// ── 地区差异化（国内发 lscbd/CN，国际发 stable_i18n + SS-DP） ──────
 	applyRealmHeaders(req, realm)
@@ -85,11 +89,25 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	traceID := ugRandHex(16) // 32 hex，与客户端 x-custom-trace-id 同形
 	spanID := ugRandHex(8)   // 16 hex，traceparent 的 parent-id
 	req.Header.Set("X-Custom-Trace-Id", traceID)
-	req.Header.Set("Traceparent", "00-"+traceID+"-"+spanID+"-01")
+	// 两区在 trace 上不是同一套（2026-10-30 抓包，chat 与模型表一致）：
+	//   CN   有 traceparent + x-flow-traceparent
+	//   INTL 只有 x-flow-traceparent，没有 traceparent；另发 x-trae-request-id
+	// 国际链路上多一条 traceparent 就是一条官方客户端不会出现的头。
+	if realm != auth.RealmIntl {
+		req.Header.Set("Traceparent", "00-"+traceID+"-"+spanID+"-01")
+	}
 	req.Header.Set("X-Flow-Traceparent", "04-"+traceID+"-"+spanID+"-01")
 	req.Header.Set("X-Request-Id", "req_"+ugUUIDv4())
 	// x-ahanet-timeout 是纯传输层超时提示，单独带不影响明文解析（实测 200），留着更像客户端。
 	req.Header.Set("X-Ahanet-Timeout", "86400")
+
+	// ── 地区独有的载荷属性头 ───────────────────────────────────────────
+	// request-traffic-type 只有国际客户端发（CN 的 chat 与模型表都没有这条），
+	// x-trae-request-id 也只有国际发，值是 uuidv4。
+	if realm == auth.RealmIntl {
+		req.Header.Set("Request-Traffic-Type", "prod")
+		req.Header.Set("X-Trae-Request-Id", ugUUIDv4())
+	}
 
 	// ── 浏览器栈自证（2026-10-30 抓包，chat 与模型表两条路径都发）──────
 	//
