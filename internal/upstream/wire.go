@@ -27,13 +27,18 @@ import (
 
 // clientUpperHeaders 是 2026-10-30 抓包里**首字母大写**的那几条。
 //
-// 客户端其余头一律小写（accept / user-agent / x-app-id / x-os-version …），
-// Go 默认会把它们写成 Title-Case，这是最容易被「精确比对」类规则命中的差异。
+// 客户端其余头一律小写（accept / x-app-id / x-os-version …），Go 默认会把它们写成
+// Title-Case，这是最容易被「精确比对」类规则命中的差异。
+//
+// user-agent 例外：抓包里是小写，但国内通道发小写会被上游判 4011
+// 「exceeded the rate limit」（2026-11-01 实测 3/3；同一时刻改回 User-Agent 3/3 全 200，
+// 其余头随便小写都不影响）。抓包与放行口径不一致时以放行为准，别再改回小写。
 var clientUpperHeaders = map[string]string{
 	"host":           "Host",
 	"connection":     "Connection",
 	"content-length": "Content-Length",
 	"referer":        "Referer",
+	"user-agent":     "User-Agent",
 	"x-ss-dp":        "X-SS-DP",
 	"x-helios":       "X-Helios",
 	"x-medusa":       "X-Medusa",
@@ -121,7 +126,7 @@ func decodeBody(resp *http.Response) (*http.Response, error) {
 type zstdCloser struct{ d *zstd.Decoder }
 
 func (z zstdCloser) Read(p []byte) (int, error) { return z.d.Read(p) }
-func (z zstdCloser) Close() error              { z.d.Close(); return nil }
+func (z zstdCloser) Close() error               { z.d.Close(); return nil }
 
 // decodedBody 关掉解压器时一并关掉底层连接，避免 SSE 长流泄漏。
 type decodedBody struct {

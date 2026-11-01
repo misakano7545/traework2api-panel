@@ -213,6 +213,20 @@ func TestWireHeaderCaseMatchesClient(t *testing.T) {
 	}
 }
 
+// user-agent 必须发成 User-Agent：国内通道收到小写 user-agent 会回 4011
+// 「exceeded the rate limit」（2026-11-01 实测 3/3；改回大写 3/3 全 200）。
+func TestWireUserAgentStaysTitleCase(t *testing.T) {
+	head := rawHead(t, func(req *http.Request) {
+		req.Header.Set("User-Agent", "Trae/1.0")
+	})
+	if !strings.Contains(head, "\r\nUser-Agent: Trae/1.0\r\n") {
+		t.Errorf("出站没写成 User-Agent（小写会被上游判 4011）\n实际:\n%s", head)
+	}
+	if strings.Contains(head, "\r\nuser-agent: ") {
+		t.Errorf("出站把 user-agent 写成小写了\n实际:\n%s", head)
+	}
+}
+
 // 包装层不能改调用方手里的 req —— 生产代码还在用 Header.Get 读这些头。
 func TestHeaderCaseTransportLeavesRequestIntact(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, "http://example.invalid/x", strings.NewReader("{}"))
