@@ -81,7 +81,9 @@ func helloParts(t *testing.T, b []byte) (ja3 string, suites, groups []uint16, al
 		case 10: // supported_groups
 			q := p + 2
 			n := int(binary.BigEndian.Uint16(b[p:]))
-			for q+4 <= p+2+n && q+4 <= len(b) {
+			// 端点条件用 q+2：每个 entry 是 2 字节 group + 2 字节 key_exchange 长度，
+			// 用 q+4 会少读最后一个（三条曲线只解出两条）。
+			for q+2 <= p+2+n && q+4 <= len(b) {
 				gl := int(binary.BigEndian.Uint16(b[q:]))
 				groups = append(groups, binary.BigEndian.Uint16(b[q+2:]))
 				q += 2 + gl

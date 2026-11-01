@@ -553,6 +553,43 @@ MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复�
   之后会静默失效 —— 改成走接口（`SetResponseHeaderTimeout`）。
 
 
+
+### 抓到了官方客户端自己的 ClientHello（aha 档）
+
+`tools/hellocap` 起裸 TCP 桩 + 系统代理，启动本机 Trae CN（`explorer.exe` 拉起，
+直接 `Start-Process` 会在 V8 isolate 阶段静默退出），抓到它发给 `api.trae.com.cn`
+的真实握手（517 字节）。**它是 aha/TTNet 原生网络栈发的，不是 Chromium**：
+
+| | 套件 | supported_groups | 签名算法 | 备注 |
+|---|---|---|---|---|
+| **aha / TTNet**（本仓 `aha` 档） | 15 | 29 / 23 / 24 | 8 | 无 PQ、带 17513(ALPS)、padding |
+| Chrome 133（utls 预置） | 15 | 56026 / 4588 / 29 / 23 / 24 | 7 | 带 PQ、ECH、17613 |
+| 本机 Chromium 进程（对照） | 15 | 4588 / 29 / 23 / 24 | 12 | 带 PQ、ECH、17613、私有 51764 |
+
+结论：**用 Chrome 指纹冒充这个客户端，在 JA3/JA4 上是对不上的** —— 多出整个 PQ key share
+和 ECH，groups 集合也不同。`internal/upstream/tls_aha.go` 按抓包复刻了真实形状。
+
+**但默认档仍是 `chrome_133`**：`aha` 形状在 `api5-normal(.alisg).mchost.guru` 与
+`growsg-normal.trae.ai` 上都握手成功，唯独 `api.trae.cn`（阿里 Tengine）回
+`handshake failure` —— 而 ug 族（签到/积分/额度）全走那台。默认档必须四个生产主机全通。
+
+真账号实测：`aha` 档在 CN 主链路出正文 16.5KB / 业务码 0，功能没问题；
+要启用得确认你的部署不依赖 `api.trae.cn`：
+
+```bash
+TW2A_TLS_FINGERPRINT=aha   # 或面板 upstream.tls_fingerprint
+```
+
+重抓（客户端版本变了就重来一次）：
+
+```bash
+go build -o hellocap.exe ./tools/hellocap
+./hellocap.exe -addr 127.0.0.1:8443 -out ./cap -sni "trae,mchost" -timeout 120s
+# 另开一个：把系统代理指到 127.0.0.1:8443，然后 explorer.exe 拉起 Trae CN.exe
+# 抓到后 cap/spec-*.go.txt 直接就是可编译的 utls spec
+```
+
+
 ### 真实上游实测（2026-11-01）
 
 两个带 build tag 的探针，常规 `go test ./...` 不会跑：

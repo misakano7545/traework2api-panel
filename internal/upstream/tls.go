@@ -31,22 +31,38 @@ import (
 )
 
 // Fingerprint 出站 TLS 指纹档位。
+//
+// ID 与 Spec 二选一：ID 是 utls 预置档（HelloChrome_*），Spec 是按抓包复刻的自定义
+// 形状（aha）。两者都会经过 specWithALPN 把 ALPN 收窄成 http/1.1。
 type tlsFingerprint struct {
-	ID   utls.ClientHelloID
+	ID   *utls.ClientHelloID
+	Spec *utls.ClientHelloSpec
 	Name string
 }
 
 var (
 	tlsMu sync.RWMutex
-	tlsFP = chromeFingerprint(utls.HelloChrome_133) // 默认：utls 支持的最高 Chrome 档
+	// 默认仍是 chrome_133：aha 形状更「像这个客户端」，但 api.trae.cn（阿里 Tengine）
+	// 对它回 handshake failure，而 ug 族（签到/积分/额度）全走那台。默认档必须四个
+	// 生产主机全通，所以 aha 留作显式可选（见 tls_aha.go 顶部说明）。
+	tlsFP = chromeFingerprint(utls.HelloChrome_133)
 )
 
 func chromeFingerprint(id utls.ClientHelloID) *tlsFingerprint {
-	return &tlsFingerprint{ID: id, Name: "chrome_" + id.Version}
+	return &tlsFingerprint{ID: &id, Name: "chrome_" + id.Version}
+}
+
+// ahaFingerprint 官方客户端（Trae）自己的 ClientHello 形状。
+//
+// 比 chrome_133 更该做默认：它才是「这个客户端发的东西」。chrome_133 多出 PQ key share、
+// ECH 与 ALPS 私有 id，在 JA3/JA4 上与真客户端对不上（对比见 tls_aha.go 的表）。
+func ahaFingerprint() *tlsFingerprint {
+	return &tlsFingerprint{Spec: ahaSpec, Name: "aha"}
 }
 
 // tlsFingerprints 可选的档位。名字进配置，值只在这里维护。
 var tlsFingerprints = map[string]func() *tlsFingerprint{
+	"aha":        ahaFingerprint,
 	"chrome_133": func() *tlsFingerprint { return chromeFingerprint(utls.HelloChrome_133) },
 	"chrome_131": func() *tlsFingerprint { return chromeFingerprint(utls.HelloChrome_131) },
 	"chrome_120": func() *tlsFingerprint { return chromeFingerprint(utls.HelloChrome_120) },
@@ -119,7 +135,7 @@ func dialTLSWithFingerprint(ctx context.Context, network, addr string, fp *tlsFi
 		}
 		return c, nil
 	}
-	spec, err := specWithALPN(fp.ID, alpnForWire())
+	spec, err := specWithALPN(fp, alpnForWire())
 	if err != nil {
 		raw.Close()
 		return nil, err
@@ -141,21 +157,61 @@ func dialTLSWithFingerprint(ctx context.Context, network, addr string, fp *tlsFi
 	return u, nil
 }
 
-// specWithALPN 取预置 spec 并把 ALPN 换成指定列表。
-func specWithALPN(id utls.ClientHelloID, alpn []string) (*utls.ClientHelloSpec, error) {
-	spec, err := utls.UTLSIdToSpec(id)
-	if err != nil {
-		return nil, err
+// specWithALPN 取指定档位的 spec 并把 ALPN 换成指定列表。
+//
+// 每次调用都返回**新拷贝**：spec 会被 utls 在握手中改写（GREASE 值、key share 长度），
+// 全局共享同一份会串味。extension 对象本身无状态，可以共用。
+func specWithALPN(fp *tlsFingerprint, alpn []string) (*utls.ClientHelloSpec, error) {
+	if fp == nil {
+		return nil, fmt.Errorf("nil fingerprint")
 	}
+	var spec *utls.ClientHelloSpec
+	if fp.Spec != nil {
+		cp := *fp.Spec
+		cp.Extensions = append([]utls.TLSExtension(nil), fp.Spec.Extensions...)
+		cp.CipherSuites = append([]uint16(nil), fp.Spec.CipherSuites...)
+		cp.CompressionMethods = append([]byte(nil), fp.Spec.CompressionMethods...)
+		spec = &cp
+	} else if fp.ID != nil {
+		s, err := utls.UTLSIdToSpec(*fp.ID)
+		if err != nil {
+			return nil, err
+		}
+		spec = &s
+	} else {
+		return nil, fmt.Errorf("档位 %q 既没有 Spec 也没有 ID", fp.Name)
+	}
+	// ALPN 一律替换成新的扩展对象，避免共享 AlpnProtocols 切片。
 	found := false
 	for i := range spec.Extensions {
-		if a, ok := spec.Extensions[i].(*utls.ALPNExtension); ok {
-			a.AlpnProtocols = alpn
+		if _, ok := spec.Extensions[i].(*utls.ALPNExtension); ok {
+			spec.Extensions[i] = &utls.ALPNExtension{AlpnProtocols: append([]string(nil), alpn...)}
 			found = true
 		}
 	}
-	if !found {
-		spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: alpn})
+	if !found && len(alpn) > 0 {
+		spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: append([]string(nil), alpn...)})
 	}
-	return &spec, nil
+	// 有状态的扩展必须重建，不能复用同一对象：UtlsGREASEExtension 在握手时写入
+	// 自己抽到的 value，UtlsPaddingExtension 会缓存算出来的长度 —— 多连接共用一个
+	// 实例会串味，症状是随机的 `tls: internal error`。
+	//
+	// 只对自定义 Spec 做：ID 档位每次 UTLSIdToSpec 出来的本来就是新对象。
+	if fp.Spec != nil {
+		for i, e := range spec.Extensions {
+			switch v := e.(type) {
+			case *utls.UtlsGREASEExtension:
+				spec.Extensions[i] = &utls.UtlsGREASEExtension{}
+			case *utls.UtlsPaddingExtension:
+				spec.Extensions[i] = &utls.UtlsPaddingExtension{GetPaddingLen: v.GetPaddingLen}
+			case *utls.KeyShareExtension:
+				shares := make([]utls.KeyShare, len(v.KeyShares))
+				for j, ks := range v.KeyShares {
+					shares[j] = utls.KeyShare{Group: ks.Group}
+				}
+				spec.Extensions[i] = &utls.KeyShareExtension{KeyShares: shares}
+			}
+		}
+	}
+	return spec, nil
 }

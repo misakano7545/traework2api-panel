@@ -53,7 +53,7 @@ func peekAndDial(t *testing.T, addr string, fp *tlsFingerprint) (ja3 string, sui
 		return
 	}
 	cfg := &utls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
-	spec, e := specWithALPN(fp.ID, alpnForWire())
+	spec, e := specWithALPN(fp, alpnForWire())
 	if e != nil {
 		err = e
 		return
@@ -210,6 +210,7 @@ func TestLiveTLSProbe(t *testing.T) {
 			fp   *tlsFingerprint
 		}{
 			{"crypto/tls", nil},
+			{"utls aha（官方客户端形状）", ahaFingerprint()},
 			{"utls chrome_133", chromeFingerprint(utls.HelloChrome_133)},
 		} {
 			t.Run(h+"/"+mode.name, func(t *testing.T) {
