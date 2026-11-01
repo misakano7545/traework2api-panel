@@ -18,9 +18,30 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8443", "监听地址")
 	out := flag.String("out", "hellocap-out", "输出目录")
 	timeout := flag.Duration("timeout", 30*time.Second, "等 ClientHello 的最长时间")
-	once := flag.Bool("once", true, "抓到一条就退出")
+	once := flag.Bool("once", true, "抓到一条（且通过 -sni 过滤）就退出")
 	genSpecFlag := flag.Bool("gen-spec", true, "同时生成可直接编译的 utls ClientHelloSpec 代码")
+	sni := flag.String("sni", "", "只收 ServerName 含这些子串的连接，逗号分隔（空 = 全收）")
 	flag.Parse()
+
+	var want []string
+	for _, s := range strings.Split(*sni, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			want = append(want, strings.ToLower(s))
+		}
+	}
+	// 空过滤列表 = 全收；非空时任何一个子串命中即可。
+	match := func(name string) bool {
+		if len(want) == 0 {
+			return true
+		}
+		n := strings.ToLower(name)
+		for _, w := range want {
+			if strings.Contains(n, w) {
+				return true
+			}
+		}
+		return false
+	}
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, "建输出目录失败:", err)
@@ -35,11 +56,23 @@ func main() {
 	defer ln.Close()
 
 	fmt.Printf("等待 ClientHello —— 监听 %s，输出 %s\n", *addr, *out)
+	if len(want) > 0 {
+		fmt.Printf("只收 ServerName 含 %v 的连接\n", want)
+	}
 	fmt.Printf("用法：把系统/客户端代理指到 %s，触发一次 HTTPS 请求即可。\n", *addr)
 	fmt.Println("（抓 ClientHello 不需要证书、不需要解密：握手第一步就断开。）")
 
+	// 保存成功的信号。once 模式由独立 goroutine 消费，避免主循环被一次「不匹配」卡死。
+	saved := make(chan string, 8)
+	if *once {
+		go func() {
+			tag := <-saved
+			fmt.Printf("\n已抓到 hello-%s，退出。\n", tag)
+			os.Exit(0)
+		}()
+	}
+
 	n := 0
-	done := make(chan struct{}, 1)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -50,28 +83,35 @@ func main() {
 			defer conn.Close()
 			n++
 			tag := strconv.Itoa(n)
-			if raw, ch, err := capture(conn, *timeout); err != nil {
+			raw, ch, err := capture(conn, *timeout)
+			if err != nil {
 				fmt.Printf("[%s] 没抓到：%v\n", tag, err)
-			} else if err := save(*out, tag, raw, ch); err != nil {
+				return
+			}
+			if ch == nil {
+				fmt.Printf("[%s] 不是 ClientHello\n", tag)
+				return
+			}
+			if !match(ch.ServerName) {
+				fmt.Printf("[%s] 跳过（SNI=%q 不在过滤列表）\n", tag, ch.ServerName)
+				return
+			}
+			if err := save(*out, tag, raw, ch); err != nil {
 				fmt.Printf("[%s] 落盘失败：%v\n", tag, err)
-			} else {
-				fmt.Print(renderReport(ch))
-				if *genSpecFlag {
-					code := genSpec(ch)
-					path := filepath.Join(*out, "spec-"+tag+".go.txt")
-					if err := os.WriteFile(path, []byte(code), 0o644); err != nil {
-						fmt.Printf("[%s] 生成 spec 失败：%v\n", tag, err)
-					} else {
-						fmt.Printf("\n已生成 spec：%s\n%s\n", path, code)
-					}
+				return
+			}
+			fmt.Print(renderReport(ch))
+			if *genSpecFlag {
+				code := genSpec(ch)
+				path := filepath.Join(*out, "spec-"+tag+".go.txt")
+				if err := os.WriteFile(path, []byte(code), 0o644); err != nil {
+					fmt.Printf("[%s] 生成 spec 失败：%v\n", tag, err)
+				} else {
+					fmt.Printf("\n已生成 spec：%s\n%s\n", path, code)
 				}
 			}
-			done <- struct{}{}
+			saved <- tag
 		}()
-		if *once {
-			<-done // 等这一条真的落完盘再退出，不靠 sleep 猜
-			return
-		}
 	}
 }
 

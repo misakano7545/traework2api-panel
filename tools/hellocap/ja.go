@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -131,7 +132,11 @@ func (ch *ClientHello) JA4() string {
 		sum := sha256.Sum256([]byte(strings.Join(parts, ",")))
 		return hex.EncodeToString(sum[:])[:12]
 	}
+	// 规范：b 段按**原顺序**，c 段两侧都要**排序**。这是 JA4 与 JA3 的第二处关键差异 ——
+	// 不排序的话，Chrome 124+ 的扩展乱序会让同一个客户端算出不同的 c 段。
 	b := h(ciphers...)
+	sort.Strings(exts)
+	sort.Strings(sigalgs)
 	c := h(strings.Join(exts, ","), strings.Join(sigalgs, ","))
 
 	return fmt.Sprintf("t%s%s%02d%02d%s_%s_%s",

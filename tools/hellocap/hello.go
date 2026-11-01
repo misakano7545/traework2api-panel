@@ -16,19 +16,19 @@ import (
 
 // 常用扩展 ID。
 const (
-	extServerName          = 0
-	extSupportedGroups     = 10
-	extPointFormats        = 11
-	extSignatureAlgorithms = 13
-	extALPN                = 16
-	extPadding             = 21
+	extServerName           = 0
+	extSupportedGroups      = 10
+	extPointFormats         = 11
+	extSignatureAlgorithms  = 13
+	extALPN                 = 16
+	extPadding              = 21
 	extExtendedMasterSecret = 23
-	extCompressCertificate = 27
-	extSessionTicket       = 35
-	extSupportedVersions   = 43
-	extPSKKeyExchangeModes = 45
-	extKeyShare            = 51
-	extRenegotiationInfo   = 65281
+	extCompressCertificate  = 27
+	extSessionTicket        = 35
+	extSupportedVersions    = 43
+	extPSKKeyExchangeModes  = 45
+	extKeyShare             = 51
+	extRenegotiationInfo    = 65281
 )
 
 // Extension 一条原始扩展（类型 + 未解析的数据）。

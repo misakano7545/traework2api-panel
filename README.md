@@ -604,6 +604,41 @@ utls 侧带 GREASE 与 17 个扩展。ALPN 那列是「Go 根本不 offer」对�
 INTL 的 `1005 {plan:4}` 是付费档门控，绕法是走 `custom_model_gpt-5` 槽位
 （`openai/gpt-5.6-sol`），这条能出正文，也是唯一能证明「会话真的产出内容」的路径。
 
+### 真实 Chromium 客户端的 ClientHello：133 已经够近（2026-11-01）
+
+`tools/hellocap` 抓了一条本机 Chromium 系客户端的握手（SNI `web.tabbit.com`），
+拿它跟 `utls.HelloChrome_133` 逐项对：
+
+| 面 | 结果 |
+|---|---|
+| cipher suites（15 个，去 GREASE） | **顺序与集合完全一致** |
+| supported_groups（4 个） | **完全一致**：`4588 / 29 / 23 / 24`（X25519MLKEM768 + X25519 + P-256 + P-384） |
+| extensions（去 GREASE） | 133 的 16 个是**子集**，只差一个 `51764`（0xca34，私有扩展） |
+| GREASE / shuffle | 两侧都有；该客户端还开了 **extension permutation**（三条抓包扩展顺序全不同） |
+
+**这推翻了此前「133 顶替 142 差很多」的判断。** Chromium 124 → 142 之间
+ClientHello 的骨架没变，差的只是私有扩展与扩展顺序随机化。所以：
+
+- 不需要再为「拿到 142 的 spec」专门抓包；
+- 真要补，只差 `51764` 这一个扩展，且它是该客户端的私有扩展，**Trae 未必发** —— 
+  加错了反而是新的指纹差异，所以没有内置。
+
+**`tools/hellocap` 的两条更正**（都是实测踩出来的）：
+
+- JA4 的 `c` 段要求 extensions 与 sigalgs **排序后**再哈希，`b` 段保持原顺序。
+  不排序的话，开了 extension permutation 的客户端每次算出不同的 `c` 段。
+- 生成的 spec 里 **ECH(65037) 默认注释掉**：它的 config 带 HPKE 公钥，原样搬等于
+  每次握手发同一把公钥，比不发更糟。`key_share` 同理，Data 留空让 utls 现生成。
+
+**抓 Trae 本体的限制**：`Trae CN.exe` 在非交互 shell 里起不来（`debug.log` 只写到
+`SetPartitionAllocOomCallback` 就断，进程随即消失），必须由桌面会话手动启动。
+抓包桩本身没问题 —— 抓到的那条就是同机 Chromium 系的真实握手。
+
+顺带从 `debug.log` 的 `AppManifest` 里确认了两件头相关的事：
+`ahaNet.ttnet_params.bypass_proxy=false`、`access_policy.domain_white_list` 覆盖
+`*.mchost.guru / *.trae.cn / *.trae.com.cn`，与抓包里的目标域一致。
+
+
 ### 抓真实 ClientHello：tools/hellocap
 
 上面的指纹是拿 utls 的 `HelloChrome_133` 顶的，而客户端 UA 是 Chrome/142。要真正复刻

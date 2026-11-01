@@ -124,8 +124,12 @@ func genExtension(e Extension) (string, string) {
 		return fmt.Sprintf("&utls.KeyShareExtension{KeyShares: []utls.KeyShare{%s}},", strings.Join(ks, ", ")),
 			"Data 故意留空 —— utls 每次现生成密钥，别把抓到的公钥钉进来"
 	case 65037:
-		return fmt.Sprintf("&utls.GenericExtension{Id: %d, Data: []byte{%s}},", e.Type, hexList(e.Data)),
-			"ECH 内含 HPKE 公钥，原样搬会复用同一把 —— 抓包里有就说明客户端在用，但这份字节要不要留需人工判断"
+		// ECH 的 config 里带 HPKE 公钥。原样搬等于每次握手都发同一把公钥，
+		// 比不发更糟（服务端/风控能看到固定值）。所以默认**注释掉**，要留得人工确认。
+		return fmt.Sprintf("		// &utls.GenericExtension{Id: %d, Data: []byte{%s}},\n"+
+				"		//   ↑ ECH：内含 HPKE 公钥（%d 字节），原样搬会每次发同一把。",
+				e.Type, hexList(e.Data), len(e.Data)),
+			"ECH 已注释：要保留需自行替换成 utls 的 ECH 构造或每次现生成"
 	case 17613:
 		var protos []string
 		for _, p := range extractALPN(e.Data) {
