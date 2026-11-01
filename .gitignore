@@ -13,6 +13,7 @@ config.json
 /signin_bin
 /tw2api
 /server
+/hellocap
 
 # 文档(doc 排除上传): 本地 md 不入库,README 除外
 *.md

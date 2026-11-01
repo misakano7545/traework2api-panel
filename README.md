@@ -604,6 +604,45 @@ utls 侧带 GREASE 与 17 个扩展。ALPN 那列是「Go 根本不 offer」对�
 INTL 的 `1005 {plan:4}` 是付费档门控，绕法是走 `custom_model_gpt-5` 槽位
 （`openai/gpt-5.6-sol`），这条能出正文，也是唯一能证明「会话真的产出内容」的路径。
 
+### 抓真实 ClientHello：tools/hellocap
+
+上面的指纹是拿 utls 的 `HelloChrome_133` 顶的，而客户端 UA 是 Chrome/142。要真正复刻
+142 的握手，得先有它的 ClientHello 字节 —— 抓这个**不需要证书、不需要解密**，握手第一步
+就能断开。
+
+```bash
+# 1) 编译并起桩（默认监听 127.0.0.1:8443）
+go build -o hellocap ./tools/hellocap
+./hellocap -addr 127.0.0.1:8443 -out ./cap-out -once -timeout 30s
+
+# 2) 把系统代理指到 127.0.0.1:8443，然后启动 Trae 客户端、随便点一次对话
+# 3) 桩会把首条 ClientHello 落四样东西：
+#      hello-1.bin     原始字节
+#      hello-1.hex      hex（肉眼核对用）
+#      hello-1.json     解析结果（套件 / 扩展 / group / sigalg / key_share）
+#      spec-1.go.txt    可直接编译的 utls ClientHelloSpec
+```
+
+桩同时支持两种入口：走 HTTP 代理的 `CONNECT host:443`（先回 200 再读 TLS）和透明代理/
+直连（第一个字节就是 `0x16`）。抓到就关连接，客户端会报握手失败 —— 那是预期的。
+
+输出里会带一份与 `HelloChrome_133` 的结构 diff（套件顺序、扩展顺序与集合、groups、
+sigalgs、key_share 组、ALPN、两个 JA3/JA4），差在哪一眼能看到。
+
+**三个踩过的坑**（都写进代码注释了）：
+
+- `supported_versions` 的前缀是 **1 字节**长度，不是 groups/sigalgs 那种 2 字节。
+  读错会把 `0x0304` 变成 `0x0403`。
+- JA4 的三处计数（版本、套件数、扩展数）**都要先滤掉 GREASE**。Chrome 系会在
+  `supported_versions` 里塞 `0xbaba`，不过滤的话最大值变成 47770，版本直接算成 `00`。
+- 生成的 spec 里 `KeyShareExtension` 的 `Data` **必须留空** —— utls 会为每个 group
+  现生成密钥。把抓到的公钥钉进去，等于每次握手都发同一把，比不伪装还糟。
+
+生成完怎么用：把 `spec-1.go.txt` 里的 `capturedSpec` 贴进 `internal/upstream/tls.go`，
+加一个档位，然后跑 `TestBuiltSpecStillHandshakes`（它会用这份 spec 真握手一次）——
+红了就是 spec 构造有问题，别直接上生产。
+
+
 ### ug 族（签到 / 积分 / 额度）也分地区
 
 `UgHeaders` 原先对国际账号发的是国内那套头，2026-10-30 补上了分叉。两区实测差异：
