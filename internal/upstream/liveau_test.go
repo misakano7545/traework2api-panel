@@ -220,6 +220,107 @@ func TestLiveAccountCheckinStatus(t *testing.T) {
 	}
 }
 
+// TestLiveAccountIntlSlot 走国际版的租户槽位旁路。
+//
+// 国际版 gpt-6-sol / gpt-6-luna 直发回 1005（要付费档），但同一批模型在
+// custom_model_gpt-5 槽位里以 openai/gpt-5.6-sol|luna 命名时能出正文
+// （见 constants.go 的 intlSlotRoutes）。这条用来验证「会话真的能出内容」，
+// 而不是只验证「流能建起来」。
+func TestLiveAccountIntlSlot(t *testing.T) {
+	if os.Getenv("TW2A_LIVE_CHAT") == "" {
+		t.Skip("会吃额度，显式 TW2A_LIVE_CHAT=1 才跑")
+	}
+	for _, tk := range findTickets(t) {
+		if ticketRealm(tk.Host) != auth.RealmIntl {
+			continue
+		}
+		a := authFromTicket(tk)
+		up := New()
+		for _, name := range []string{"gpt-6-sol", "gpt-6-luna"} {
+			route, ok := IntlSlotRoute(name)
+			if !ok {
+				continue
+			}
+			payload := `{"messages":[{"role":"user","content":[{"type":"text","text":"说一个字"}]}],"stream":true,"config_name":` +
+				strconv.Quote(route.Slot) + `,"model":` + strconv.Quote(route.Model) + `}`
+			start := time.Now()
+			rc, status, body, err := up.ChatStream(a, []byte(payload))
+			if err != nil {
+				t.Logf("slot %s→%s 发起失败(%v) status=%d body=%.160s", name, route.Model, time.Since(start), status, body)
+				continue
+			}
+			raw, _ := io.ReadAll(io.LimitReader(rc, 256<<10))
+			rc.Close()
+			text := string(raw)
+			code, msg := bizError(text)
+			snippet := extractText(text, 40)
+			t.Logf("slot %s→%s 耗时=%v 字节=%d 正文=%q 业务码=%d msg=%.50s",
+				name, route.Model, time.Since(start), len(raw), snippet, code, msg)
+			t.Logf("   流头: %s", headRunes(text, 500))
+			if snippet != "" {
+				return
+			}
+		}
+		t.Log("国际槽位旁路也没出正文")
+	}
+}
+
+// TestLiveAccountChatCoder 走 coder 通道（function=solo_coder）。
+//
+// 4011 是**通道级**限流：同一账号在 work 通道被拒时，coder 通道常常还是通的
+// （README 里 gemini-3.1-pro 那条记录就是这个现象）。这条用来分辨
+// 「账号被限」还是「整条链路坏了」—— 前者换通道能出正文，后者两条一起死。
+func TestLiveAccountChatCoder(t *testing.T) {
+	if os.Getenv("TW2A_LIVE_CHAT") == "" {
+		t.Skip("会吃额度，显式 TW2A_LIVE_CHAT=1 才跑")
+	}
+	for _, tk := range findTickets(t) {
+		if !strings.Contains(tk.Host, "api5-normal.mchost.guru") {
+			continue // coder 通道只在 CN agent 主机上验
+		}
+		a := authFromTicket(tk)
+		up := New()
+		models, err := up.FetchModels(a)
+		if err != nil || len(models) == 0 {
+			t.Fatalf("拉模型表失败: %v", err)
+		}
+		// coder 通道的模型名里带 gemini / claude 的那批是另一张表。
+		var candidates []string
+		for _, m := range models {
+			if strings.Contains(m.ID, "gemini") || strings.Contains(m.ID, "claude") {
+				candidates = append(candidates, m.ID)
+			}
+		}
+		if len(candidates) == 0 {
+			candidates = []string{models[0].ID}
+		}
+		if len(candidates) > 3 {
+			candidates = candidates[:3]
+		}
+		for _, model := range candidates {
+			payload := `{"messages":[{"role":"user","content":[{"type":"text","text":"说一个字"}]}],"stream":true,"function":` +
+				strconv.Quote(FunctionCoder) + `,"config_name":` + strconv.Quote(model) + `,"model":` + strconv.Quote(model) + `}`
+			start := time.Now()
+			rc, status, body, err := up.ChatStream(a, []byte(payload))
+			if err != nil {
+				t.Logf("coder %-24s 发起失败(%v) status=%d body=%.160s", model, time.Since(start), status, body)
+				continue
+			}
+			raw, _ := io.ReadAll(io.LimitReader(rc, 256<<10))
+			rc.Close()
+			text := string(raw)
+			code, msg := bizError(text)
+			snippet := extractText(text, 40)
+			t.Logf("coder %-24s 耗时=%v 字节=%d 正文=%q 业务码=%d msg=%.50s",
+				model, time.Since(start), len(raw), snippet, code, msg)
+			if snippet != "" {
+				return // 出正文即为通过
+			}
+		}
+		t.Log("coder 通道也没出正文")
+	}
+}
+
 // TestLiveAccountChatStream 真发一次 SSE 对话 —— 这条会吃额度。
 // 两区各一次，同一句最短的问候，读到首帧就收。
 func TestLiveAccountChatStream(t *testing.T) {
