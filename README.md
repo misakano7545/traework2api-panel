@@ -42,7 +42,9 @@ token 自动刷新。入站三种协议：`chat_completions`（`POST /v1/chat/co
 `codex_responses`（`POST /v1/responses`）、`anthropic_messages`（`POST /v1/messages`，
 同样接受 `POST /messages`）。
 
-纯 Go 标准库，零第三方依赖。
+只引三个第三方库，全在出站伪装这一层：`refraction-networking/utls`（TLS 握手
+ClientHello 指纹）、`andybalholm/brotli` 与 `klauspost/compress/zstd`（响应解压，
+utls 的传递依赖）。业务逻辑仍是纯标准库。
 
 ## 核心能力
 
@@ -497,13 +499,13 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 | `traceparent` | CN 有；INTL 只有 `x-flow-traceparent` | 改成仅 CN |
 | `x-harness` | CN 有，INTL 无 | 改成仅 CN |
 | `x-trae-request-id` | INTL chat 独有（uuidv4） | 补 |
-| `Accept-Encoding` | `gzip, deflate, br, zstd` | 显式发 `gzip, deflate`（见下条注意事项） |
+| `Accept-Encoding` | `gzip, deflate, br, zstd` | 四值完整复刻（解压见下） |
 
 **Accept-Encoding 的坑**：`net/http` 的透明解压在 `Accept-Encoding` 非空时**会关掉**
 （`transport.go` 里 `requestedGzip` 只在 header 为空时置真）。所以自己写这个头就必须
-自己解压，否则读到的是压缩字节 —— `wire.go` 的 `decodeBody` 接管了 gzip/flate。
-只 advertise 这两个是刻意的：br/zstd 标准库没有，advertise 了解不了，上游真回 brotli
-就是全链路坏掉，代价远大于少两个值。（`go.mod` 现在零依赖，为这个引第三方库不划算。）
+自己解压，否则读到的是压缩字节 —— `wire.go` 的 `decodeBody` 接管了全部四种编码：
+gzip/deflate 走标准库，br 走 `andybalholm/brotli`，zstd 走 `klauspost/compress/zstd`。
+后两个是 utls 的传递依赖，本来就在树里，补齐四值不再额外增重。
 
 **故意没做的三条**：
 
@@ -512,15 +514,43 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
   按 key 字母序写出，且**顺序不可控**。要一致只能绕开 `net/http` 自己拼报文 ——
   等于重造连接池、keep-alive、chunked 与并发安全，风险远高于收益。大小写已经对齐，
   顺序留着。
-- **br / zstd**：见上。
 - **`X-Medusa` / `X-Helios` / `x-request-pin` / `x-requested-at`**：客户端这几条伴随
   的是**加密 body**，本仓发明文，带了反而 400。这条差异无法用「头对齐」消除，
   只能实现那套加密 —— 属于另一件事。
+- **请求体加密**：同上，是最硬的一条差异（见本文前面的结论）。
 
-TLS 层同样没动：Go `crypto/tls` 的 ClientHello 是 13 个套件、单 supported_group
-（只有 x25519）、扩展 10 个、**无 GREASE**；客户端走 aha/TTNet（BoringSSL 系）。
-要像只能引 `utls` 自己构造 ClientHello spec，会破零依赖，且 `HelloChrome_Auto`
-模拟的是 Chrome 不是 TTNet —— 只能说「更像浏览器」，不等于「像客户端」。
+### TLS 指纹：从脚本栈换成浏览器栈
+
+请求头是 HTTP 层的，TLS 握手在它之前就完成了 —— 光对齐 header，在做过 JA4 的
+风控眼里还是脚本。`crypto/tls` 的 ClientHello 是「单 supported_group(x25519) /
+**无 GREASE** / 10 个扩展」；浏览器系（BoringSSL）是「多套件 / 多 group / 带
+GREASE / 十几个扩展含 ALPS·ECH」。同一台机打同一目标，两个 JA3：
+
+```
+crypto/tls       771,49195-49199-…,0-11-65281-23-18-5-10-13-50-43-51,4587,0
+utls Chrome_133  771,43690-4865-…,10794-35-23-13-65037-5-43-27-16-…,4588,0
+```
+
+`internal/upstream/tls.go` 用 `refraction-networking/utls` 接管握手，默认
+`chrome_133`（utls v1.8.2 支持的最高档）。配置项 `upstream.tls_fingerprint`
+（环境变量 `TW2A_TLS_FINGERPRINT`）可选 `chrome_133 / chrome_131 / chrome_120 / go`，
+热生效；`go` = 回退原生握手，用于怀疑被 TLS 层针对时的对照。
+
+**这不是逐字节一致，只是从「脚本栈」变成「浏览器栈」**：客户端抓包时 UA 是
+Chrome/142，utls 最高 133，中间九个版本主要差在 PQ key share 的排布；而且当年
+MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复刻得重新抓一次握手
+（抓 ClientHello 不需要解密，起个裸 TCP 记录首条记录即可）。
+
+**ALPN 是必须收窄的**：浏览器默认 offer `h2, http/1.1`，而我们已经关掉 h2
+（客户端是 h1 + `Connection: keep-alive`）。真协商到 h2 就会用 h1 报文去说 h2，
+直接坏掉 —— 所以 ALPN 只发 `http/1.1`。代价是 JA4 的 ALPN 段与真浏览器不同，
+这是「能跑」和「完全一致」之间必须选一个。
+
+接线上的两个坑：
+- 用 `DialTLSContext` 接管后 `http.Transport` **不再看** `TLSClientConfig`，
+  `InsecureSkipVerify` 等要自己从里面继承，否则自签环境直接验签失败。
+- `setHeaderTimeout` 原先断言 `*http.Transport` 改字段，包了 `headerCaseTransport`
+  之后会静默失效 —— 改成走接口（`SetResponseHeaderTimeout`）。
 
 ### ug 族（签到 / 积分 / 额度）也分地区
 
