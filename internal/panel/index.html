@@ -178,8 +178,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .inline { display: flex; align-items: center; gap: 9px; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
+/* 列数按格数自适应而不是写死：本仓 KPI 可见 6~7 格，国际额度的美元格还会动态出现第 8 格，
+   写死列数会让多出来的那一格单独掉到第二行，破坏基线「单行等分 + 细分割线」的形态。 */
 .stats {
-  display: grid; grid-template-columns: repeat(6, 1fr);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
@@ -230,12 +232,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 10px 9px; }
-.who { min-width: 118px; max-width: 200px; }
+.who { min-width: 130px; max-width: 240px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
