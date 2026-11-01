@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 // rawHead 起一个裸 TCP 监听，把客户端写出的**原始** HTTP 头逐行返回。
@@ -103,10 +106,11 @@ func TestDecodeBodyGzipRoundtrip(t *testing.T) {
 	}
 }
 
-// 只 advertise gzip/deflate，真收到别的编码要明确报错，不能把压缩字节当正文喂给上层。
+// 只 advertise gzip/deflate/br/zstd，真收到别的编码要明确报错，
+// 不能把压缩字节当正文喂给上层。
 func TestDecodeBodyRejectsUnadvertisedEncoding(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Encoding", "br")
+		w.Header().Set("Content-Encoding", "compress")
 		_, _ = w.Write([]byte("\x00\x01binary"))
 	}))
 	defer srv.Close()
@@ -115,10 +119,62 @@ func TestDecodeBodyRejectsUnadvertisedEncoding(t *testing.T) {
 	resp, err := cl.Get(srv.URL)
 	if err == nil {
 		resp.Body.Close()
-		t.Fatal("收到 br 却当成明文返回了，上层会读到压缩字节")
+		t.Fatal("收到 compress 却当成明文返回了，上层会读到压缩字节")
 	}
 	if !strings.Contains(err.Error(), "Content-Encoding") {
 		t.Fatalf("错误信息应点明编码问题，得到 %v", err)
+	}
+}
+
+// br 与 zstd 是客户端 advertise 的另外两种，必须能解 —— 否则一改就全链路坏。
+func TestDecodeBodyBrotliAndZstd(t *testing.T) {
+	const payload = `{"ok":true,"msg":"中文也要能解"}`
+
+	t.Run("br", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Encoding", "br")
+			bw := brotli.NewWriter(w)
+			_, _ = bw.Write([]byte(payload))
+			_ = bw.Close()
+		}))
+		defer srv.Close()
+		assertDecoded(t, srv.URL, payload)
+	})
+
+	// zstd
+	t.Run("zstd", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Encoding", "zstd")
+			zw, err := zstd.NewWriter(w)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, _ = zw.Write([]byte(payload))
+			_ = zw.Close()
+		}))
+		defer srv.Close()
+		assertDecoded(t, srv.URL, payload)
+	})
+}
+
+func assertDecoded(t *testing.T, url, want string) {
+	t.Helper()
+	cl := &http.Client{Timeout: 5 * time.Second, Transport: newWireTransport(&http.Transport{})}
+	resp, err := cl.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != want {
+		t.Fatalf("解压结果=%q want %q", body, want)
+	}
+	if resp.Header.Get("Content-Encoding") != "" {
+		t.Errorf("解压后应删掉 Content-Encoding，得到 %q", resp.Header.Get("Content-Encoding"))
 	}
 }
 

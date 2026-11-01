@@ -59,6 +59,11 @@ func applyUpstream(up *upstream.Client, c *Config) {
 	)
 	upstream.SetIdentity(c.Upstream.UserAgent, c.Upstream.ClientVersion)
 	upstream.SetDevice(c.Upstream.DeviceBrand, c.Upstream.OsVersion)
+	// TLS 指纹：空 = 内置默认（chrome_133）。值非法只记日志不拦启动 ——
+	// 这一层是「更像客户端」的增强，不该成为起不来的单点。
+	if err := upstream.SetTLSFingerprint(c.Upstream.TLSFingerprint); err != nil {
+		log.Printf("[upstream] TLS 指纹配置无效，沿用当前档位（%s）: %v", upstream.TLSFingerprintName(), err)
+	}
 	// agent 基址：显式配置优先，留空回落内置常量；两者都只是「兜底」——
 	// domains.go 的自动发现一旦拿到结果就覆盖它们（见 Client.effectiveAgentBase）。
 	// 这里**必须显式写回**（不能只在非空时赋值）：否则面板里清空该项后，旧值会留在

@@ -124,11 +124,10 @@ func SOLOHeaders(req *http.Request, a *auth.Auth, stream bool) {
 	req.Header.Set("App-Version", currentIdeVersionFor(realm))
 	req.Header.Set("X-Tt-Trace-Id", soloTtTraceID())
 	req.Header.Set("Connection", "keep-alive")
-	// 客户端发四值 gzip, deflate, br, zstd。这里只 advertise 两个标准库能解的值：
+	// 客户端发四值 gzip, deflate, br, zstd —— 完整复刻。
 	// 显式写 Accept-Encoding 会关掉 net/http 的自动解压，解压改由 wire.go 的
-	// decodeBody 负责；advertise 了 br/zstd 却解不了，上游真回 brotli 就是全链路 502。
-	// 另外三值/四值的进一步对齐要引入第三方解压库，见 README。
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	// decodeBody 负责（gzip/deflate 走标准库，br/zstd 走 utls 带进来的两个库）。
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 
 	// 故意不发 x-request-pin / x-requested-at：这两个是客户端**加密载荷**的伴随头
 	// （带它们的那次实测 body 是 X-Medusa/X-Helios 密文）。本仓发明文 body，带上它们上游
@@ -319,9 +318,8 @@ func UgHeaders(req *http.Request, a *auth.Auth) {
 	h.Set("Sec-Fetch-Site", "none")
 	h.Set("X-Request-Id", ugUUIDv4())
 	applyUgRealmHeaders(h, realm)
-	// 与 SOLO 链路同口径：显式写 Accept-Encoding（否则 Go 只发 gzip，是脚本特征），
-	// 解压由 wire.go 的 decodeBody 统一负责。只 advertise 标准库能解的两个值。
-	h.Set("Accept-Encoding", "gzip, deflate")
+	// 与 SOLO 链路同口径：四值完整复刻，解压由 wire.go 的 decodeBody 统一负责。
+	h.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 
 // applyUgRealmHeaders 两区 ug 族各自独有的头。

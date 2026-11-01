@@ -12,12 +12,17 @@ package upstream
 import (
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 // clientUpperHeaders 是 2026-10-30 抓包里**首字母大写**的那几条。
@@ -71,10 +76,9 @@ func (t *headerCaseTransport) RoundTrip(r *http.Request) (*http.Response, error)
 // 加 gzip、也不再透明解压（transport.go 里 requestedGzip 只在 header 为空时置真）。
 // 而客户端发的是多值，不显式写就少一层伪装。
 //
-// 只支持 gzip 与 deflate：这两个标准库有，且我们**只 advertise 这两个**，
-// 上游不会回 brotli/zstd，所以不存在解不了的分支。要上 br/zstd 得先引入
-// 第三方解压库（会破当前零依赖），收益是 Accept-Encoding 字符串完整对齐 ——
-// 记在 README 的待办里。
+// 四种编码都支持：gzip / deflate 走标准库，br 走 andybalholm/brotli，
+// zstd 走 klauspost/compress/zstd —— 这两个是 utls 的传递依赖，本来就在树里，
+// 所以补齐四值不再额外增重。
 func decodeBody(resp *http.Response) (*http.Response, error) {
 	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	if enc == "" || enc == "identity" {
@@ -91,9 +95,18 @@ func decodeBody(resp *http.Response) (*http.Response, error) {
 		rc = zr
 	case "deflate":
 		rc = flate.NewReader(resp.Body)
+	case "br":
+		rc = io.NopCloser(brotli.NewReader(resp.Body))
+	case "zstd":
+		zr, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("zstd 响应解压失败: %w", err)
+		}
+		rc = zstdCloser{zr}
 	default:
 		resp.Body.Close()
-		return nil, fmt.Errorf("不支持的 Content-Encoding %q（只发 gzip/deflate，不该收到这个）", enc)
+		return nil, fmt.Errorf("不支持的 Content-Encoding %q", enc)
 	}
 	resp.Body = &decodedBody{Reader: rc, raw: resp.Body}
 	// 解压后长度与编码都不再成立，留着会让上层读错。
@@ -103,6 +116,12 @@ func decodeBody(resp *http.Response) (*http.Response, error) {
 	resp.Uncompressed = true
 	return resp, nil
 }
+
+// zstdCloser 让 *zstd.Decoder 满足 io.ReadCloser。
+type zstdCloser struct{ d *zstd.Decoder }
+
+func (z zstdCloser) Read(p []byte) (int, error) { return z.d.Read(p) }
+func (z zstdCloser) Close() error              { z.d.Close(); return nil }
 
 // decodedBody 关掉解压器时一并关掉底层连接，避免 SSE 长流泄漏。
 type decodedBody struct {
@@ -127,9 +146,18 @@ func (t *headerCaseTransport) SetResponseHeaderTimeout(d time.Duration) {
 
 // newWireTransport 建一个「报文形态贴近官方客户端」的 Transport。
 //
-// 关掉 HTTP/2 是刻意的：客户端抓包里是 HTTP/1.1（带 Connection: keep-alive），
-// 而 http2 明确拒绝 Connection 头。TLSNextProto 给一个非 nil 的空 map 就禁用 h2。
+// 两件事在这里一起定：
+//   - 关掉 HTTP/2（客户端抓包里是 HTTP/1.1 + Connection: keep-alive，而 http2
+//     明确拒绝 Connection 头）。TLSNextProto 给一个非 nil 的空 map 就禁用 h2。
+//   - TLS 握手改走 utls 的浏览器指纹（见 tls.go）。用 DialTLSContext 接管后，
+//     http.Transport 不再自己做 TLS，返回的必须是已握手的连接。
 func newWireTransport(base *http.Transport) *headerCaseTransport {
 	base.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	base.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// 接管握手后 Transport 不再看 TLSClientConfig，这里必须自己继承它的
+		// InsecureSkipVerify，否则测试里挂自签证书会直接验签失败。
+		insecure := base.TLSClientConfig != nil && base.TLSClientConfig.InsecureSkipVerify
+		return dialTLSWithFingerprint(ctx, network, addr, currentTLSFingerprint(), insecure)
+	}
 	return &headerCaseTransport{base: base}
 }

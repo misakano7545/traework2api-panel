@@ -74,6 +74,11 @@ type Config struct {
 		// 读的是真机；留空用内置兜底值（等于所有账号共用一台不存在的机器）。
 		DeviceBrand string `json:"device_brand"`
 		OsVersion   string `json:"os_version"`
+		// TLSFingerprint 出站 TLS ClientHello 指纹档位：chrome_133（默认）/ chrome_131 /
+		// chrome_120 / go。请求头是 HTTP 层的，TLS 握手在它之前就完成了 —— 用 crypto/tls
+		// 发包，JA3/JA4 是脚本栈形态（无 GREASE、单 group），做过握手指纹的风控先看这一层。
+		// go = 回退原生握手（怀疑被 TLS 层针对时用）。热生效。
+		TLSFingerprint string `json:"tls_fingerprint"`
 		// HostDiscovery 是否按 TNC 域名下发自动跟进 agent 基址（默认开，见
 		// internal/upstream/domains.go）。关掉 = 只用 agent_host / 内置常量。
 		HostDiscovery bool `json:"host_discovery"`
@@ -302,6 +307,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("TW2A_CLIENT_VERSION"); v != "" {
 		c.Upstream.ClientVersion = v
+	}
+	if v := os.Getenv("TW2A_TLS_FINGERPRINT"); v != "" {
+		c.Upstream.TLSFingerprint = v
 	}
 	if v := os.Getenv("TW2A_MAX_IN_FLIGHT"); v != "" {
 		envInt("TW2A_MAX_IN_FLIGHT", v, &c.Pool.MaxInFlight)
