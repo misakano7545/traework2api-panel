@@ -536,15 +536,14 @@ crypto/tls       771,49195-49199-…,0-11-65281-23-18-5-10-13-50-43-51,4587,0
 utls Chrome_133  771,43690-4865-…,10794-35-23-13-65037-5-43-27-16-…,4588,0
 ```
 
-`internal/upstream/tls.go` 用 `refraction-networking/utls` 接管握手，默认
-`chrome_133`（utls v1.8.2 支持的最高档）。配置项 `upstream.tls_fingerprint`
-（环境变量 `TW2A_TLS_FINGERPRINT`）可选 `chrome_133 / chrome_131 / chrome_120 / go`，
-热生效；`go` = 回退原生握手，用于怀疑被 TLS 层针对时的对照。
+`internal/upstream/tls.go` 用 `refraction-networking/utls` 接管握手。默认档是 **`aha`**
+（官方客户端 aha/TTNet 的真实形状，按抓包复刻，见上一节），其余可选
+`chrome_133 / chrome_131 / chrome_120 / go`。配置项 `upstream.tls_fingerprint`
+（环境变量 `TW2A_TLS_FINGERPRINT`）热生效；`go` = 回退原生握手，用于对照。
 
-**这不是逐字节一致，只是从「脚本栈」变成「浏览器栈」**：客户端抓包时 UA 是
-Chrome/142，utls 最高 133，中间九个版本主要差在 PQ key share 的排布；而且当年
-MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复刻得重新抓一次握手
-（抓 ClientHello 不需要解密，起个裸 TCP 记录首条记录即可）。
+**`aha` 档已经是逐项复刻**（套件 / GREASE / groups / sigalgs / 扩展集合 / padding 都按
+抓包对齐，见上一节）。`chrome_*` 那几档只是备选与对照 —— 它们比真客户端多出整个 PQ
+key share 与 ECH，在 JA3/JA4 上是对不上的。
 
 **ALPN 是必须收窄的**：浏览器默认 offer `h2, http/1.1`，而我们已经关掉 h2
 （客户端是 h1 + `Connection: keep-alive`）。真协商到 h2 就会用 h1 报文去说 h2，
