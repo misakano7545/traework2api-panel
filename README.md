@@ -569,10 +569,28 @@ MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复�
 结论：**用 Chrome 指纹冒充这个客户端，在 JA3/JA4 上是对不上的** —— 多出整个 PQ key share
 和 ECH，groups 集合也不同。`internal/upstream/tls_aha.go` 按抓包复刻了真实形状。
 
-**默认档就是 `aha`**（2026-11-01 定）。中间踩过一次坑：最初加上 padding 扩展后
-`api.trae.cn` 回 `handshake failure`，当时误判成「Tengine 不认这个形状」，就把默认档
-退回了 `chrome_133`。后来用 `TestBisectTraeCN` 逐项变量二分，发现**只有 padding 是
-触发点** —— 去掉它之后四个生产主机（含 `api.trae.cn`）全部握手成功，`aha` 转正。
+**默认档就是 `aha`**（2026-11-01 定），四个生产主机（含 `api.trae.cn`）实测全通，
+padding 按抓包的 220 字节原样保留。
+
+中间连着踩了两个坑，都记在这里免得重来：
+
+1. **把 padding 当成 Tengine 的雷**。加 padding 后 `api.trae.cn` 报 `handshake failure`，
+   一度判成「阿里 Tengine 不认 padding」并把默认档退回 `chrome_133`。实际元凶是
+   `specWithALPN` 里对 utls 预置档（ID 档）也做了 KeyShare 重建，把 spec 改坏 ——
+   修掉之后 padding 和无 padding 都能握。
+2. **拿单次握手当结论**。这台网关在连续握手时会抖，同一条 spec 前一秒成功后一秒
+   `handshake failure`。`TestAhaStabilityTraeCN` 连打 6 次统计：aha 带 padding 6/6、
+   去 padding 6/6、`chrome_133` 6/6 —— 三档都稳，之前的「失败」是抖动。
+
+真账号实测（默认档 aha）：CN 主链路出正文 18.8KB / 业务码 0，模型表 29/31 条，
+ug 族只读业务（付费身份 / 额度 / 积分包）全 200。
+
+要回退或对照：
+
+```bash
+TW2A_TLS_FINGERPRINT=chrome_133   # 或 aha / chrome_131 / chrome_120 / go
+```
+
 
 真账号实测（默认档）：CN 主链路出正文 21.4KB / 业务码 0，模型表 29 条，
 ug 族只读业务（付费身份 / 额度 / 积分包）全 200。

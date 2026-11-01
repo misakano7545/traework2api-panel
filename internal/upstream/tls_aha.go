@@ -65,7 +65,13 @@ var ahaSpec = &utls.ClientHelloSpec{
 		// 17513 = application_settings（ALPS 的旧 id，Chromium 用 17613）。值是 "h2"。
 		&utls.GenericExtension{Id: 17513, Data: []byte{0x00, 0x03, 0x02, 0x68, 0x32}},
 		&utls.UtlsGREASEExtension{},
-		// padding 暂时不发：api.trae.cn（Tengine）对带 padding 的 aha spec 直接回
-		// handshake failure，而 api5-normal 接受。定位实验用，先关掉。
+		// padding：抓包里是 220 字节固定零，而且是扩展列表的最后一条。
+		//
+		// 早先这里有段错误结论：加上 padding 后 api.trae.cn 回 handshake failure，
+		// 一度被判成「Tengine 不认 padding」。后来的 TestBisectTraeCN 把每个变体单独
+		// 跑一遍，padding 固定 220B 与 utls 自动档**都能握手成功** —— 真正的元凶是
+		// specWithALPN 里对 ID 档位也做了 KeyShare 重建，把 spec 改坏了。修掉之后
+		// padding 照抓包补回来。
+		&utls.GenericExtension{Id: 21, Data: make([]byte, 220)},
 	},
 }

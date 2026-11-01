@@ -73,7 +73,49 @@ func handshakeOnce(host string, fp *tlsFingerprint) error {
 	return conn.HandshakeContext(ctx)
 }
 
-// TestBisectTraeCN 逐项变量打 api.trae.cn，找出哪一条让 Tengine 拒绝。
+// TestAhaStabilityTraeCN 对 api.trae.cn 连打多次，统计 aha 档的成功率。
+//
+// 单次结果不可信：这台网关（阿里 Tengine）在连续握手时会抖，同一条 spec 前一秒
+// 成功、后一秒 handshake failure。要判断「某条扩展是不是被拒」，必须看成功率，
+// 不能看单次。
+func TestAhaStabilityTraeCN(t *testing.T) {
+	const host = "api.trae.cn"
+	const rounds = 6
+
+	cases := []struct {
+		name string
+		fp   *tlsFingerprint
+	}{
+		{"aha(带 padding)", ahaFingerprint()},
+		{"aha(去 padding)", variantSpec("no-pad", func(s *utls.ClientHelloSpec) {
+			var kept []utls.TLSExtension
+			for _, e := range s.Extensions {
+				if g, ok := e.(*utls.GenericExtension); ok && g.Id == 21 {
+					continue
+				}
+				kept = append(kept, e)
+			}
+			s.Extensions = kept
+		})},
+		{"chrome_133", chromeFingerprint(utls.HelloChrome_133)},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ok, fail := 0, 0
+			var lastErr error
+			for i := 0; i < rounds; i++ {
+				if err := handshakeOnce(host, c.fp); err != nil {
+					fail++
+					lastErr = err
+				} else {
+					ok++
+				}
+			}
+			t.Logf("成功 %d/%d，最后一次错误: %v", ok, rounds, lastErr)
+		})
+	}
+}
 func TestBisectTraeCN(t *testing.T) {
 	const host = "api.trae.cn"
 
@@ -121,6 +163,14 @@ func TestBisectTraeCN(t *testing.T) {
 		})},
 		{"对照 chrome_133", chromeFingerprint(utls.HelloChrome_133)},
 		{"对照 crypto/tls", nil},
+		// 抓包里 padding 是 220 字节固定零，而 utls 的 BoringPaddingStyle 会按包长
+		// 补到 512 的倍数。两者长度不同 —— 试固定 220 能不能让 Tengine 接受。
+		{"padding 固定 220B", variantSpec("pad220", func(s *utls.ClientHelloSpec) {
+			s.Extensions = append(s.Extensions, &utls.GenericExtension{Id: 21, Data: make([]byte, 220)})
+		})},
+		{"padding utls 自动", variantSpec("pad-auto", func(s *utls.ClientHelloSpec) {
+			s.Extensions = append(s.Extensions, &utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle})
+		})},
 	}
 
 	for _, v := range variants {
