@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -278,6 +279,55 @@ func TestWireTransportUsesFingerprint(t *testing.T) {
 		t.Fatalf("走生产 Transport 握手失败: %v", err)
 	}
 	resp.Body.Close()
+}
+
+// 换了握手层之后，连接复用、gzip 响应、多次请求都得照旧 ——
+// 只对齐特征把功能搞坏是最坏的结果。
+func TestWireTransportEndToEnd(t *testing.T) {
+	const payload = `{"ok":true}`
+	var hits int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		// 第 1 次压 gzip，第 2 次不压：两种分支都走一遍。
+		if hits == 1 {
+			w.Header().Set("Content-Encoding", "gzip")
+			zw := gzip.NewWriter(w)
+			_, _ = zw.Write([]byte(payload))
+			_ = zw.Close()
+			return
+		}
+		_, _ = w.Write([]byte(payload))
+	}))
+	srv.StartTLS()
+	defer srv.Close()
+
+	tr := newWireTransport(&http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 4,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+	})
+	cl := &http.Client{Timeout: 5 * time.Second, Transport: tr}
+
+	for i := 0; i < 2; i++ {
+		resp, err := cl.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("第 %d 次请求失败: %v", i+1, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("第 %d 次读 body 失败: %v", i+1, err)
+		}
+		if string(body) != payload {
+			t.Fatalf("第 %d 次正文=%q want %q", i+1, body, payload)
+		}
+		if resp.Proto != "HTTP/1.1" {
+			t.Errorf("第 %d 次协议=%s，应该是 HTTP/1.1", i+1, resp.Proto)
+		}
+	}
+	if hits != 2 {
+		t.Fatalf("服务端只收到 %d 次请求", hits)
+	}
 }
 
 func min(a, b int) int {
