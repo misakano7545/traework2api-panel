@@ -552,6 +552,44 @@ MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复�
 - `setHeaderTimeout` 原先断言 `*http.Transport` 改字段，包了 `headerCaseTransport`
   之后会静默失效 —— 改成走接口（`SetResponseHeaderTimeout`）。
 
+### 请求体加密：静态侦察结论（2026-11-01）
+
+客户端 `llm_utils_chat` 的 body 是 base64 包着的二进制，配套 `X-Medusa` / `X-Helios` /
+`X-Neptune` / `x-request-pin` / `x-requested-at` 五件套；本仓发明文 JSON。这是握手与头
+全部对齐之后剩下的唯一实质差异，所以专门查了一遍能不能复刻。
+
+**查了什么**
+
+| 位置 | 结果 |
+|---|---|
+| `Trae CN.exe` 的 strings（22MB） | `medusa` / `helios` / `neptune` **零命中** |
+| `aha_net.dll` / `sscronet.dll` / `metasecml.dll` | 同样零命中 |
+| `resources/app/out/**`（86MB JS） | 零命中 |
+| `libckg.dll` | 命中 `medusa/helios`，但那是代码知识图谱服务（50000 端口、sqlite_vec），字符串巧合 |
+| JS 侧加密库 | 有 `sm4:{encrypt:(i,e,t)=>BRs(i,e,1,t)}` 实现，但**没有 `sm4.encrypt` 调用点** |
+| native `sm4` 符号 | `Trae CN.exe` 扫到 43 处，逐条看上下文全是二进制噪声（`Sm4`），不是符号 |
+
+**抓包 body 的形态**（CN 首条，`body_len=3220` 完整）：
+
+- base64 解码后 2414 字节，高熵，不是 JSON、不是 gzip/zstd（无 `1f8b` / `28b5` 魔数）
+- 2414 mod 16 = 14 —— 不是裸块加密密文；像「nonce + 流加密」或「压缩后再加密」
+- 另外两条抓包（22408 / 155160）是**截断的**：`.reverse/mitm.py` 只记 `body[:4000]`，
+  解码后都是 3000 字节，拿不到完整密文做密码分析
+
+**结论：静态不可复刻。**
+
+头名和算法常量都不在明处 —— 要么在 V8 快照/字节码里，要么做了字符串混淆运行时解密。
+继续挖只有两条路：
+
+1. **动态调试**（Frida hook `BRs` 或 native 导出函数、x64dbg 跟 `llm_utils_chat` 的
+   构造栈），能拿到算法与密钥；但密钥大概率是设备绑定 + 服务端下发，换号就不通用。
+2. **改 mitm 不截断**重抓，先确认完整密文的长度关系（是否 = 明文 + 固定开销），
+   再判断是不是标准 AEAD。
+
+**优先级判断：低。** 上游目前**接受明文 body**（README 前面记过 wirecheck 实测 200，
+本仓真账号也一直用明文跑通），所以这条差异只影响「包像不像」，不影响可用性。
+真正的风险是上游某天把校验从「可选」切成「强制」—— 那是服务端开关，不是本仓能提前
+解决的问题；真到那天，上面的动态调试也得重做一遍。
 
 
 ### 抓到了官方客户端自己的 ClientHello（aha 档）
