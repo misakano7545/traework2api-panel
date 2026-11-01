@@ -42,10 +42,9 @@ type tlsFingerprint struct {
 
 var (
 	tlsMu sync.RWMutex
-	// 默认仍是 chrome_133：aha 形状更「像这个客户端」，但 api.trae.cn（阿里 Tengine）
-	// 对它回 handshake failure，而 ug 族（签到/积分/额度）全走那台。默认档必须四个
-	// 生产主机全通，所以 aha 留作显式可选（见 tls_aha.go 顶部说明）。
-	tlsFP = chromeFingerprint(utls.HelloChrome_133)
+	// 默认用 aha：它是官方客户端 aha/TTNet 网络栈的真实形状（抓包复刻），
+	// 比 chrome_133 更贴近「这个客户端」。四个生产主机（含 api.trae.cn）实测全通。
+	tlsFP = ahaFingerprint()
 )
 
 func chromeFingerprint(id utls.ClientHelloID) *tlsFingerprint {

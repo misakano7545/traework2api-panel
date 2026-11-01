@@ -569,16 +569,20 @@ MITM 终止了 TLS，**没有留下 142 的 ClientHello 样本**，想精确复�
 结论：**用 Chrome 指纹冒充这个客户端，在 JA3/JA4 上是对不上的** —— 多出整个 PQ key share
 和 ECH，groups 集合也不同。`internal/upstream/tls_aha.go` 按抓包复刻了真实形状。
 
-**但默认档仍是 `chrome_133`**：`aha` 形状在 `api5-normal(.alisg).mchost.guru` 与
-`growsg-normal.trae.ai` 上都握手成功，唯独 `api.trae.cn`（阿里 Tengine）回
-`handshake failure` —— 而 ug 族（签到/积分/额度）全走那台。默认档必须四个生产主机全通。
+**默认档就是 `aha`**（2026-11-01 定）。中间踩过一次坑：最初加上 padding 扩展后
+`api.trae.cn` 回 `handshake failure`，当时误判成「Tengine 不认这个形状」，就把默认档
+退回了 `chrome_133`。后来用 `TestBisectTraeCN` 逐项变量二分，发现**只有 padding 是
+触发点** —— 去掉它之后四个生产主机（含 `api.trae.cn`）全部握手成功，`aha` 转正。
 
-真账号实测：`aha` 档在 CN 主链路出正文 16.5KB / 业务码 0，功能没问题；
-要启用得确认你的部署不依赖 `api.trae.cn`：
+真账号实测（默认档）：CN 主链路出正文 21.4KB / 业务码 0，模型表 29 条，
+ug 族只读业务（付费身份 / 额度 / 积分包）全 200。
+
+要回退或对照：
 
 ```bash
-TW2A_TLS_FINGERPRINT=aha   # 或面板 upstream.tls_fingerprint
+TW2A_TLS_FINGERPRINT=chrome_133   # 或 aha / chrome_131 / chrome_120 / go
 ```
+
 
 重抓（客户端版本变了就重来一次）：
 
