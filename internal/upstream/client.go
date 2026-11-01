@@ -248,10 +248,13 @@ func New() *Client {
 		IdleConnTimeout:       60 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
 	}
+	// 只包一次：HTTP / StreamHTTP 必须共用同一个 Transport（连接池复用），
+	// 各自 new 一个就是两个池，SSE 长流会把短请求饿死。
+	wire := newWireTransport(tr)
 	return &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP:    &http.Client{Transport: tr}, // 无总超时
-		BalanceCli:    &http.Client{Timeout: 15 * time.Second, Transport: balanceTr},
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: wire},
+		StreamHTTP:    &http.Client{Transport: wire}, // 无总超时
+		BalanceCli:    &http.Client{Timeout: 15 * time.Second, Transport: newWireTransport(balanceTr)},
 		AgentHost:     AgentHost,
 		AgentHostIntl: AgentHostIntl,
 		UgHost:        UgHost,
@@ -1848,6 +1851,12 @@ func (r *idleTimeoutReader) Close() error { return r.rc.Close() }
 
 func setHeaderTimeout(hc *http.Client, d time.Duration) {
 	if hc == nil {
+		return
+	}
+	// 生产 Transport 被 headerCaseTransport 包了一层（见 wire.go），断言具体类型
+	// 会失败并让热改静默失效，所以先走接口。
+	if s, ok := hc.Transport.(interface{ SetResponseHeaderTimeout(time.Duration) }); ok {
+		s.SetResponseHeaderTimeout(d)
 		return
 	}
 	if tr, ok := hc.Transport.(*http.Transport); ok {

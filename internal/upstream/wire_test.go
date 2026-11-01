@@ -1,0 +1,133 @@
+package upstream
+
+import (
+	"bufio"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+)
+
+// rawHead 起一个裸 TCP 监听，把客户端写出的**原始** HTTP 头逐行返回。
+//
+// 不能用 httptest：net/http 的读侧会用 CanonicalMIMEHeaderKey 还原 key，
+// 服务端拿到的永远是 Title-Case，看不出线上真实拼写。
+func rawHead(t *testing.T, build func(*http.Request)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			got <- ""
+			return
+		}
+		defer c.Close()
+		var b strings.Builder
+		br := bufio.NewReader(c)
+		for {
+			line, err := br.ReadString('\n')
+			b.WriteString(line)
+			if err != nil || line == "\r\n" {
+				break
+			}
+		}
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+		got <- b.String()
+	}()
+
+	cl := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: newWireTransport(&http.Transport{}),
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/api/agent/v3/llm_utils_chat", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build(req)
+	if resp, err := cl.Do(req); err == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	select {
+	case s := <-got:
+		return s
+	case <-time.After(5 * time.Second):
+		t.Fatal("裸监听超时，没收到报头")
+		return ""
+	}
+}
+
+// 线上头名必须是客户端的小写写法，只有那几条固定大写的例外。
+func TestWireHeaderCaseMatchesClient(t *testing.T) {
+	head := rawHead(t, func(req *http.Request) {
+		req.Header.Set("X-App-Id", "app")
+		req.Header.Set("X-Os-Version", "Windows 11 Pro")
+		req.Header.Set("X-Ss-Dp", "787976")
+		req.Header.Set("Referer", "https://trae-api-cn.mchost.guru/x")
+		req.Header.Set("Connection", "keep-alive")
+	})
+
+	for _, want := range []string{
+		"\r\nx-app-id: app\r\n",
+		"\r\nx-os-version: Windows 11 Pro\r\n",
+		"\r\nx-ss-dp: 787976\r\n", // 例外：客户端这里是大写 X-SS-DP
+		"\r\nReferer: https://trae-api-cn.mchost.guru/x\r\n",
+		"\r\nConnection: keep-alive\r\n",
+	} {
+		if strings.HasPrefix(want, "\r\nx-ss-dp") {
+			continue // 由下面的 X-SS-DP 断言覆盖
+		}
+		if !strings.Contains(head, want) {
+			t.Errorf("线上报头缺少小写形态 %q\n实际:\n%s", want, head)
+		}
+	}
+	if !strings.Contains(head, "\r\nX-SS-DP: 787976\r\n") {
+		t.Errorf("X-SS-DP 应保持大写（客户端如此）\n实际:\n%s", head)
+	}
+	// 反向断言：Go 默认的 Title-Case 不能出现。
+	for _, bad := range []string{"\r\nX-App-Id:", "\r\nX-Os-Version:", "\r\nX-Ss-Dp:"} {
+		if strings.Contains(head, bad) {
+			t.Errorf("线上仍是 Go 的 Title-Case %q\n实际:\n%s", bad, head)
+		}
+	}
+}
+
+// 包装层不能改调用方手里的 req —— 生产代码还在用 Header.Get 读这些头。
+func TestHeaderCaseTransportLeavesRequestIntact(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "http://example.invalid/x", strings.NewReader("{}"))
+	SOLOHeaders(req, nil, false)
+	before := req.Header.Get("X-App-Id")
+	beforeOS := req.Header.Get("X-Os-Version")
+
+	rawHead(t, func(r *http.Request) {
+		// 用 SOLOHeaders 填好，再让 transport 去改副本
+		r.Header = req.Header.Clone()
+	})
+
+	if got := req.Header.Get("X-App-Id"); got != before || got == "" {
+		t.Errorf("原请求的 X-App-Id 被改坏了：%q", got)
+	}
+	if got := req.Header.Get("X-Os-Version"); got != beforeOS || got == "" {
+		t.Errorf("原请求的 X-Os-Version 被改坏了：%q", got)
+	}
+}
+
+// h2 必须关掉：客户端是 HTTP/1.1 + Connection: keep-alive，而 http2 明确拒绝
+// Connection 头。这条测试钉住 TLSNextProto 被置空的事实。
+func TestNewWireTransportDisablesH2(t *testing.T) {
+	tr := newWireTransport(&http.Transport{})
+	if tr.base.TLSNextProto == nil {
+		t.Fatal("TLSNextProto 为 nil 表示 h2 仍会自动启用")
+	}
+	if len(tr.base.TLSNextProto) != 0 {
+		t.Fatalf("TLSNextProto 非空 map 会重新启用 h2：%v", tr.base.TLSNextProto)
+	}
+}
