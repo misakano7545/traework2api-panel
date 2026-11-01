@@ -442,8 +442,11 @@ func TestAuditDeltaIntlExpireGatedByNow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
-	if u.Expire != end {
+	if u.Expire != end && end > time.Now().Unix() {
 		t.Fatalf("行为已变：今天（%s）Expire=%d 期望 %d", time.Now().Format(time.RFC3339), u.Expire, end)
+	}
+	if end <= time.Now().Unix() && u.Expire != 0 {
+		t.Fatalf("夹具已过期（%s），Expire 应为 0，实得 %d", time.Unix(end, 0).UTC().Format(time.RFC3339), u.Expire)
 	}
 
 	// 同一份报文，只把 end_time 换成过去 → Expire 立刻变 0（同一段代码、只是 now 不同）。

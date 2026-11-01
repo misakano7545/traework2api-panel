@@ -183,17 +183,21 @@ func TestIntlFixtureUnreadableAsCredits(t *testing.T) {
 	if pu.LimitUSD != 1 || pu.UsedUSD != 0.00059 {
 		t.Errorf("包接口的汇总与明细不一致: limit=%v used=%v", pu.LimitUSD, pu.UsedUSD)
 	}
-	// 到期时间两口径都要有（国际版 expire_time=0，靠 end_time 回落）
-	// end_time 是夹具里的 2026-10-31：到期的包不该再报到期时间（实现带 `e > now` 门槛），
-	// 所以这里按「已过期就不报」判——把期望值钉死在那个日期上，2026-11-01 起这条断言会自己变红。
-	wantExpire := int64(0)
+	// 到期时间两口径都要有（国际版 expire_time=0，靠 end_time 回落）。但两者契约不同：
+	//   u.Expire 带 `e > now` 门槛——过期就不报（0）；
+	//   p.Expire 是包的原始截止时刻，过期后仍原样给出（面板据 diff<=0 渲染「已到期」，
+	//            credit_packages_test.go 也钉着它等于夹具 end_time）。
+	// 所以只有 u 期望值随 now 变，写成两者同一个 now 函数会让断言在夹具到期那天自己变红。
 	const fixtureEnd = 1793491199
+	wantExpire := int64(0)
 	if fixtureEnd > time.Now().Unix() {
 		wantExpire = fixtureEnd
 	}
-	if u.Expire != wantExpire || p.Expire != wantExpire {
-		t.Errorf("国际版到期应回落 end_time=%d（未过期）/ 0（已过期），实得 u=%d p=%d",
-			wantExpire, u.Expire, p.Expire)
+	if u.Expire != wantExpire {
+		t.Errorf("汇总到期应回落 end_time=%d（未过期）/ 0（已过期），实得 %d", wantExpire, u.Expire)
+	}
+	if p.Expire != fixtureEnd {
+		t.Errorf("包的到期应恒等于 end_time=%d（过期也原样报，面板渲染「已到期」），实得 %d", fixtureEnd, p.Expire)
 	}
 }
 
