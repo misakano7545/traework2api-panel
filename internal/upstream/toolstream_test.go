@@ -165,3 +165,51 @@ func TestStreamErrorFrameIsOpenAIObject(t *testing.T) {
 		t.Fatalf("没有下发 OpenAI 形状的错误帧: %q", rr.Body.String())
 	}
 }
+
+// 并行工具调用时，上游会在同一帧里塞一条**只有 index 的空占位**（其余字段全是空串）。
+// 清理空字段后它就成了 {"index":1}：OpenAI 官方 API 从不这么发，严格客户端（ZCode
+// 用 zod 校验）看到 delta.tool_calls[i].function 缺失就判整帧非法、整轮失败
+// —— issue #21 的 original 报错。占位条目不含任何信息，直接丢掉。
+func TestStreamToolCallNoEmptyPlaceholderEntry(t *testing.T) {
+	const raw = `event:output
+data:{"tool_calls":[{"function":{"arguments":"}"},"index":1,"type":"function"},{"function":{"arguments":"","name":""},"id":"","index":1,"type":""},{"function":{"arguments":"","name":"delete_file"},"id":"call_2","index":2,"type":"function"}]}
+
+event:done
+data:{"finish_reason":"stop"}
+
+`
+	rr := httptest.NewRecorder()
+	if _, err := StreamWithError(rr, strings.NewReader(raw), nil, nil); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []map[string]any `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue
+		}
+		for _, ch := range chunk.Choices {
+			for _, tc := range ch.Delta.ToolCalls {
+				if _, ok := tc["function"]; !ok {
+					t.Fatalf("下发了没有 function 的 tool_calls 条目（严格客户端会判帧非法）: %s", data)
+				}
+			}
+		}
+	}
+	if c := concatToolCalls(t, rr.Body.String())[2]; c == nil || c.name != "delete_file" {
+		t.Fatalf("正常的并行条目被误删: %+v", c)
+	}
+}

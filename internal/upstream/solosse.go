@@ -611,6 +611,7 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 					var tc []map[string]any
 					if err := json.Unmarshal(ev.ToolCalls, &tc); err == nil {
 						// SOLO 上游 tool_call 条目用 `function_call` 字段 → 转成 OpenAI 的 `function`
+						kept := tc[:0]
 						for _, call := range tc {
 							if fc, ok := call["function_call"].(map[string]any); ok {
 								call["function"] = fc
@@ -622,11 +623,16 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 								delete(fn, "partial_arguments")
 							}
 							dedupeToolCallDelta(call, tcSent)
+							// 清空字段后只剩 index 的占位条目不含任何信息，而严格客户端
+							// （ZCode 用 zod）见 delta.tool_calls[i].function 缺失就判整帧
+							// 非法、整轮失败 —— OpenAI 官方 API 从不发这种条目，丢掉。
+							if _, ok := call["function"]; ok || call["id"] != nil || call["type"] != nil {
+								kept = append(kept, call)
+							}
 						}
-						delta["tool_calls"] = tc
-						// 空数组不算「见过工具调用」：否则一个纯文本回合也会被改成
-						// tool_calls，正好和下面 done 分支的改写意图相反。
+						tc = kept
 						if len(tc) > 0 {
+							delta["tool_calls"] = tc
 							sawToolCalls = true
 							if stat != nil {
 								stat.ToolCalls = 1
