@@ -280,3 +280,72 @@ func TestContinueReaderSurfacesTransportError(t *testing.T) {
 		t.Errorf("已写出的字节要先交完再报错，实际 %q", out)
 	}
 }
+
+// 16000 是 glm-5.3__max 的墙，裸 glm-5.3 没有（实测 2026-11-03：裸名 21569 不截断）。
+// 键写成裸名 = 正常回复被误续写。
+func TestContinueReaderVariantCap(t *testing.T) {
+	seg16k := strings.Replace(soloCutSeg, `"completion_tokens":32000`, `"completion_tokens":16000`, 1)
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"__max 变体 16000 判截断", `{"model":"glm-5.3__max","messages":[]}`, 1},
+		{"裸名 16000 不判截断", `{"model":"glm-5.3","messages":[]}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, reqs := fakeCutUpstream(t, func(int) (int, string) { return 200, soloNextSeg })
+			r := newTestContinueReader(t, c, tc.body, io.NopCloser(strings.NewReader(seg16k)))
+			if _, err := io.ReadAll(r); err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if len(*reqs) != tc.want {
+				t.Fatalf("续写请求数=%d want %d", len(*reqs), tc.want)
+			}
+		})
+	}
+}
+
+// config_name 恒是裸 ID，查表必须让变体名先于它，否则变体条目永远查不到。
+func TestCutCapVariantBeforeConfigName(t *testing.T) {
+	soloCutCaps["glm-5.3"] = 32000
+	defer delete(soloCutCaps, "glm-5.3")
+	if got := cutCapFor([]byte(`{"model":"glm-5.3__max","config_name":"glm-5.3"}`)); got != 16000 {
+		t.Fatalf("cutCap=%d want 16000（变体键被 config_name 遮住）", got)
+	}
+}
+
+// 续写体按剩余额度下发：原样沿用客户端的 max_tokens，段 2 会再吐一个 cap。
+func TestContinueReaderLimitRemaining(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c,
+		`{"model":"glm-5.2","max_tokens":64000,"messages":[]}`,
+		io.NopCloser(strings.NewReader(soloCutSeg)))
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("续写请求数=%d want 1", len(*reqs))
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte((*reqs)[0]), &obj); err != nil {
+		t.Fatalf("续写体不是 JSON: %v", err)
+	}
+	if got := obj["max_tokens"]; got != float64(32000) {
+		t.Fatalf("续写 max_tokens=%v want 32000（64000-32000，剩余额度）", got)
+	}
+}
+
+// 段数随限额扩容但有硬顶：limit=200000 / cap 32000 → ceil=7 → 封顶 4 段 = 3 次续写。
+func TestContinueReaderSegBudgetHardCap(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(int) (int, string) { return 200, soloCutSeg })
+	r := newTestContinueReader(t, c,
+		`{"model":"glm-5.2","max_tokens":200000,"messages":[]}`,
+		io.NopCloser(strings.NewReader(soloCutSeg)))
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != maxContinueSegmentsHard-1 {
+		t.Fatalf("续写请求数=%d want %d（扩容硬顶）", len(*reqs), maxContinueSegmentsHard-1)
+	}
+}
