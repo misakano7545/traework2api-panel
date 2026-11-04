@@ -15,7 +15,7 @@ import (
 //	         config_name:<model>, model:<model>}
 //
 // 改写规则（SPEC §4.4）：
-//  1. messages: content 字符串 → [{"type":"text","text":...}]；已是数组 → 透传
+//  1. messages: content 字符串 → [{"type":"text","text":...}]；数组只留 text/image_url
 //  2. stream: 强制 true（非流式由服务端聚合）
 //  3. model → config_name + model（**由调用方 handler 一起设**；这里不再补默认值）
 //  4. function: 固定 "solo_work_lite"
@@ -86,7 +86,23 @@ func PrepareBody(src []byte) []byte {
 					map[string]any{"type": "text", "text": c},
 				}
 			default:
-				// 已是数组 → 透传（兼容多模态，未实测，保守透传）
+				// 上游只认 text / image_url：input_audio 实测回 4001「the param is invalid」
+				// （2026-11-04，astrbot 把 QQ 语音原样塞进 content），而 content 数组被剔空
+				// 同样是 4001。剔掉的块留日志——客户端以为这段语音模型听过了才是真坑。
+				arr, _ := c.([]any)
+				kept := make([]any, 0, len(arr))
+				for _, pi := range arr {
+					p, _ := pi.(map[string]any)
+					if tp, _ := p["type"].(string); tp == "text" || tp == "image_url" {
+						kept = append(kept, pi)
+						continue
+					}
+					log.Printf("WARN: 内容块 %v 上游不支持，已剔除（model=%v，整条请求会回 4001）", p["type"], obj["model"])
+				}
+				if len(kept) == 0 {
+					kept = append(kept, map[string]any{"type": "text", "text": nonTextPlaceholder})
+				}
+				m["content"] = kept
 			}
 		}
 	}
@@ -112,6 +128,10 @@ func PrepareBody(src []byte) []byte {
 
 // DefaultConfigName 默认模型（glm-5.2，实测可用）。
 const DefaultConfigName = "glm-5.2"
+
+// nonTextPlaceholder 上游不吃的内容块（语音/文件）被剔空后的占位：空 content 数组
+// 实测同样回 4001，留一句说明比让整条请求失败诚实。
+const nonTextPlaceholder = "[非文本内容已省略]"
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
 //   - "none" / {"type":"none"} → 删 tool_choice + 删 tools/functions
