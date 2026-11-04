@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -902,6 +903,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 不再换号——换号只会把每个号都罚一次降权，最后还谎报成「号都不可用」。
 			var ue *upstream.Error
 			if errors.As(err, &ue) && (ue.Kind == upstream.ErrClient || ue.Kind == upstream.ErrNone) {
+				// 参数类错误只回原话，出站报文形状要留一行：上游说「param is invalid」
+				// 时，没有形状就只能猜是哪个字段（2026-11-04 astrbot 4001 实测）。
+				t := traceFrom(r)
+				tid := ""
+				if t != nil {
+					tid = t.ID
+				}
+				log.Printf("WARN: 上游请求级错误 rid=%s model=%s status=%d err=%s body=%s",
+					tid, shownModel, ue.Status, ue.Msg, bodyShape(body))
 				writeOpenAIError(w, ue.Status, "upstream_rejected", ue.Msg)
 				return
 			}
@@ -914,6 +924,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		var se *upstream.SOLOStreamError
 		if errors.As(lastErr, &se) && se.Kind() == upstream.ErrNone {
+			t := traceFrom(r)
+			tid := ""
+			if t != nil {
+				tid = t.ID
+			}
+			log.Printf("WARN: 上游请求级错误 rid=%s model=%s err=%s body=%s",
+				tid, shownModel, se.Error(), bodyShape(body))
 			writeOpenAIError(w, http.StatusTooManyRequests, "upstream_rejected", se.Error())
 			return
 		}
@@ -923,6 +940,53 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		msg += ": " + lastErr.Error()
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+}
+
+// bodyShape 描述出站报文形状：上游回「param is invalid」时，状态码与文案都指不出是
+// 哪个字段，只有键名、角色序列、消息里多余字段、内容块类型、工具名能定位。
+// 只列形状，正文不进日志。
+func bodyShape(body []byte) string {
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil {
+		return fmt.Sprintf("%dB(不可解析)", len(body))
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	roles := map[string]int{}
+	odd := map[string]int{}
+	parts := map[string]int{}
+	msgs, _ := obj["messages"].([]any)
+	for _, mi := range msgs {
+		m, _ := mi.(map[string]any)
+		roles[fmt.Sprint(m["role"])]++
+		for k := range m {
+			switch k {
+			case "role", "content", "tool_calls", "tool_call_id", "name":
+			default:
+				odd["msg."+k]++
+			}
+		}
+		if arr, ok := m["content"].([]any); ok {
+			for _, pi := range arr {
+				p, _ := pi.(map[string]any)
+				parts[fmt.Sprint(p["type"])]++
+			}
+		}
+	}
+	names := make([]string, 0, 8)
+	if ts, ok := obj["tools"].([]any); ok {
+		for _, ti := range ts {
+			t, _ := ti.(map[string]any)
+			fn, _ := t["function"].(map[string]any)
+			names = append(names, fmt.Sprint(fn["name"]))
+		}
+	}
+	sort.Strings(names)
+	return fmt.Sprintf("%dB keys=%v msgs=%d roles=%v 多余字段=%v 内容块=%v tools=%v",
+		len(body), keys, len(msgs), roles, odd, parts, names)
 }
 
 // acquireAccount 挑一个账号并占用在途名额：会话粘性命中优先，否则按权重挑。
