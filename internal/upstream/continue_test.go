@@ -72,10 +72,14 @@ func TestContinueReaderCutContinues(t *testing.T) {
 	if n := strings.Count(s, "event:done"); n != 1 {
 		t.Fatalf("done 事件数=%d want 1（首段 done 应被吞）:\n%s", n, s)
 	}
-	// usage 改写：最后一条 token_usage 为跨段累计（prompt 10+20 / completion 32000+7）。
+	// usage 改写：completion 跨段求和（32000+7），prompt 取末段（20，不求和：续写段的
+	// prompt 已含整段上下文，求和会虚高 N 倍让客户端提前压缩），total 按两者重算。
 	last := lastUsageLine(t, s)
-	if last["completion_tokens"] != float64(32007) || last["prompt_tokens"] != float64(30) {
-		t.Fatalf("合并 usage=%v want completion=32007 prompt=30", last)
+	if last["completion_tokens"] != float64(32007) || last["prompt_tokens"] != float64(20) {
+		t.Fatalf("合并 usage=%v want completion=32007 prompt=20（末段值）", last)
+	}
+	if last["total_tokens"] != float64(32027) {
+		t.Fatalf("total_tokens=%v want 32027（末段 prompt + 累计 completion）", last["total_tokens"])
 	}
 	// 续写请求（PrepareBody 后的 SOLO 方言）：同模型 + assistant 已输出内容 + 续写指令 + 原始消息。
 	req := (*reqs)[0]
@@ -186,7 +190,9 @@ func TestContinueReaderCapAtMaxSegments(t *testing.T) {
 }
 
 // TestContinueReaderSeamReasoningDropped 续写段自带的 reasoning 对客户端剥离（仅累计）：
-// 否则 responses 侧会开第二个 reasoning item，codex 报 OutputTextDelta without active item。
+// 续写只在已有正文时发生，此时 responses 侧的 message item 已打开，再喂思考会开第二个
+// reasoning item，codex 报 OutputTextDelta without active item。纯思考期的静默由
+// solosse 的 15s keepalive 注释帧兜住（见 continue.go 那段注释）。
 func TestContinueReaderSeamReasoningDropped(t *testing.T) {
 	seg2 := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"内部思考\",\"tool_calls\":null}\n\n" +
 		"event:output\ndata:{\"response\":\"继续\",\"reasoning_content\":\"还想\",\"tool_calls\":null}\n\n" +
@@ -225,6 +231,25 @@ func TestContinueReaderCapTolerance(t *testing.T) {
 	}
 }
 
+// TestContinueReaderNaturalOverCapNoContinue 自然收尾但 completion 超过 cap（未登记的更大
+// cap 模型、或被上游夹过的大额度）：不得当成截断去续写——那会把完整的 done 吞掉再烧一次上下文。
+func TestContinueReaderNaturalOverCapNoContinue(t *testing.T) {
+	seg := strings.Replace(soloCutSeg, `"completion_tokens":32000`, `"completion_tokens":45000`, 1)
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(seg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("续写请求数=%d want 0（45000 不是压线截断）", len(*reqs))
+	}
+	if strings.Count(string(out), "event:done") != 1 {
+		t.Fatalf("done 应原样通过:\n%s", out)
+	}
+}
+
 // lastUsageLine 取输出里最后一条 token_usage 的载荷。
 func lastUsageLine(t *testing.T, s string) map[string]any {
 	t.Helper()
@@ -244,6 +269,105 @@ func lastUsageLine(t *testing.T, s string) map[string]any {
 	}
 	t.Fatalf("输出里没有 token_usage 帧:\n%s", s)
 	return nil
+}
+
+// soloCutNoDoneSeg 干净 EOF 但**没有 done 事件**的段（上游偶发这么收尾）：正文 + usage，无 done。
+const soloCutNoDoneSeg = "event:output\ndata:{\"response\":\"半句话\",\"tool_calls\":null}\n\n" +
+	"event:token_usage\ndata:{\"prompt_tokens\":10,\"completion_tokens\":1200,\"total_tokens\":1210}\n\n"
+
+// 断流（无 done）盲重试一次：旧行为下 solosse 会补 [DONE]、responses 报 completed，
+// 半个回答被伪装成完整答复。这里应当用续写体重发一次，客户端只看到一条完整流。
+func TestContinueReaderCutNoDoneBlindRetry(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(soloCutNoDoneSeg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	if len(*reqs) != 1 {
+		t.Fatalf("盲重试请求数=%d want 1（断流应救一次）", len(*reqs))
+	}
+	if !strings.Contains((*reqs)[0], "半句话") || !strings.Contains((*reqs)[0], "从中断处继续输出剩余内容") {
+		t.Fatalf("盲重试请求应带已输出正文 + 续写指令:\n%s", (*reqs)[0])
+	}
+	if !strings.Contains(s, "半句话") || !strings.Contains(s, "继续") {
+		t.Fatalf("两段正文都应在场:\n%s", s)
+	}
+	// 只有末段那个 done 是 stop —— 不能出现两条终态，也不能被我们补成 length。
+	if n := strings.Count(s, "event:done"); n != 1 {
+		t.Fatalf("done 事件数=%d want 1:\n%s", n, s)
+	}
+	if strings.Contains(s, `"finish_reason":"length"`) {
+		t.Fatalf("盲重试成功后不应再补截断终态:\n%s", s)
+	}
+}
+
+// 断流盲重试失败 → 如实补 finish_reason=length（让 responses 报 incomplete、
+// messages 报 max_tokens），不再让 solosse 补个 [DONE] 把截断伪装成完成。
+func TestContinueReaderCutNoDoneEmitsLength(t *testing.T) {
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) {
+		return 500, `{"code":4008,"msg":"quota exceeded"}`
+	})
+	r := newTestContinueReader(t, c, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(soloCutNoDoneSeg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+	if len(*reqs) != 1 {
+		t.Fatalf("盲重试请求数=%d want 1", len(*reqs))
+	}
+	if n := strings.Count(s, "event:done"); n != 1 {
+		t.Fatalf("done 事件数=%d want 1（补一条 length 终态）:\n%s", n, s)
+	}
+	if !strings.Contains(s, `"finish_reason":"length"`) {
+		t.Fatalf("盲重试失败后应补 finish_reason=length:\n%s", s)
+	}
+	if !strings.Contains(s, "半句话") {
+		t.Fatalf("已输出的正文不应丢失:\n%s", s)
+	}
+}
+
+// 工具分片 + 无 done：不盲重试（残缺参数拼接风险大），但必须补 length 终态，
+// 否则下游会把半截 tool_calls 当成可执行的完整调用。
+func TestContinueReaderCutNoDoneToolEmitsLength(t *testing.T) {
+	seg := "event:output\ndata:{\"response\":\"\",\"tool_calls\":[{\"index\":0,\"function_call\":{\"name\":\"Bash\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]}\n\n"
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(seg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("工具分片不应盲重试，实际请求数=%d", len(*reqs))
+	}
+	if !strings.Contains(string(out), `"finish_reason":"length"`) {
+		t.Fatalf("工具分片断流应补 length 终态:\n%s", out)
+	}
+}
+
+// 上游先发 event:error 再 EOF：solosse 已经写过 error 帧 + [DONE]，本层不能再补一条
+// done（第二套终态帧会让客户端解析出两个终止）。
+func TestContinueReaderErrorThenEOFNoExtraTerminal(t *testing.T) {
+	seg := "event:output\ndata:{\"response\":\"说到一半\"}\n\n" +
+		"event:error\ndata:{\"code\":4011,\"message\":\"rate limited\"}\n\n"
+	c, reqs := fakeCutUpstream(t, func(call int) (int, string) { return 200, soloNextSeg })
+	r := newTestContinueReader(t, c, `{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`,
+		io.NopCloser(strings.NewReader(seg)))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("error 段不应续写，请求数=%d", len(*reqs))
+	}
+	if strings.Count(string(out), "event:done") != 0 {
+		t.Fatalf("error 之后不应再补 done 终态:\n%s", out)
+	}
 }
 
 // cutReader 先吐一段数据、再报一个非 EOF 的读错误（模拟上游中途断连）。

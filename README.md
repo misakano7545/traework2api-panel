@@ -427,6 +427,34 @@ thinking（上游没有 signature）。缓存命中各按客户端口径回：re
 `input_tokens` **不含**缓存读/写，扣掉 `cache_read_`/`cache_creation_input_tokens`；Responses 出
 `cached_tokens`）；上游没报就不写，不拿 0 冒充「没命中」。
 
+**截断自动续写**（`internal/upstream/continue.go`，2026-11-10 真号实测）：SOLO 单次输出有硬上限，
+且**按变体不同**（`cn:deepseek-v4.1-flash` 恰在 `completion_tokens=32000` 被切、`glm-5.3__max` 在 16000），
+而 `done` 仍报 `finish_reason:"stop"` —— 截断信号被上游伪装，客户端（Codex 这类不带输出限额的）写大文件
+会在半途被截且毫无提示。网关在 SOLO 帧层识别「本段撞了该模型的 cap 且是纯文本」后用「已输出内容作
+assistant + 续写指令」补发同模型请求，后续帧接进同一条流：客户端只看到一个 `stop`、正文连续。
+
+实测（同一句「输出 6000 行 print」，不带 `max_tokens`）：段 1 `completion=32000`（撞上限）→ 自动续写 1 次
+→ 回给客户端 `completion=44206`（32000+12206，跨段求和）、`prompt=29182`（**末段值**，不求和：续写段的
+prompt 天然含整段上下文，求和会虚高 N 倍让客户端提前全量压缩）、`total=73388` 自洽；正文 1..6000 全在，
+只有一个 `finish_reason:"stop"`，请求记 success、扣 5.77 积分（对照组：同一提示改 4000 行时
+`completion=28384` 没撞上限，不触发续写）。同批 `/v1/responses` 跑 6000 行只有一个 `response.completed`
+（`output_tokens=42618`），不会被误判成 `incomplete`。
+
+第二种形态是上游**干脆不发 `done` 就干净 EOF**：`solosse` 的幂等兜底会给它补一个 `[DONE]`，responses
+适配器见 `sawDone` 就报 `completed` —— 半个回答被当成完整答复。这里改用同一份续写体**盲重试一次**
+（幂等，不重复输出），仍失败就补一条 `finish_reason:"length"`，让 responses 报 `incomplete`、
+messages 报 `stop_reason:max_tokens`（这两个映射本来就有，缺的只是「这段没正常收尾」这个事实）。
+传输层读错误不走这条：它按失败上抛由 handler 换号，硬补 `done` 等于把上游故障伪装成截断。
+
+边界：工具调用分片不续（残缺 JSON 拼接比不续更糟），只补截断终态；客户端显式 `max_tokens` < cap 时不续
+（尊重意图）；段数默认 3 段、限额 ≥ cap 时按 `ceil(限额/cap)` 扩容、硬顶 4 段（每段都重发上下文，输入
+token 近二次增长）。**未照搬参考实现的两块**：思考吃光预算后的「关思考续写」（SOLO 没有可靠的关思考开关，
+见下文全档实测）与累计 token 上限按档位下限 ×4（本仓没有档位下限概念）。
+
+副作用留档：上游**不认**客户端的小 `max_tokens`（实测 `max_tokens=300` 仍产出 32000 token 才停），
+所以「客户端只要 300」这件事网关无法替上游兑现，只保证不再追加续写。
+
+
 **工具结果里的图片**（`/v1/responses` 的 `function_call_output`、`/v1/messages` 的 `tool_result`）：
 图不能留在 `tool` 消息里（Chat 的 `tool` 角色只接受文本，带 `image_url` 会被 OpenAI 直接 400），
 也不能整段拍平成 JSON 文本（base64 按正文分词 ≈ 字符数×0.69，一张 400KB 截图十几万 token，而且模型

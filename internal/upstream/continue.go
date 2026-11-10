@@ -7,14 +7,26 @@
 // 写大文件/长分析会在半途被截而毫无察觉。
 //
 // 这里挂在 SOLO 帧层（StreamWithError 之下、上游 body 之上）：识别「截断特征」
-// （token_usage.completion_tokens >= 该变体的 cap 且正常 stop 收尾/静默 EOF）后，
+// （token_usage.completion_tokens >= 该变体的 cap 且正常 stop 收尾）后，
 // 用「已输出内容作 assistant + 续写指令」补发同模型请求（实测：模型从中断处
 // 无缝接续），后续事件直接接进同一条流；本段的 done 被吞、usage 跨段合成为
 // 累计值、客户端只看到一次连续输出。
 //
+// 第二种截断形态：上游**一个字都不说就干净 EOF**（没有 done 事件）。solosse 的
+// 「幂等兜底」会给这种流补一个 [DONE]，而 responses 适配器见到 sawDone 就报
+// response.completed —— 半个回答被伪装成完整答复（wb 版线上实测 2 天内 27 次
+// 「Codex 莫名中断、要手动继续」就是这个）。这里先用同样的续写体盲重试一次
+// （幂等：assistant 前缀带着已输出内容），再失败就如实补 finish_reason=length，
+// 让 responses/messages 各自按既有映射报 incomplete / max_tokens。
+//
 // ponytail: 只续纯文本段（有 tool_calls 分片不续——残缺参数拼接风险大）；每请求段数
 // 默认 maxContinueSegments，显式限额 ≥ cap 时按 ceil(限额/cap) 扩容（硬顶
 // maxContinueSegmentsHard），续写体的限额按剩余额度下发；限额 < cap 则尊重意图不续。
+//
+// 没照搬 wb 的两块：① thinking 吃光预算的「关思考续写」——SOLO 侧没有可靠的关思考
+// 开关（README「全模型全档实测」：reasoning_effort 各档 reasoning_tokens 中位数与
+// 「不发」基本同量级，关不掉），续写只会再烧一份同额度的思考；② 累计输出上限按档位
+// 下限 ×4 ——SOLO 没有档位下限概念，段数预算已经是硬闸门。
 package upstream
 
 import (
@@ -102,7 +114,9 @@ type ContinueReader struct {
 
 	toolSeen bool
 	errSeen  bool
-	done     bool
+	// blindTried 断流盲重试已用（每请求一次，防打断流-重试-再断流的套娃）。
+	blindTried bool
+	done       bool
 	// readErr 上游读取错误（非 EOF）。吞掉它，中途断连就会被当成「正常收尾」——
 	// 补一个 [DONE]、token_usage 已有就记成功，客户端拿到一条看似完整实则截断的回复。
 	// 这正是本文件要防的事（截断不可见，见文件头注释）。Read 把已写出的字节交完后再返回它。
@@ -238,10 +252,12 @@ func (r *ContinueReader) flushEvent() {
 		if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
 			r.toolSeen = true
 		}
-		// 续写段的思考是机制内部产物（第一段已展示过）：对客户端剥离，否则 responses
-		// 侧会在 message item 还打开时开第二个 reasoning item，codex 后续文本 delta
-		// 全部报 "OutputTextDelta without active item"（wb 同款实测 12332 条）。
-		// 仍累计进 r.reason 供下一段上下文；剥离后空载事件下游会自然忽略。
+		// 续写段的思考对客户端剥离：续写只在「已写出正文」时发生（canContinue 要求
+		// text 非空），所以这里恒有正文在场，删掉 reasoning 不会造成协议问题；反过来
+		// 留着会让 responses 侧在 message item 已打开时再开第二个 reasoning item，
+		// codex 后续文本 delta 全报 "OutputTextDelta without active item"（wb 实测 12332 条）。
+		// 剥离后「续写段纯思考期」的静默由 solosse 的 15s keepalive 注释帧兜住
+		// （responses 适配器对注释帧原样透传），不需要像 wb 那样把思考漏给客户端。
 		if r.seg > 0 && ev.Reasoning != "" {
 			var obj map[string]any
 			if json.Unmarshal([]byte(data), &obj) == nil {
@@ -262,6 +278,13 @@ func (r *ContinueReader) flushEvent() {
 				r.usage = map[string]any{}
 			}
 			mergeUsageInto(r.usage, ev.Usage)
+			// total_tokens 按「末段 prompt + 累计 completion」重算，保持口径自洽：
+			// 直接求和会把每段的 prompt（都含整段上下文）累加成 N 倍。
+			if p, ok := r.usage["prompt_tokens"].(float64); ok {
+				if c, ok := r.usage["completion_tokens"].(float64); ok {
+					r.usage["total_tokens"] = p + c
+				}
+			}
 			// 改写为跨段累计值再下发：下游（StreamWithError 的 lastUsage →
 			// handler 记账）拿到的就是合计，不重写只会记到最后一段。
 			if raw, err := json.Marshal(r.usage); err == nil {
@@ -288,8 +311,15 @@ func (r *ContinueReader) handleDone(pend []string) {
 		r.emitBlock(pend)
 		return
 	}
-	if r.canContinue() && r.switchSegment() {
+	if r.canContinue() && r.switchSegment(false) {
 		return
+	}
+	// 没续写却停在整千 token 边界上：上游硬截断的 completion_tokens 是整数上限
+	// （实测 16000 / 32000），自然收尾几乎不会正好落在整千上。cap 表靠实测攒，
+	// 这条日志就是扩表的来源——静默漏判会让「半句话」永远只报 stop。
+	if capPlateau(r.segTok) && r.segTok < float64(r.cutCap) {
+		log.Printf("WARN: [continue] 疑似未登记的截断上限 model=%s completion_tokens=%d finish=%s（若是，请登记到 soloCutCaps）",
+			modelOfBody(r.body), int(r.segTok), doneFinishOf(pend))
 	}
 	r.emitBlock(pend)
 	r.done = true
@@ -297,15 +327,88 @@ func (r *ContinueReader) handleDone(pend []string) {
 	r.readErr = nil
 }
 
-// endSegment 无 done 的 EOF 收尾：能续就换段，否则直接结束（solosse 兜底补 [DONE]）。
+// doneFinishOf 从 done 块的 data 行里取 finish_reason（只用于日志）。
+func doneFinishOf(pend []string) string {
+	for _, l := range pend {
+		if !strings.HasPrefix(strings.TrimSpace(l), "data:") {
+			continue
+		}
+		var obj struct {
+			FinishReason string `json:"finish_reason"`
+		}
+		if json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(l), "data:")), &obj) == nil {
+			return obj.FinishReason
+		}
+	}
+	return "?"
+}
+
+// capPlateau 疑似「收尾在整千 token 边界」上（见 handleDone 的日志用途）。
+func capPlateau(tok float64) bool {
+	if tok < 8000 || tok != float64(int(tok)) {
+		return false
+	}
+	return int(tok)%1000 == 0
+}
+
+// endSegment 无 done 的 EOF 收尾：能续就换段，否则盲重试一次，再否则如实补截断终态。
+//
+// 三种收尾必须区分开（否则就是「截断不可见」的第二种形态）：
+//   - 本段撞 cap：续写（同账号同模型，见文件头）；
+//   - 干净 EOF（无 done、无读错误）且已产出内容：盲重试一次。上游偶发这么收尾，
+//     旧行为下 solosse 会补 [DONE]、responses 报 completed，半个回答被当完整答复；
+//   - 仍不行：补一条 finish_reason=length 的 done，让下游按截断处理。
+//
+// 传输层读错误（readErr 非 nil）不在这里救：它已经会被 Read 上抛，上层按失败换号，
+// 硬补一条 done 反而把「上游故障」伪装成「截断的正常结束」。
 func (r *ContinueReader) endSegment(sawDone bool) {
 	if r.done {
 		return
 	}
-	if r.canContinue() && r.switchSegment() {
+	if r.canContinue() && r.switchSegment(false) {
 		return
 	}
+	if r.canBlindRetry() && r.switchSegment(true) {
+		return
+	}
+	r.emitTruncated()
 	r.done = true
+}
+
+// canBlindRetry 断流盲重试资格：已产出内容、没见工具分片/error 帧、不是传输层读错误、
+// 每请求一次、且还有段数预算。
+func (r *ContinueReader) canBlindRetry() bool {
+	switch {
+	case r.blindTried, r.errSeen, r.toolSeen:
+		return false
+	case r.readErr != nil:
+		return false
+	case r.seg >= r.segBudget-1:
+		return false
+	case r.text.Len() == 0 && r.reason.Len() == 0:
+		return false
+	}
+	return true
+}
+
+// emitTruncated 补一条截断终态（finish_reason=length）事实帧。
+//
+// 补在这一层而不是三个适配器里各写一份：本层是 chat / responses / messages 共用的
+// 唯一接缝，它们各自早已把 length 映射正确（responses → response.incomplete +
+// max_output_tokens，messages → stop_reason=max_tokens），此前缺的只是「这段没正常
+// 收尾」这个事实没被任何一层说出口。零输出段不补：空流仍要走 ErrEmptyStream 换号。
+func (r *ContinueReader) emitTruncated() {
+	// errSeen：上游发过 event:error，solosse 已经写过 error 帧 + [DONE] 收尾。这里再补
+	// 一条 done 就是第二套终态帧，客户端按 SSE 解析会拿到两个终止（Codex 直接报错）。
+	if r.errSeen {
+		return
+	}
+	if r.text.Len() == 0 && r.reason.Len() == 0 && !r.toolSeen {
+		return
+	}
+	r.emitBlock([]string{"event:done\n", `data:{"finish_reason":"length"}` + "\n"})
+	log.Printf("WARN: [continue] seg=%d model=%s text=%dB 无 done 收尾 → 如实补 finish_reason=length",
+		r.seg, modelOfBody(r.body), r.text.Len())
 }
 
 // canContinue 续写资格：本段真的撞了**该模型**的 cap 且是纯文本段，且没违背客户端的
@@ -318,12 +421,23 @@ func (r *ContinueReader) canContinue() bool {
 		return false
 	case r.text.Len() == 0:
 		return false
-	case r.segTok < float64(r.cutCap):
+	case !r.hitCap():
 		return false
 	case r.limitTok >= 0 && (r.limitTok < int64(r.cutCap) || r.cumTok() >= float64(r.limitTok)):
 		return false
 	}
 	return true
+}
+
+// hitCap 本段的 completion_tokens 落在「该模型 cap」上（不是随便超过它）。
+//
+// 上界不能省：cap 表只有实测过的几个变体，没登记的大 cap 模型（如上游表声明 64000 的
+// __max 条目）用默认 32000 判定时，一个**自然收尾**在 45000 的长回答会落进「>= cap」，
+// 于是把完整的 done 吞掉、再烧一次上下文去续写——花的钱和上下文都和截断无关。
+// 实测的截断值都是正好压线（32000 / 32003 / 16000），留 5% 余量足够吸收分片计数误差。
+func (r *ContinueReader) hitCap() bool {
+	capv := float64(r.cutCap)
+	return r.segTok >= capv && r.segTok <= capv*1.05
 }
 
 // cumTok 跨段累计的 completion_tokens（usage 合并帧口径，与记账同源）。
@@ -335,8 +449,9 @@ func (r *ContinueReader) cumTok() float64 {
 }
 
 // switchSegment 用「已输出内容 + 续写指令」补发同模型请求；成功则换段并清本段判定位。
+// blind=true 表示由「无 done 收尾」触发的盲重试（记次数、日志区分）。
 // 注意：done 块已由调用方暂存（未 emitBlock），续写成功即隐式吞掉。
-func (r *ContinueReader) switchSegment() bool {
+func (r *ContinueReader) switchSegment(blind bool) bool {
 	body, err := r.continuationBody()
 	if err != nil {
 		log.Printf("WARN: [continue] 续写请求体构造失败: %v", err)
@@ -352,12 +467,19 @@ func (r *ContinueReader) switchSegment() bool {
 		return false
 	}
 	r.seg++
+	if blind {
+		r.blindTried = true
+	}
 	r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
 	r.segTok = 0 // 本段判定重置；usage/文本/工具位跨段保留
 	// 上一段的读错误到此已被续写救回：不清掉的话，下面整段流最后会拿这个陈旧错误
 	// 把「已拼完整的回复」上报成传输失败（用量记失败 + 解绑会话粘性）。
 	r.readErr = nil
-	log.Printf("[continue] seg=%d model=%s text=%dB → 续写", r.seg, modelOfBody(r.body), r.text.Len())
+	note := ""
+	if blind {
+		note = "（断流盲重试）"
+	}
+	log.Printf("[continue] seg=%d model=%s text=%dB → 续写%s", r.seg, modelOfBody(r.body), r.text.Len(), note)
 	return true
 }
 
@@ -418,9 +540,17 @@ func rewriteDataLine(lines []string, payload string) []string {
 	return out
 }
 
-// mergeUsageInto 跨段累计 usage：数字叶子求和，结构取并集（同 wb 版口径）。
+// mergeUsageInto 跨段累计 usage：
+//   - 输出侧（completion_tokens / reasoning_tokens / 各种积分）数字叶子求和；
+//   - 输入侧（prompt_* / cache_*）取末段值——续写段的 prompt 天然已包含整个上下文，
+//     求和会把上下文重复计入 N 段倍，客户端按 usage 判上下文占用时会虚高到提前全量压缩；
+//   - 结构取并集（同 wb 版口径）。
 func mergeUsageInto(dst, src map[string]any) {
 	for k, v := range src {
+		if usageTakesLast(k) {
+			dst[k] = v
+			continue
+		}
 		switch sv := v.(type) {
 		case float64:
 			if dv, ok := dst[k].(float64); ok {
@@ -436,10 +566,18 @@ func mergeUsageInto(dst, src map[string]any) {
 				mergeUsageInto(nm, sv)
 				dst[k] = nm
 			}
+		case []any:
+			dst[k] = sv // 数组（如 completion_tokens_details 之外的列表）没有求和语义，取末段
 		default:
 			dst[k] = v
 		}
 	}
+}
+
+// usageTakesLast 该 usage 键跨段取「末段值」而不是求和：输入侧的所有键。
+// SOLO 的缓存命中量报在 cache_read_input_tokens（见表头 token_usage 样例）。
+func usageTakesLast(k string) bool {
+	return strings.HasPrefix(k, "prompt") || strings.HasPrefix(k, "cache_")
 }
 
 func modelOfBody(body []byte) string {
