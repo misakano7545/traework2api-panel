@@ -93,10 +93,13 @@ func toString(v any) string {
 	return string(b)
 }
 
-// TestStreamLongSilenceThenEmptyCommits 钉住那条取舍：静默超过一个保活间隔后必然已经
-// 发过注释帧（响应已提交），此时上游再以空流结束就只能按现状收尾（[DONE]），不能换号重试。
-// 反过来说，真正空转的上游是立刻结束的——那条路径留给 ErrEmptyStream 重试。
-func TestStreamLongSilenceThenEmptyCommits(t *testing.T) {
+// TestStreamLongSilenceThenEmptyStillRotates 首帧心跳之后空流**仍然**要交回换号。
+//
+// 旧口径是「写过注释帧 = 已提交 = 不能换号」，于是一次静默之后上游空转就变成
+// 「200 + [DONE] 的空回复」。现在注释帧只提交响应头（客户端还没拿到任何内容），
+// 换号后第二段接在同一条 200 上、客户端无感；全部号都失败时由 server 侧的
+// sseCommitWriter 收成协议内 error 帧（见 internal/server/ssecommit.go）。
+func TestStreamLongSilenceThenEmptyStillRotates(t *testing.T) {
 	old := keepaliveInterval
 	keepaliveInterval = 20 * time.Millisecond
 	t.Cleanup(func() { keepaliveInterval = old })
@@ -113,18 +116,18 @@ func TestStreamLongSilenceThenEmptyCommits(t *testing.T) {
 		t.Fatalf("立即 EOF 不该写字节：%q", body)
 	}
 
-	// 有静默窗的空流：先保活，再按现状收尾。
+	// 有静默窗的空流：先保活（提交了响应头），然后照样交给调用方换号。
 	rec2 := &flusherRecorder{ResponseRecorder: httptest.NewRecorder()}
 	slow2 := &slowReader{r: strings.NewReader("event: metadata\ndata:{}\n\n"), gap: 60 * time.Millisecond}
-	if err := Stream(rec2, slow2); err != nil {
-		t.Fatalf("静默过的流不该报错（已提交无法重试）：%v", err)
+	if err := Stream(rec2, slow2); err != ErrEmptyStream {
+		t.Fatalf("静默过的空流仍应换号重试，实得 %v", err)
 	}
 	body2 := rec2.Body.String()
 	if !strings.Contains(body2, ": keepalive") {
 		t.Fatalf("静默期应发过保活：%q", body2)
 	}
-	if !strings.Contains(body2, "data: [DONE]") {
-		t.Fatalf("已提交的流要正常收尾：%q", body2)
+	if strings.Contains(body2, "data: [DONE]") {
+		t.Fatalf("空流不该在这里自己收尾（由换号或协议内 error 帧收尾）：%q", body2)
 	}
 }
 

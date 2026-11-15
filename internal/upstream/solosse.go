@@ -49,6 +49,25 @@ var ErrEmptyStream = errors.New("upstream returned an empty stream")
 // 15s 是「远小于任何空闲阈值、又几乎不产生流量」的取值；0 = 关闭。变量而非常量只为测试能调小。
 var keepaliveInterval = 15 * time.Second
 
+// headKeepaliveInterval 首帧之前（上游已回 200、第一个数据帧还没到）的保活节拍。
+//
+// 秒级而不是 15s：客户端放弃的最大耐心在 3~4 秒，不是 15 秒。实测（参考实现
+// workbuddy2api 线上，同类客户端 Codex/ZCode）四次「零内容 + client_gone」中断
+// 全部落在 3.46~4.09s —— 上游在预填充大上下文，而这期间一个字节都没写，客户端
+// 自己把连接关了。补 1.5s 注释帧后首个字节从 5.2s 降到 1.5s（读者看到的是「等
+// 一秒后开始动」而不是「连接僵死」）。
+//
+// 分档的理由与代价：注释帧会提交 200，所以「首帧否决还能不能换号」必须从
+// 「有没有写过字节」改成「有没有写过数据帧」（见 streamOpts 的 chunkWritten）。
+// 0 = 不分档（退回只用 keepaliveInterval）。变量而非常量只为测试能调小。
+var headKeepaliveInterval = 1500 * time.Millisecond
+
+// SetKeepaliveIntervals 调整保活节拍（head = 首帧前，idle = 首帧后）。idle<=0 关闭保活；
+// head<=0 表示不分档。供测试与热改入口使用：包级变量被每个请求读一次，对**新请求**生效。
+func SetKeepaliveIntervals(head, idle time.Duration) {
+	headKeepaliveInterval, keepaliveInterval = head, idle
+}
+
 // keepaliveLine SSE 注释帧（以 ':' 开头，客户端解析器一律忽略，不占事件通道）。
 const keepaliveLine = ": keepalive\n\n"
 
@@ -468,11 +487,11 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 	// 写出与保活分属两个 goroutine，所以所有写入（含头）走这一把锁串行化；
 	// net/http 的 ResponseWriter 不是并发安全的。
 	var (
-		wmu         sync.Mutex
-		lastWrite   = time.Now()
-		committed   bool // 已往下游写过任何字节（含注释帧）——决定空流还能不能换号重试
-		headersDone bool
-		stopped     bool // 收尾已开始：保活线程不许再写（否则注释帧会插到调用方的错误体前面）
+		wmu          sync.Mutex
+		lastWrite    = time.Now()
+		chunkWritten bool // 已写过第一个数据帧（chat.completion.chunk）——决定空流/首帧错误还能不能换号
+		headersDone  bool
+		stopped      bool // 收尾已开始：保活线程不许再写（否则注释帧会插到调用方的错误体前面）
 	)
 	fl, _ := w.(http.Flusher)
 	// 头不能在这里就地设：空流要走重试，此时一个字节都不该写给客户端，
@@ -498,7 +517,6 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			fl.Flush()
 		}
 		lastWrite = time.Now()
-		committed = true
 		return nil
 	}
 	writeRaw := func(s string) error {
@@ -539,19 +557,31 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			pendingUsage = nil
 		}
 		raw, _ := json.Marshal(chunk)
-		return writeRaw("data: " + string(raw) + "\n\n")
+		// 首个数据帧 = 这条流对客户端「真的开始了」：此后不能再换号（换了就是两条
+		// 互相矛盾的回复）。只写过注释帧时换号仍对客户端无感——首帧心跳之后的空流/
+		// 首帧错误因此仍可轮转，判定看 chunkWritten 而不是 committed。
+		wmu.Lock()
+		defer wmu.Unlock()
+		chunkWritten = true
+		return writeLocked("data: " + string(raw) + "\n\n")
 	}
 	writeDONE := func() error {
 		return writeRaw("data: [DONE]\n\n")
 	}
 
-	// 保活：静默满一个间隔就往下游发一个注释帧——**首字节之前也发**。
-	// 取舍明写在注释里：发了注释帧 = 已提交响应，那条流就不能再走「空流换号重试」
-	// （见 ErrEmptyStream）。而「上游只思考不吐字」恰恰是首字节前的那段静默，
-	// 也正是最容易被中间盒掐掉的一段；真正空转的上游是**立刻**结束的，根本等不到一个间隔。
-	// 所以冲突实际不会同时命中：快速空流留给重试，长静默留给保活。
+	// 保活：静默满一个间隔就往下游发一个注释帧——**首字节之前也发**，且首字节之前用
+	// 更短的节拍（headKeepaliveInterval）：那一段正是客户端最容易放弃的地方（3~4s 就
+	// 自己关连接，见 headKeepaliveInterval 的注释）。首个数据帧之后回到 keepaliveInterval。
+	//
+	// 与换号的关系变了：注释帧只提交响应头，不再堵住「空流/首帧错误换号」——那两处判定
+	// 看的是 chunkWritten（见 writeChunk），不是「有没有写过字节」。
+	//
 	// 间隔在主线程读一次就定死：goroutine 里再读包级变量会与测试/热改并发（-race 可复现）。
 	kaInterval := keepaliveInterval
+	headInterval := kaInterval
+	if headKeepaliveInterval > 0 && (headInterval == 0 || headKeepaliveInterval < headInterval) {
+		headInterval = headKeepaliveInterval
+	}
 	var kaStop chan struct{}
 	if kaInterval > 0 {
 		kaStop = make(chan struct{})
@@ -565,7 +595,9 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			close(kaStop)
 		}()
 		go func() {
-			t := time.NewTicker(kaInterval)
+			// ticker 走较短的那档，每 tick 按「现在在哪一档」判门槛：分档只改门槛，
+			// 不改 ticker 周期，省掉一个「换档时重设 ticker」的状态机。
+			t := time.NewTicker(headInterval)
 			defer t.Stop()
 			for {
 				select {
@@ -579,7 +611,11 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 						wmu.Unlock()
 						return
 					}
-					if time.Since(lastWrite) >= kaInterval {
+					iv := kaInterval
+					if !chunkWritten {
+						iv = headInterval
+					}
+					if time.Since(lastWrite) >= iv {
 						// 写失败（客户端已断）不必上报：主循环下一次写/读会拿到同一个错误。
 						_ = writeLocked(keepaliveLine)
 					}
@@ -589,9 +625,34 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		}()
 	}
 
+	// closeTruncated 上游没给出正常收尾时补一帧截断终态（finish_reason=length）+ [DONE]。
+	// 判据：已经写过内容、没有写过 error 帧。一个字节都没写过时**不动**——那种情况
+	// 留给调用方换号（交回错误比补一帧空终态更有用）。
+	closeTruncated := func() {
+		wmu.Lock()
+		need := chunkWritten && !errSent && !sawDone
+		wmu.Unlock()
+		if !need {
+			return
+		}
+		if err := writeChunk(map[string]any{}, "length"); err != nil {
+			return
+		}
+		_ = writeDONE()
+	}
+
 	for {
 		line, err := sseLine(br)
 		if err != nil && err != io.EOF {
+			// 传输层断（上游连接被重置、空闲看门狗掐断、读超时）：直接把错误上抛等于让
+			// 客户端的 SSE 停在半截——既没有 finish_reason 也没有 [DONE]，客户端各自的
+			// 表现就是「流莫名断在那」。
+			//
+			// 这里先说出口再上抛：写成 truncation 终态（与 continue.go 的 emitTruncated
+			// 同口径），让 responses 报 incomplete、messages 报 max_tokens、chat 客户端
+			// 拿到 finish_reason=length。错误仍照常返回，调用方按失败记账/不解绑会话——
+			// 「这段没正常收尾」和「这次请求失败」是两件事，都别说谎。
+			closeTruncated()
 			return lastUsage, err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
@@ -681,7 +742,10 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				// 拿到「成功但报错」，这一轮连号都不换。请求级错误（4001/4026，
 				// Kind()==ErrNone）不换：换几个号都是同一个答复，只会白打上游。
 				wmu.Lock()
-				early := !committed
+				// 判定用 chunkWritten 而不是 committed：首帧心跳写过注释帧之后，
+				// 客户端看到的仍然只是「连接活着」，还没拿到任何内容 —— 这时换号
+				// 对它无感（第二段的帧接在同一条 200 上）。写过数据帧才算真开始了。
+				early := !chunkWritten
 				wmu.Unlock()
 				if early && se.Kind() != ErrNone {
 					return lastUsage, se
@@ -708,12 +772,13 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		}
 	}
 	if !sawDone {
-		// 空流：上游 200 但一个模型事件都没有，且我们一个字节都没写给客户端
-		// → 交给调用方换号重试（见 ErrEmptyStream）。已写过（保活注释帧也算）就只能按
-		// 现状收尾：补 [DONE]，客户端看到一次空回复。
+		// 空流：上游 200 但一个模型事件都没有 → 交给调用方换号重试（见 ErrEmptyStream）。
+		// 判定看 chunkWritten 而非 committed：首帧心跳可能已写过注释帧，那不算「这条流
+		// 已有内容」，换号后第二段接在同一条 200 上，客户端无感。写过数据帧就只能按
+		// 现状收尾（补 [DONE]，客户端看到一次空回复）。
 		// 判定与「保活线程可否再写」必须在同一把锁里定案，否则注释帧会插到错误体前面。
 		wmu.Lock()
-		empty := !sawModel && !committed && lastUsage == nil
+		empty := !sawModel && !chunkWritten && lastUsage == nil
 		stopped = true
 		wmu.Unlock()
 		if empty {

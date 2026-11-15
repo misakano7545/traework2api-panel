@@ -116,7 +116,9 @@ type ContinueReader struct {
 	errSeen  bool
 	// blindTried 断流盲重试已用（每请求一次，防打断流-重试-再断流的套娃）。
 	blindTried bool
-	done       bool
+	// narrationTried 预告句救援已用（每请求一次，防「续写段又停在预告句」套娃）。
+	narrationTried bool
+	done           bool
 	// readErr 上游读取错误（非 EOF）。吞掉它，中途断连就会被当成「正常收尾」——
 	// 补一个 [DONE]、token_usage 已有就记成功，客户端拿到一条看似完整实则截断的回复。
 	// 这正是本文件要防的事（截断不可见，见文件头注释）。Read 把已写出的字节交完后再返回它。
@@ -311,7 +313,12 @@ func (r *ContinueReader) handleDone(pend []string) {
 		r.emitBlock(pend)
 		return
 	}
-	if r.canContinue() && r.switchSegment(false) {
+	if r.canContinue() && r.switchSegment(segContinue) {
+		return
+	}
+	// 撞 cap 之外还有第二种「上游认为说完了」：正文停在预告句上（见 narration.go）。
+	// 放在 canContinue 之后：真截断时先把长度续完，别拿救援指令去接一段被切断的输出。
+	if r.canNarrate(doneFinishOf(pend)) && r.switchSegment(segNarrate) {
 		return
 	}
 	// 没续写却停在整千 token 边界上：上游硬截断的 completion_tokens 是整数上限
@@ -321,6 +328,7 @@ func (r *ContinueReader) handleDone(pend []string) {
 		log.Printf("WARN: [continue] 疑似未登记的截断上限 model=%s completion_tokens=%d finish=%s（若是，请登记到 soloCutCaps）",
 			modelOfBody(r.body), int(r.segTok), doneFinishOf(pend))
 	}
+	r.noteToolOnlyCandidate(doneFinishOf(pend))
 	r.emitBlock(pend)
 	r.done = true
 	// 上游正常收尾：即便之前某段是断的（续写救回来了），整体也是完整的，不算错误。
@@ -365,10 +373,10 @@ func (r *ContinueReader) endSegment(sawDone bool) {
 	if r.done {
 		return
 	}
-	if r.canContinue() && r.switchSegment(false) {
+	if r.canContinue() && r.switchSegment(segContinue) {
 		return
 	}
-	if r.canBlindRetry() && r.switchSegment(true) {
+	if r.canBlindRetry() && r.switchSegment(segBlind) {
 		return
 	}
 	r.emitTruncated()
@@ -448,11 +456,27 @@ func (r *ContinueReader) cumTok() float64 {
 	return 0
 }
 
+// segMode 换段的原因，决定续写指令与记账（日志区分三条救援）。
+type segMode int
+
+const (
+	segContinue segMode = iota // 撞该模型的输出 cap
+	segBlind                   // 无 done 的干净 EOF（盲重试一次）
+	segNarrate                 // 停在预告句上（见 narration.go）
+)
+
+// nudge nudge 该模式使用的续写指令。
+func (m segMode) nudge() string {
+	if m == segNarrate {
+		return narrationNudge
+	}
+	return continueNudge
+}
+
 // switchSegment 用「已输出内容 + 续写指令」补发同模型请求；成功则换段并清本段判定位。
-// blind=true 表示由「无 done 收尾」触发的盲重试（记次数、日志区分）。
 // 注意：done 块已由调用方暂存（未 emitBlock），续写成功即隐式吞掉。
-func (r *ContinueReader) switchSegment(blind bool) bool {
-	body, err := r.continuationBody()
+func (r *ContinueReader) switchSegment(mode segMode) bool {
+	body, err := r.continuationBody(mode.nudge())
 	if err != nil {
 		log.Printf("WARN: [continue] 续写请求体构造失败: %v", err)
 		return false
@@ -467,8 +491,11 @@ func (r *ContinueReader) switchSegment(blind bool) bool {
 		return false
 	}
 	r.seg++
-	if blind {
+	switch mode {
+	case segBlind:
 		r.blindTried = true
+	case segNarrate:
+		r.narrationTried = true
 	}
 	r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
 	r.segTok = 0 // 本段判定重置；usage/文本/工具位跨段保留
@@ -476,17 +503,32 @@ func (r *ContinueReader) switchSegment(blind bool) bool {
 	// 把「已拼完整的回复」上报成传输失败（用量记失败 + 解绑会话粘性）。
 	r.readErr = nil
 	note := ""
-	if blind {
+	switch mode {
+	case segBlind:
 		note = "（断流盲重试）"
+	case segNarrate:
+		note = "（预告句救援）"
 	}
 	log.Printf("[continue] seg=%d model=%s text=%dB → 续写%s", r.seg, modelOfBody(r.body), r.text.Len(), note)
+	if mode == segNarrate {
+		log.Printf("WARN: [narration] model=%s 正文停在预告句上（尾 60B=%q）→ 已补一次救援续写",
+			modelOfBody(r.body), tailText(r.text.String(), 60))
+	}
 	return true
 }
 
-// continuationBody 原请求 messages + assistant（已输出正文）+ 续写指令。
+// tailText 取正文尾部 n 个字节（日志用，别把整段回答打进日志）。
+func tailText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
+}
+
+// continuationBody 原请求 messages + assistant（已输出正文）+ 续写指令 nudge。
 // ponytail: 实测形状只有纯 content（P2 探针验证无缝接续）；不带 reasoning_content，
 // 避免上游对 assistant 附带字段的兼容性未知数。其余字段（model/function/参数）原样保留。
-func (r *ContinueReader) continuationBody() ([]byte, error) {
+func (r *ContinueReader) continuationBody(nudge string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(r.body, &obj); err != nil {
 		return nil, err
@@ -494,7 +536,7 @@ func (r *ContinueReader) continuationBody() ([]byte, error) {
 	msgs, _ := obj["messages"].([]any)
 	msgs = append(msgs,
 		map[string]any{"role": "assistant", "content": r.text.String()},
-		map[string]any{"role": "user", "content": continueNudge})
+		map[string]any{"role": "user", "content": nudge})
 	obj["messages"] = msgs
 	// 限额必须按剩余额度下发：原样沿用客户端的 max_tokens，段 2 自己就能再吐一个 cap，
 	// 声明 20000 实交 32000，越了客户端的权。

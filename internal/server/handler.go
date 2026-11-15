@@ -761,6 +761,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	var peek chatRequest
 	_ = json.Unmarshal(body, &peek)
+	// SSE 一旦对客户端开口（首帧心跳的注释帧也算），错误就只能以协议内 error 帧收尾，
+	// 不能再回 JSON 错误体（见 ssecommit.go）。包在最外层：upstream 的注释帧/正文帧与
+	// handler 的错误体都经过同一份「是否已开口」记录。
+	if peek.Stream {
+		w = &sseCommitWriter{ResponseWriter: w}
+	}
 	// 不传 model 时补全默认模型：mapModel 虽然也会兜底到默认 config_name，但那一步
 	// 只决定**发出去**用什么，shownModel 仍是空 → 运行日志的 model 列、响应体的
 	// model 字段都空着（升级后一直在冒这种「cn: 」空行）。补全后两处都有名字。
@@ -1094,6 +1100,17 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 				return false, serr
 			}
 		}
+		// 传输层失败（读错误 / 首字节超时 / 上游断连）：一个字节都没写给客户端就换号——
+		// 这条流对客户端还不存在，换号是最干净的恢复（首帧心跳之后 committed 也为真，
+		// 所以换号窗口的判据必须是「客户端已经看到内容」，见 ssecommit.go）。
+		// 已经开过口就只能就地收尾；solosse 在上抛前已补了截断终态，客户端拿到的是
+		// 一个说得清的结果（finish_reason=length），不会停在半截。
+		if serr != nil {
+			if c, ok := w.(interface{ committed() bool }); ok && !c.committed() {
+				h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
+				return false, serr
+			}
+		}
 		// 流内 error 事件走 onErr 回调后 serr 仍是 nil，所以成败要看**两处**：返回的 err
 		// 与回调有没有触发过。不看回调会把 1005 记成成功；反过来拿「有没有 token_usage」
 		// 当判据又会把「正文完整但没给 usage」的回复记成失败并解绑会话粘性。
@@ -1107,7 +1124,14 @@ func (h *Handler) attempt(w http.ResponseWriter, acct *auth.Auth, body []byte, p
 		return true, nil
 	}
 
-	resp, err := upstream.Aggregate(rc)
+	// 非流式也走续写器：`Aggregate` 的 finish_reason 初值就是 "stop"，且它没有
+	// 「见过 done 吗」的概念 —— 上游干净 EOF 不给 done、或撞 cap 假报 stop 时，
+	// 非流式会把半个回答当完整答复写回（流式那侧的三种救援一个都不生效）。
+	// ContinueReader 产出的是 SOLO SSE，Aggregate 正好吃这个格式；它补的
+	// done{"finish_reason":"length"} 会被聚合成 length，客户端据此知道输出被截断。
+	cont := upstream.NewContinueReader(h.cfg.Upstream, acct, body, rc)
+	resp, err := upstream.Aggregate(cont)
+	cont.Close()
 	rc.Close() // 已完全消费，立即释放上游连接（防轮转 continue 泄漏 body）
 	if err != nil {
 		var se *upstream.SOLOStreamError
@@ -1293,6 +1317,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	// 流已经开口（首帧注释帧/正文帧已写出）：状态码改不动了，只能在协议内收尾。
+	// 往 SSE 流里追加裸 JSON 就是「客户端莫名断流」的另一种形态（见 ssecommit.go）。
+	if c, ok := w.(interface{ committed() bool }); ok && c.committed() {
+		writeSSEErrorFrame(w, status, code, msg)
+		return
+	}
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
