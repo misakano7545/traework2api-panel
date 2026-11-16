@@ -559,6 +559,23 @@ Spearman 相关系数（真按档位调档应该接近 `+1`）。14 个会思考
 `step-5-preview` 那一行全 0 是模型特性不是失败：它 33 发全程 `reasoning_tokens=0`（`completion` 80~109 正常出答案）。
 本轮 495 发（15 模型 × 11 列 × 3 轮，版本码 20260811）零失败。
 
+**跨实现交叉复验（2026-11-15，`cn:deepseek-v4.1-flash`）**：另有同类实现声称把档位映射成 Trae 原生的
+`light` / `high` / `extra_high`、且 `thinking.budget_tokens` 生效。上面那张表没有覆盖这两个键，所以在
+同一道需要长推理的题上补测（每档 6 轮，取 `reasoning_tokens` 中位数）：
+
+| 请求字段 | 中位数 | 六轮实测区间 |
+|---|---|---|
+| 不发 | 1640 | 1272~3235 |
+| `reasoning_effort: light` | 2317 | 792~2770 |
+| `reasoning_effort: extra_high` | 1725 | 1067~2575 |
+| `thinking.budget_tokens: 256` | 1631 | 1079~2412 |
+| `thinking.budget_tokens: 32000` | 2493 | 1134~4257 |
+
+`budget_tokens=256` 若被认下，思考不可能跑到 1631（最小一轮 1079）；`light` 反而比 `extra_high` 更高。
+结论与上面一致：**本仓走的 IDE 族（`llm_raw_chat` + `chat_v3` / `solo_work_lite`）不看这些字段**。
+对方的结论不是错，而是另一条链路——`/api/remote/v1/chat_sessions`（Remote/Work 端点）的行为；
+**同一份客户端字段在不同上游端点上不能互相外推**，引用别人的实测前必须在同一条链路上复测一次。
+
 **`kimi-k3` 的开关是「客户端版本码」，不是账号档位**（实测 2026-09-27）：上游按 `X-Ide-Version-Code`
 下发不同的模型表与门控，`X-Ide-Version` 字符串本身不影响结果（`0.1.43`/`0.1.50`/`1.0.0` 同码同表；
 2026-10-11 复核补测 `0.1.52`/`0.1.61` 仍逐行一致）。
